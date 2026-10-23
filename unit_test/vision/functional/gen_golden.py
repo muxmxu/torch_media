@@ -221,6 +221,9 @@ emit("perspective_frac_f64", F.perspective(f64(L), [[0.1, 0.2], [12.3, 0], [12, 
 COEFFS = [1.1, 0.05, -0.5, -0.02, 0.95, 0.7, 0.001, -0.002]
 emit("perspective_coeffs_f64", F.perspective(f64(B), None, None, NE, None, COEFFS))
 emit("perspective_nearest_fill_u8", F.perspective(S, [[0, 0], [6, 0], [6, 4], [0, 4]], [[1, 1], [5, 0], [6, 4], [0, 3]], NE, [9.0, 99.0, 199.0]))
+# a zero denominator on x + y = 7 (inf grid entries, NaN at (6, 1)): nearest takes the fill there (bilinear: SIGBUS)
+ZERO_DEN = [1.0, 0.0, 0.0, 0.0, 1.0, -1.5, -0.125, -0.125]
+emit("perspective_zero_den_nearest_f32", F.perspective(f32(S), None, None, NE, [0.25, 0.5, 0.75], ZERO_DEN))
 DS = (torch.rand(1, 5, 7, 2) - 0.5) * 0.4
 DL = (torch.rand(1, 11, 13, 2) - 0.5) * 0.4
 emit("disp_s", DS)
@@ -237,6 +240,18 @@ if HAS_MPS:  # torchvision on MPS (float32); its MPS adjust_hue is wrong (non_bl
     emit("rotate_mps_f32", F.rotate(f32(L).to("mps"), 30.0, BI, fill=[0.1, 0.5, 0.9]))
     emit("perspective_mps_f32", F.perspective(f32(L).to("mps"), SP, [[1, 0], [11, 2], [12, 9], [0, 10]], BI))
     emit("equalize_mps_u8", F.equalize(B.to("mps")))
+
+# ---- permute_channels / grayscale_to_rgb / gaussian_noise (progress10) ----
+emit("pad_symmetric_full_u8", F.pad(S, [7, 5], padding_mode="symmetric"))  # the widest valid symmetric pad
+emit("permute_channels_u8", F.permute_channels(S, [2, 0, 1]))
+emit("permute_channels_batch_f32", F.permute_channels(f32(B), [1, 2, 0]))
+emit("permute_channels_neg_u8", F.permute_channels(S, [-1, 0, 1]))  # Python indexing: -1 is the last channel
+torch.manual_seed(77)
+emit("gaussian_noise_f32", F.gaussian_noise(f32(S)))
+torch.manual_seed(78)
+emit("gaussian_noise_f64", F.gaussian_noise(f64(S), mean=0.1, sigma=0.3, clip=False))
+torch.manual_seed(79)
+emit("gaussian_noise_half", F.gaussian_noise(f32(S).half(), mean=0.05, sigma=0.2).float())
 
 out = pathlib.Path(__file__).with_name("golden.hpp")
 out.write_text(

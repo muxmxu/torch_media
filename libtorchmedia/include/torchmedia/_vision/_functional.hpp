@@ -90,6 +90,14 @@ namespace torchmedia::vision::functional {
             for (auto &p: padding) {
                 p = std::max<int64_t>(p, 0);
             }
+            // torch's CPU gather raises IndexError for a pad wider than the image unless the output is empty; MPS would
+            // read out of bounds
+            const auto h = x.size(-2);
+            const auto w = x.size(-1);
+            const bool empty =
+                    x.size(0) * x.size(1) * (h + padding[2] + padding[3]) * (w + padding[0] + padding[1]) == 0;
+            const bool fits = empty || (padding[0] <= w && padding[1] <= w && padding[2] <= h && padding[3] <= h);
+            TORCH_CHECK_INDEX(fits, std::format("pad: symmetric padding wider than the image ({} x {}).", h, w));
             const auto opts = torch::TensorOptions().dtype(torch::kLong).device(x.device());
             const auto indices = [&](int64_t before, int64_t n, int64_t after) {
                 return torch::cat({torch::arange(before - 1, -1, -1, opts), torch::arange(n, opts),
@@ -295,8 +303,15 @@ namespace torchmedia::vision::functional {
             return m < 0 ? m + b : (m == 0 ? 0.0 : m);
         }
 
-        // torchvision _get_inverse_affine_matrix (inverted=True): the output -> input pixel map around `center`
-        // (relative to the image center), in Python's double op order.
+        // Python math.sin: clang (Darwin) merges sin(x) and cos(x) of one x into __sincos_stret, whose sin can be 1 ulp
+        // off libm's sin; the volatile copy keeps the calls apart.
+        inline auto py_sin(double x) -> double {
+            const volatile double v = x;
+            return std::sin(v);
+        }
+
+        // torchvision v2 _get_inverse_affine_matrix (inverted=True): the output -> input pixel map around `center`
+        // (relative to the image center), in Python's double op order (v2's, not transforms.functional's).
         inline auto inverse_affine_matrix(const std::array<double, 2> &center, double angle,
                                           const std::array<double, 2> &translate, double scale,
                                           const std::array<double, 2> &shear) -> std::array<double, 6> {
@@ -311,8 +326,8 @@ namespace torchmedia::vision::functional {
             const double cx_plus_tx = center[0] + translate[0];
             const double cy_plus_ty = center[1] + translate[1];
             const double a = std::cos(rot_minus_sy) / cos_sy;
-            const double b = -(a * tan_sx + std::sin(rot));
-            const double c = std::sin(rot_minus_sy) / cos_sy;
+            const double b = -(a * tan_sx + py_sin(rot));
+            const double c = py_sin(rot_minus_sy) / cos_sy;
             const double d = std::cos(rot) - c * tan_sx;
             std::array<double, 6> m{d / scale, -b / scale, 0.0, -c / scale, a / scale, 0.0};
             m[2] += center[0] - m[0] * cx_plus_tx - m[1] * cy_plus_ty;
@@ -443,6 +458,30 @@ namespace torchmedia::vision::functional {
         }
         auto l = detail::luma(img).to(img.scalar_type());
         return num_output_channels == 3 ? l.expand(img.sizes()) : l;
+    }
+
+    // A 1-channel image repeated to 3 channels; an image with >= 3 channels is returned as is.
+    inline auto grayscale_to_rgb(const tensor_t &img) -> tensor_t {
+        return img.dim() >= 3 && img.size(-3) >= 3 ? img : rgb_to_grayscale(img, 3);
+    }
+
+    // Reorder the channels: output channel k is input channel permutation[k] (Python indexing, negatives wrap).
+    inline auto permute_channels(const tensor_t &img, const std::vector<int64_t> &permutation) -> tensor_t {
+        if (img.dim() < 3) {
+            return detail::invalid(detail::rank_error("permute_channels", img, 3));
+        }
+        const auto c = img.size(-3);
+        if (static_cast<int64_t>(permutation.size()) != c) {
+            return detail::invalid(
+                    std::format("permute_channels: length of permutation does not match number of channels: {} != {}",
+                                permutation.size(), c));
+        }
+        if (img.numel() == 0) {
+            return img;
+        }
+        using torch::indexing::Slice;
+        const auto index = torch::tensor(permutation, torch::TensorOptions().dtype(torch::kLong).device(img.device()));
+        return img.reshape({-1, c, img.size(-2), img.size(-1)}).index({Slice(), index}).reshape(img.sizes());
     }
 
     // Per-channel (img - mean) / std on a floating image; mean / std are rounded to the image dtype like torchvision.
@@ -959,6 +998,21 @@ namespace torchmedia::vision::functional {
         return fp ? x : x.round_().to(img.scalar_type());
     }
 
+    // img + mean + sigma * N(0, 1) noise drawn with randn_like (the image's device generator), clamped to [0, 1]
+    // with clip. Floating images only.
+    inline auto gaussian_noise(const tensor_t &img, double mean = 0.0, double sigma = 0.1, bool clip = true)
+            -> tensor_t {
+        if (!img.is_floating_point()) {
+            return detail::invalid(std::format("gaussian_noise: input tensor is expected to be in float dtype, got {}.",
+                                               c10::toString(img.scalar_type())));
+        }
+        if (sigma < 0) {
+            return detail::invalid(std::format("gaussian_noise: sigma shouldn't be negative, got {}.", sigma));
+        }
+        const auto out = img.add(torch::randn_like(img).mul(sigma).add(mean));
+        return clip ? out.clamp(0, 1) : out;
+    }
+
     // Set img[..., i:i+h, j:j+w] = v (Python slice semantics); a copy unless inplace.
     inline auto erase(const tensor_t &img, int64_t i, int64_t j, int64_t h, int64_t w, const tensor_t &v,
                       bool inplace = false) -> tensor_t {
@@ -1122,7 +1176,12 @@ namespace torchmedia::vision::functional {
                 torch::tensor({0.5 * static_cast<double>(ow), 0.5 * static_cast<double>(oh)}, torch::kFloat64).to(opts);
         const auto rescaled_theta1 = theta1.transpose(1, 2).div_(scale);
         const auto flat = base_grid.view({1, oh * ow, 3});
-        const auto grid = flat.bmm(rescaled_theta1).div_(flat.bmm(theta2.transpose(1, 2))).sub_(1.0);
+        // A zero denominator (crossing corners, e.g. distortion_scale near 1) gives inf / NaN, on which torch's CPU
+        // bilinear grid_sample dies with SIGBUS (torchvision too): those pixels go off the image and take the fill.
+        const auto grid = flat.bmm(rescaled_theta1)
+                                  .div_(flat.bmm(theta2.transpose(1, 2)))
+                                  .sub_(1.0)
+                                  .nan_to_num_(-4.0, -4.0, -4.0);
         return detail::apply_grid_transform(img, grid.view({1, oh, ow, 2}), interpolation, fill);
     }
 

@@ -240,6 +240,23 @@ static void test_pad() {
     TM_CHECK(throws_invalid([&] { return F::pad(S, {1, 2, 3}); }));
     TM_CHECK(throws_invalid([&] { return F::pad(S, {1}, {1, 2, 3}, PM::edge); }));
     TM_CHECK(throws_invalid([&] { return F::pad(torch::zeros({5, 7}), {1}); }));
+    // a symmetric pad wider than the image raises IndexError on every device (MPS would gather out of bounds)
+    CHECK_GOLDEN(F::pad(S, {7, 5}, {}, PM::symmetric), pad_symmetric_full_u8);
+    const auto devices = torch::mps::is_available() ? std::vector{torch::kCPU, torch::kMPS} : std::vector{torch::kCPU};
+    for (const auto &dev: devices) {
+        for (const auto &p: std::vector<std::vector<int64_t>>{{8, 0}, {0, 6}, {0, 0, 8, 0}, {0, 0, 0, 6}}) {
+            bool index_error = false;
+            try {
+                (void) F::pad(f32(S).to(dev), p, {}, PM::symmetric);
+            } catch (const c10::IndexError &) {
+                index_error = true;
+            }
+            TM_CHECK(index_error);
+        }
+    }
+    // torch only bounds-checks a non-empty gather: an empty batch or no channels pads like torchvision
+    TM_CHECK(F::pad(torch::zeros({0, 3, 4, 4}), {10}, {}, PM::symmetric).sizes() == torch::IntArrayRef({0, 3, 24, 24}));
+    TM_CHECK(F::pad(torch::zeros({1, 0, 4, 4}), {10}, {}, PM::symmetric).sizes() == torch::IntArrayRef({1, 0, 24, 24}));
 }
 
 static void test_to_dtype() {
@@ -489,6 +506,16 @@ static void test_affine_perspective_elastic() {
     CHECK_GOLDEN(perspective(S, pts{{0, 0}, {6, 0}, {6, 4}, {0, 4}}, pts{{1, 1}, {5, 0}, {6, 4}, {0, 3}}, IM::nearest,
                              {9, 99, 199}),
                  perspective_nearest_fill_u8);
+    // a zero denominator on x + y = 7 gives inf grid entries (NaN at x 6, y 1): torchvision's nearest takes the fill
+    // there, its bilinear grid_sample dies with SIGBUS; here those pixels go off the image (the fill, or 0 without one)
+    const std::vector<double> zero_den{1.0, 0.0, 0.0, 0.0, 1.0, -1.5, -0.125, -0.125};
+    CHECK_GOLDEN(perspective(f32(S), {}, {}, IM::nearest, {0.25, 0.5, 0.75}, zero_den),
+                 perspective_zero_den_nearest_f32);
+    const auto zd = perspective(f32(S), {}, {}, IM::bilinear, {0.25, 0.5, 0.75}, zero_den);
+    TM_CHECK(zd.isfinite().all().item<bool>());
+    TM_CHECK(torch::equal(zd.select(-2, 1).select(-1, 6), torch::tensor({0.25f, 0.5f, 0.75f})));
+    TM_CHECK(torch::equal(zd.select(-2, 4).select(-1, 3), torch::tensor({0.25f, 0.5f, 0.75f})));
+    TM_CHECK(perspective(S, {}, {}, IM::bilinear, {}, zero_den).select(-2, 1).select(-1, 6).eq(0).all().item<bool>());
     TM_CHECK(throws_invalid([&] { return perspective(S, sp, sp, IM::bilinear, {}, coeffs); }));
     TM_CHECK(throws_invalid([&] { return perspective(S, {}, {}, IM::bilinear, {}, {1.0, 2.0}); }));
     TM_CHECK(throws_invalid([&] { return perspective(S, sp, {}); }));
@@ -530,6 +557,33 @@ static void test_new_ops_devices() {
 #endif
 }
 
+// permute_channels / grayscale_to_rgb / gaussian_noise (progress10): the kernels behind RandomChannelPermutation,
+// RandomPhotometricDistort, RGB and GaussianNoise.
+static void test_channels_noise() {
+    CHECK_GOLDEN(permute_channels(S, {2, 0, 1}), permute_channels_u8);
+    CHECK_GOLDEN(permute_channels(f32(B), {1, 2, 0}), permute_channels_batch_f32);
+    CHECK_GOLDEN(permute_channels(S, {-1, 0, 1}), permute_channels_neg_u8);
+    const auto empty = torch::zeros({0, 3, 4, 5});
+    TM_CHECK(permute_channels(empty, {0, 1, 2}).is_same(empty));
+    TM_CHECK(throws_invalid([] { return permute_channels(S, {0, 1}); }));
+    TM_CHECK(throws_invalid([] { return permute_channels(torch::zeros({4, 5}), {0}); }));
+
+    const auto gray = S.slice(0, 0, 1);
+    TM_CHECK(torch::equal(grayscale_to_rgb(gray), gray.repeat({3, 1, 1})));
+    TM_CHECK(grayscale_to_rgb(S).is_same(S) && grayscale_to_rgb(B).is_same(B));
+    TM_CHECK(throws_invalid([] { return grayscale_to_rgb(torch::zeros({2, 4, 5})); }));
+    TM_CHECK(throws_invalid([] { return grayscale_to_rgb(torch::zeros({4, 5})); }));
+
+    torch::manual_seed(77);
+    CHECK_GOLDEN(gaussian_noise(f32(S)), gaussian_noise_f32);
+    torch::manual_seed(78);
+    CHECK_GOLDEN(gaussian_noise(f64(S), 0.1, 0.3, false), gaussian_noise_f64);
+    torch::manual_seed(79);
+    CHECK_GOLDEN(gaussian_noise(f32(S).to(torch::kHalf), 0.05, 0.2).to(torch::kFloat32), gaussian_noise_half);
+    TM_CHECK(throws_invalid([] { return gaussian_noise(S); }));
+    TM_CHECK(throws_invalid([] { return gaussian_noise(f32(S), 0.0, -0.1); }));
+}
+
 int main() {
     TM_RUN(test_resize_modes);
     TM_RUN(test_resize_batch_and_sizes);
@@ -546,5 +600,6 @@ int main() {
     TM_RUN(test_rotate);
     TM_RUN(test_affine_perspective_elastic);
     TM_RUN(test_new_ops_devices);
+    TM_RUN(test_channels_noise);
     return tm_test::summary("vision_test_functional");
 }

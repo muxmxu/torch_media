@@ -1,8 +1,10 @@
 // Assertion-based tests for the vision transform classes: each class equals its golden-verified functional op, the
 // ImageNet recipe Resize(256) + CenterCrop(224) + ToDtype(float32, scale) + Normalize matches torchvision 0.20.1
-// end to end, and the random flips draw like torchvision v2 (gen_golden.py -> golden.hpp).
+// end to end, and the random flips draw like torchvision v2 (gen_golden.py -> golden.hpp). The random classes
+// (progress10) replay torchvision's seeded calls: every output, whether it is the input itself, and the next draw.
 #include <cmath>
 #include <stdexcept>
+#include <string>
 #include <torch/torch.h>
 #include <torchmedia.hpp>
 #include "golden.hpp"
@@ -10,15 +12,21 @@
 
 namespace F = torchmedia::vision::functional;
 namespace T = torchmedia::vision::transform;
+using IM = F::interpolation_mode;
+using PM = F::padding_mode;
 
 // Bit-exact on arm64, where the goldens were generated. Elsewhere torch may resize uint8 natively (x86 AVX2, one
 // uint8 step = 1 / 255 / 0.224 after Normalize) or contract FMAs differently.
 #if defined(__aarch64__)
 constexpr double kTolPixel = 0.0;
 constexpr double kTolSumRel = 0.0;
+constexpr double kTolInt = 0.0;
+constexpr double kTolFloat = 0.0;
 #else
 constexpr double kTolPixel = 0.02;
 constexpr double kTolSumRel = 1e-4;
+constexpr double kTolInt = 1.0;
+constexpr double kTolFloat = 1e-5;
 #endif
 
 template<class Fn>
@@ -248,6 +256,326 @@ static void test_random_color() {
     TM_CHECK(throws_invalid([] { return T::RandomPosterize(T::random_posterize_option().p(-0.1)); }));
 }
 
+// ======== random transform classes (progress10) ========
+static auto G(const golden::entry &e) -> torch::Tensor {
+    return torch::tensor(e.data, torch::kFloat64).reshape(e.shape);
+}
+static const auto S = G(golden::in_s).to(torch::kUInt8); // [3, 9, 11]
+static const auto B = G(golden::in_b).to(torch::kUInt8); // [2, 3, 6, 10]
+static const auto TI = G(golden::in_t).to(torch::kUInt8); // [3, 4, 5]
+static const auto E = G(golden::in_e).to(torch::kUInt8); // [1, 24, 26]
+static auto f32(const torch::Tensor &x) -> torch::Tensor { return x.to(torch::kFloat32) / 255; }
+static auto f64(const torch::Tensor &x) -> torch::Tensor { return x.to(torch::kFloat64) / 255; }
+
+static auto dtype_name(torch::Dtype d) -> std::string {
+    return d == torch::kUInt8     ? "uint8"
+           : d == torch::kFloat32 ? "float32"
+           : d == torch::kFloat64 ? "float64"
+                                  : c10::toString(d);
+}
+
+// out must match the golden entry in dtype, shape and values.
+static void check_entry(const torch::Tensor &out, const golden::entry &e, const std::string &name, int line) {
+    const auto dt = dtype_name(out.scalar_type());
+    tm_test::record(dt == e.dtype, name.c_str(), __FILE__, line, "dtype " + dt + " != " + e.dtype);
+    std::string detail;
+    const double tol = out.is_floating_point() ? kTolFloat : kTolInt;
+    const auto expected = G(e).to(out.scalar_type()); // 9-digit float32 goldens round-trip once rounded to float32
+    tm_test::record(tm_test::tensor_close(out, expected, tol, 0.0, detail), name.c_str(), __FILE__, line, detail);
+}
+#define CHECK_ENTRY(out, name) check_entry((out), golden::name, #name, __LINE__)
+
+// Replays a seeded case: same outputs, the same "returns the input itself" calls, and the same next draw (so the
+// same number of draws). Odd calls go through forward().
+template<class Tr>
+static void check_case(const Tr &t, const torch::Tensor &x, const golden::seeded_case &c, const std::string &name,
+                       int line) {
+    torch::manual_seed(c.seed);
+    for (size_t k = 0; k < c.outs.size(); ++k) {
+        const auto out = k % 2 ? t.forward(x) : t(x);
+        const auto call = name + "[" + std::to_string(k) + "]";
+        check_entry(out, c.outs[k], call, line);
+        tm_test::record(out.is_same(x) == (c.same[k] != 0), (call + " is input").c_str(), __FILE__, line);
+    }
+    tm_test::record(torch::rand({1}).item<double>() == c.next_draw, (name + " next draw").c_str(), __FILE__, line);
+}
+#define CHECK_CASE(t, x, name) check_case((t), (x), golden::name, #name, __LINE__)
+
+static void test_random_crop() {
+    using O = T::random_crop_option;
+    CHECK_CASE(T::RandomCrop(O().size({5, 7})), S, crop_u8);
+    CHECK_CASE(T::RandomCrop(O().size({6}).padding({2}).fill({0.5})), f32(S), crop_pad_f32);
+    CHECK_CASE(T::RandomCrop(O().size({7, 9}).padding({1, 3}).padding_mode(PM::reflect)), B, crop_pad2_reflect_u8);
+    CHECK_CASE(T::RandomCrop(O().size({8, 12}).padding({1, 2, 3, 4}).padding_mode(PM::symmetric)), f32(B),
+               crop_pad4_symmetric_f32);
+    CHECK_CASE(T::RandomCrop(O().size({12, 14}).pad_if_needed(true).fill({10, 20, 30})), S, crop_pad_if_needed_u8);
+    CHECK_CASE(T::RandomCrop(O().size({12, 5}).pad_if_needed(true).padding_mode(PM::edge)), f32(S),
+               crop_pad_if_needed_edge_f32);
+    CHECK_CASE(T::RandomCrop(O().size({9, 11})), S, crop_full_u8);
+    CHECK_CASE(T::RandomCrop(O().size({3, 4})), S.select(0, 0), crop_2d_u8);
+    CHECK_CASE(T::RandomCrop(O().size({9, 5})), S, crop_rows_u8);
+    TM_CHECK(throws_invalid([] { return T::RandomCrop(O()); }));
+    TM_CHECK(throws_invalid([] { return T::RandomCrop(O().size({1, 2, 3})); }));
+    TM_CHECK(throws_invalid([] { return T::RandomCrop(O().size({3}).padding({1, 2, 3})); }));
+    const T::RandomCrop too_big(O().size({12, 14}));
+    const T::RandomCrop too_big_padded(O().size({12, 14}).padding({1}));
+    TM_CHECK(throws_invalid([&] { return too_big(S); }) && throws_invalid([&] { return too_big_padded(S); }));
+    TM_CHECK(throws_invalid([&] { return too_big(torch::zeros({5})); })); // needs [..., H, W]
+}
+
+static void test_random_resized_crop() {
+    using O = T::random_resized_crop_option;
+    CHECK_CASE(T::RandomResizedCrop(O().size({5, 6})), S, rrc_u8);
+    CHECK_CASE(T::RandomResizedCrop(O().size({7}).interpolation(IM::bicubic).antialias(false)), f32(S),
+               rrc_bicubic_f32);
+    CHECK_CASE(T::RandomResizedCrop(O().size({4, 5}).scale({0.3, 0.6}).ratio({0.5, 2.0})), B, rrc_batch_u8);
+    // no attempt fits: the whole image, center-cropped to the nearest ratio bound
+    CHECK_CASE(T::RandomResizedCrop(O().size({5, 6}).scale({0.9, 1.0}).ratio({0.2, 0.25})), f32(S),
+               rrc_fallback_wide_f32);
+    CHECK_CASE(T::RandomResizedCrop(O().size({5, 6}).scale({0.9, 1.0}).ratio({5.0, 6.0})), f32(S),
+               rrc_fallback_tall_f32);
+    CHECK_CASE(T::RandomResizedCrop(O().size({5, 6}).scale({2.0, 3.0})), S, rrc_fallback_whole_u8);
+    TM_CHECK(throws_invalid([] { return T::RandomResizedCrop(O()); }));
+}
+
+static void test_random_resize() {
+    CHECK_CASE(T::RandomResize(T::random_resize_option().min_size(4).max_size(9)), S, rresize_u8);
+    CHECK_CASE(T::RandomResize(
+                       T::random_resize_option().min_size(3).max_size(8).interpolation(IM::nearest).antialias(false)),
+               f32(B), rresize_nearest_f32);
+    using SO = T::random_shortest_size_option;
+    CHECK_CASE(T::RandomShortestSize(SO().min_size({4, 6, 8}).max_size(9)), S, shortest_u8);
+    CHECK_CASE(T::RandomShortestSize(SO().min_size({4, 7}).interpolation(IM::bilinear).antialias(true)), f32(B),
+               shortest_f32);
+    using JO = T::scale_jitter_option;
+    CHECK_CASE(T::ScaleJitter(JO().target_size({8, 10}).scale_range({0.5, 1.5})), S, jitter_scale_u8);
+    CHECK_CASE(T::ScaleJitter(
+                       JO().target_size({12, 10}).scale_range({0.5, 1.2}).interpolation(IM::bicubic).antialias(true)),
+               f32(S), jitter_scale_bicubic_f32);
+    CHECK_CASE(T::ScaleJitter(JO().target_size({13, 12}).scale_range({1.0, 1.0})), S, jitter_scale_float32_u8);
+    CHECK_CASE(T::ScaleJitter(JO().target_size({8, 10}).scale_range({0.5, 1.5})), f32(B), jitter_scale_batch_f32);
+}
+
+static void test_color_jitter() {
+    using O = T::color_jitter_option;
+    CHECK_CASE(T::ColorJitter(O().brightness({0.4}).contrast({0.4}).saturation({0.4})), S, cj_u8);
+    CHECK_CASE(T::ColorJitter(O().brightness({0.4}).contrast({0.4}).saturation({0.4}).hue({0.1})), f32(S), cj_hue_f32);
+    CHECK_CASE(T::ColorJitter(O().brightness({0.5, 1.5}).hue({-0.2, 0.3})), B, cj_batch_u8);
+    CHECK_CASE(T::ColorJitter(), S, cj_none_u8);
+    CHECK_CASE(T::ColorJitter(O().brightness({0}).contrast({1, 1}).saturation({0.5}).hue({0})), f32(S),
+               cj_identity_ranges_f32);
+    CHECK_CASE(T::ColorJitter(O().brightness({0.3}).contrast({0.2, 0.9}).saturation({0.0, 2.0}).hue({-0.5, 0.5})),
+               f64(S), cj_f64);
+    CHECK_CASE(T::ColorJitter(O().brightness({1.5}).contrast({1.2})), S, cj_clip_u8);
+    TM_CHECK(throws_invalid([] { return T::ColorJitter(O().brightness({-0.1})); }));
+    TM_CHECK(throws_invalid([] { return T::ColorJitter(O().contrast({1, 2, 3})); }));
+    TM_CHECK(throws_invalid([] { return T::ColorJitter(O().saturation({1.5, 0.5})); }));
+    TM_CHECK(throws_invalid([] { return T::ColorJitter(O().hue({0.6})); }));
+    TM_CHECK(throws_invalid([] { return T::ColorJitter(O().brightness({-0.5, 1.0})); }));
+
+    using PO = T::random_photometric_distort_option;
+    CHECK_CASE(T::RandomPhotometricDistort(), S, pd_u8);
+    CHECK_CASE(T::RandomPhotometricDistort(PO().brightness({0.875, 1.125})
+                                                   .contrast({0.5, 1.5})
+                                                   .saturation({0.5, 1.5})
+                                                   .hue({-0.05, 0.05})
+                                                   .p(1.0)),
+               f32(S), pd_p1_f32);
+    CHECK_CASE(T::RandomPhotometricDistort(PO().p(0.0)), S, pd_p0_u8);
+    CHECK_CASE(T::RandomPhotometricDistort(PO().p(1.0)), f32(B), pd_batch_f32);
+    CHECK_CASE(T::RandomChannelPermutation(), S, perm_u8);
+    CHECK_CASE(T::RandomChannelPermutation(), f32(B), perm_batch_f32);
+
+    const T::RGB rgb;
+    const auto gray = S.slice(0, 0, 1);
+    TM_CHECK(torch::equal(rgb(gray), gray.repeat({3, 1, 1})) && rgb.forward(S).is_same(S));
+}
+
+static void test_random_warps() {
+    using RO = T::random_rotation_option;
+    CHECK_CASE(T::RandomRotation(RO().degrees({30})), S, rot_u8);
+    CHECK_CASE(
+            T::RandomRotation(RO().degrees({-10, 40}).interpolation(IM::bilinear).expand(true).fill({0.2, 0.4, 0.6})),
+            f32(S), rot_expand_f32);
+    CHECK_CASE(T::RandomRotation(RO().degrees({25}).interpolation(IM::bilinear).center({3, 4}).fill({})), f32(B),
+               rot_center_none_f32);
+    TM_CHECK(throws_invalid([] { return T::RandomRotation(RO()); }));
+    TM_CHECK(throws_invalid([] { return T::RandomRotation(RO().degrees({-5})); }));
+    TM_CHECK(throws_invalid([] { return T::RandomRotation(RO().degrees({1, 2, 3})); }));
+    TM_CHECK(throws_invalid([] { return T::RandomRotation(RO().degrees({5}).center({1})); }));
+
+    using AO = T::random_affine_option;
+    CHECK_CASE(T::RandomAffine(AO().degrees({20}).translate({0.2, 0.3}).scale({0.8, 1.2}).shear({10})), S, aff_u8);
+    CHECK_CASE(T::RandomAffine(AO().degrees({-45, 10}).shear({-5, 5, -20, 3}).interpolation(IM::bilinear).fill({0.25})),
+               f32(S), aff_shear4_f32);
+    CHECK_CASE(T::RandomAffine(
+                       AO().degrees({15}).translate({0.1, 0.1}).interpolation(IM::bilinear).fill({}).center({2.5, 3})),
+               f32(B), aff_center_none_f32);
+    CHECK_CASE(T::RandomAffine(AO().degrees({0})), S, aff_zero_u8);
+    CHECK_CASE(T::RandomRotation(RO().degrees({0})), S, rot_zero_u8);
+    CHECK_CASE(T::RandomRotation(RO().degrees({-60, 150}).interpolation(IM::bilinear).center({2, 6}).fill({})), f64(S),
+               rot_center_f64);
+    CHECK_CASE(T::RandomAffine(AO().degrees({30})
+                                       .translate({0.2, 0.1})
+                                       .shear({-10, 15, 5, 20})
+                                       .interpolation(IM::bilinear)
+                                       .fill({0.5})),
+               f64(S), aff_shear_f64);
+    TM_CHECK(throws_invalid([] { return T::RandomAffine(AO()); }));
+    TM_CHECK(throws_invalid([] { return T::RandomAffine(AO().degrees({5}).translate({0.1})); }));
+    TM_CHECK(throws_invalid([] { return T::RandomAffine(AO().degrees({5}).translate({0.1, 1.5})); }));
+    TM_CHECK(throws_invalid([] { return T::RandomAffine(AO().degrees({5}).scale({1.0})); }));
+    TM_CHECK(throws_invalid([] { return T::RandomAffine(AO().degrees({5}).scale({0.0, 1.0})); }));
+    TM_CHECK(throws_invalid([] { return T::RandomAffine(AO().degrees({5}).shear({-1})); }));
+    TM_CHECK(throws_invalid([] { return T::RandomAffine(AO().degrees({5}).shear({1, 2, 3})); }));
+    TM_CHECK(throws_invalid([] { return T::RandomAffine(AO().degrees({5}).center({1, 2, 3})); }));
+    TM_CHECK(!throws_invalid([] { return T::RandomAffine(AO().degrees({5}).translate({1.0, 1.0})); })); // inclusive
+
+    using PO = T::random_perspective_option;
+    CHECK_CASE(T::RandomPerspective(), S, persp_u8);
+    CHECK_CASE(T::RandomPerspective(PO().distortion_scale(0.8).p(1.0).interpolation(IM::nearest).fill({0.5, 0.1, 0.9})),
+               f32(S), persp_nearest_fill_f32);
+    CHECK_CASE(T::RandomPerspective(PO().distortion_scale(0.3).p(1.0).fill({})), f32(B), persp_none_batch_f32);
+    CHECK_CASE(T::RandomPerspective(PO().distortion_scale(0.6).p(1.0)),
+               f32(S.slice(0, 0, 1).slice(1, 0, 7).slice(2, 0, 6)), persp_odd_f32);
+    // distortion_scale 1 can cross corners: a zero denominator (inf / NaN grid) takes the fill instead of crashing
+    // grid_sample (torchvision: SIGBUS at this seed)
+    const T::RandomPerspective full(PO().distortion_scale(1.0).p(1.0));
+    const auto x64 = torch::arange(64 * 64, torch::kFloat32).reshape({1, 64, 64}) / 4096;
+    torch::manual_seed(13);
+    for (int k = 0; k < 4; ++k) {
+        TM_CHECK(full(x64).isfinite().all().item<bool>());
+    }
+    TM_CHECK(throws_invalid([] { return T::RandomPerspective(PO().distortion_scale(1.5)); }));
+    TM_CHECK(throws_invalid([] { return T::RandomPerspective(PO().p(-1.0)); }));
+    TM_CHECK(!throws_invalid([] { return T::RandomPerspective(PO().distortion_scale(1.0)); })); // inclusive
+
+    using EO = T::elastic_transform_option;
+    CHECK_CASE(T::ElasticTransform(), f32(E), elastic_default_f32);
+    CHECK_CASE(T::ElasticTransform(EO().alpha({20.0, 30.0}).sigma({0.625, 0.5}).interpolation(IM::nearest)), S,
+               elastic_nearest_u8);
+    CHECK_CASE(T::ElasticTransform(EO().alpha({10.0}).sigma({0.0}).interpolation(IM::bicubic).fill({})), f32(S),
+               elastic_nosigma_bicubic_f32);
+    CHECK_CASE(T::ElasticTransform(EO().alpha({20.0, 30.0}).sigma({0.625, 0.5})), f32(S), elastic_even_kernel_f32);
+    CHECK_CASE(T::ElasticTransform(EO().alpha({20.0}).sigma({0.5})), f32(B), elastic_batch_f32);
+    TM_CHECK(throws_invalid([] { return T::ElasticTransform(EO().alpha({})); }));
+    TM_CHECK(throws_invalid([] { return T::ElasticTransform(EO().sigma({1, 2, 3})); }));
+    const T::ElasticTransform zero_sigma_y(EO().sigma({1.0, 0.0})); // dx is blurred with both sigmas: 0 is rejected
+    TM_CHECK(throws_invalid([&] { return zero_sigma_y(f32(S)); }));
+}
+
+static void test_erasing_zoom_noise() {
+    using O = T::random_erasing_option;
+    CHECK_CASE(T::RandomErasing(), S, erase_u8);
+    CHECK_CASE(T::RandomErasing(O().p(1.0).value({})), f32(S), erase_random_f32);
+    CHECK_CASE(T::RandomErasing(O().p(1.0).value({0.1, 0.2, 0.3})), f32(B), erase_channel_f32);
+    const auto x = S.clone();
+    CHECK_CASE(T::RandomErasing(O().p(1.0).value({7}).inplace(true)), x, erase_inplace_u8);
+    CHECK_CASE(T::RandomErasing(O().p(1.0).scale({0.99, 1.0}).ratio({1.0, 1.0})), f32(S), erase_fallback_f32);
+    CHECK_CASE(T::RandomErasing(O().p(1.0).scale({0.99, 1.0}).ratio({1.0, 1.0})), f32(S).slice(2, 0, 9),
+               erase_exact_fit_f32);
+    TM_CHECK(throws_invalid([] { return T::RandomErasing(O().p(2.0)); }));
+    TM_CHECK(throws_invalid([] { return T::RandomErasing(O().scale({-0.1, 0.5})); }));
+    TM_CHECK(throws_invalid([] { return T::RandomErasing(O().scale({0.1, 1.5})); }));
+    TM_CHECK(!throws_invalid([] { return T::RandomErasing(O().scale({0.0, 0.33})); })); // inclusive
+    const T::RandomErasing two_values(O().p(1.0).value({1, 2}));
+    TM_CHECK(throws_invalid([&] { return two_values(S); }));
+
+    using ZO = T::random_zoom_out_option;
+    CHECK_CASE(T::RandomZoomOut(), TI, zoom_u8);
+    CHECK_CASE(T::RandomZoomOut(ZO().fill({0.1, 0.5, 0.9}).side_range({1.5, 2.0}).p(1.0)), f32(TI), zoom_fill_f32);
+    CHECK_CASE(T::RandomZoomOut(ZO().p(0.0)), S, zoom_p0_u8);
+    CHECK_CASE(T::RandomZoomOut(ZO().side_range({1.0, 1.5}).p(1.0)), B, zoom_batch_u8);
+    TM_CHECK(throws_invalid([] { return T::RandomZoomOut(ZO().side_range({0.5, 2.0})); }));
+    TM_CHECK(throws_invalid([] { return T::RandomZoomOut(ZO().side_range({2.0, 1.5})); }));
+    TM_CHECK(throws_invalid([] { return T::RandomZoomOut(ZO().p(1.5)); }));
+
+    CHECK_CASE(T::GaussianNoise(), f32(S), noise_f32);
+    CHECK_CASE(T::GaussianNoise(T::gaussian_noise_option().mean(0.1).sigma(0.3).clip(false)), f64(S), noise_noclip_f64);
+    CHECK_CASE(T::GaussianNoise(T::gaussian_noise_option().sigma(0.2)), f32(B), noise_batch_f32);
+    TM_CHECK(throws_invalid([] { return T::GaussianNoise()(S); })); // floating images only
+}
+
+static void test_containers() {
+    const auto jitter = [](double b, double c) {
+        return T::ColorJitter(T::color_jitter_option().brightness({b}).contrast({c}));
+    };
+    const T::RandomRotation rot20(T::random_rotation_option().degrees({20}));
+    const T::RandomHorizontalFlip hflip1(T::random_flip_option().p(1.0));
+    const T::RandomVerticalFlip vflip1(T::random_flip_option().p(1.0));
+    CHECK_CASE(T::RandomApply({jitter(0.3, 0.3), rot20}, 0.6), S, apply_u8);
+    CHECK_CASE(T::RandomApply({jitter(0.3, 0.3), rot20}, 0.6), f32(B), apply_batch_f32);
+    CHECK_CASE(T::RandomChoice({hflip1, vflip1, rot20}, {1, 2, 3}), S, choice_u8);
+    CHECK_CASE(T::RandomChoice({hflip1, vflip1}), S, choice_equal_u8);
+    const T::ColorJitter brightness(T::color_jitter_option().brightness({0.3}));
+    CHECK_CASE(T::RandomOrder({brightness, rot20, T::Grayscale(T::grayscale_option().num_output_channels(3))}), S,
+               order_u8);
+    CHECK_CASE(T::RandomOrder({brightness, rot20, T::Grayscale(T::grayscale_option().num_output_channels(3))}), f32(B),
+               order_batch_f32);
+
+    // Compose chains any callables in order (a lambda included)
+    const T::Compose chain({T::Resize(T::resize_option().size({6})), T::CenterCrop(T::center_crop_option().size({5})),
+                            [](const torch::Tensor &t) { return t.flip(-1); }});
+    TM_CHECK(torch::equal(chain(S), F::center_crop(F::resize(S, {6}), {5}).flip(-1)));
+    TM_CHECK(torch::equal(chain.forward(S), chain(S)));
+    // empty RandomApply / RandomOrder return the input (torchvision raises UnboundLocalError)
+    TM_CHECK(T::RandomApply({}, 1.0)(S).is_same(S) && T::RandomOrder({})(S).is_same(S));
+    TM_CHECK(T::RandomApply({rot20}, 0.0).forward(S).is_same(S));
+    TM_CHECK(throws_invalid([] { return T::Compose({}); }));
+    TM_CHECK(throws_invalid([&] { return T::RandomApply({rot20}, 1.5); }));
+    TM_CHECK(throws_invalid([&] { return T::RandomChoice({rot20, hflip1}, {1.0}); }));
+    TM_CHECK(throws_invalid([&] { return T::RandomChoice({rot20, hflip1}, {0.0, 0.0}); }));
+}
+
+static void test_deterministic_misc() {
+    const T::Identity id;
+    TM_CHECK(id(S).is_same(S) && id.forward(S).is_same(S));
+    const T::ConvertImageDtype to_float;
+    TM_CHECK(torch::equal(to_float(S), F::to_dtype(S, torch::kFloat32, true)));
+    const T::ConvertImageDtype to_u8(T::convert_image_dtype_option().dtype(torch::kUInt8));
+    TM_CHECK(torch::equal(to_u8.forward(f32(S)), F::to_dtype(f32(S), torch::kUInt8, true)));
+
+    const auto m = ((torch::arange(144) * 7).remainder(11) - 5).to(torch::kFloat32).reshape({12, 12}) / 8;
+    const auto mean = torch::arange(12).remainder(5).to(torch::kFloat32) / 10;
+    using LO = T::linear_transformation_option;
+    const T::LinearTransformation lt(LO().transformation_matrix(m).mean_vector(mean));
+    CHECK_ENTRY(lt(f32(S).slice(1, 0, 2).slice(2, 0, 2)), lt_f32);
+    CHECK_ENTRY(lt.forward(B.slice(2, 0, 2).slice(3, 0, 2)), lt_batch_u8); // uint8 - float mean: float32 output
+    CHECK_ENTRY(lt(f64(S).slice(1, 0, 2).slice(2, 0, 2)), lt_f64);
+    TM_CHECK(throws_invalid([&] { return lt(f32(S)); })); // 3 * 9 * 11 != 12
+    TM_CHECK(throws_invalid([&] { return lt(torch::zeros({3, 2, 2}, torch::kMeta)); })); // device type
+    TM_CHECK(throws_invalid(
+            [&] { return T::LinearTransformation(LO().transformation_matrix(m.slice(0, 0, 6)).mean_vector(mean)); }));
+    TM_CHECK(throws_invalid(
+            [&] { return T::LinearTransformation(LO().transformation_matrix(m).mean_vector(mean.slice(0, 0, 6))); }));
+    TM_CHECK(throws_invalid(
+            [&] { return T::LinearTransformation(LO().transformation_matrix(m).mean_vector(mean.to(torch::kMeta))); }));
+    TM_CHECK(throws_invalid([&] {
+        return T::LinearTransformation(LO().transformation_matrix(m).mean_vector(mean.to(torch::kFloat64)));
+    }));
+}
+
+// The ImageNet training recipe: RandomResizedCrop(224) + RandomHorizontalFlip + ColorJitter(0.4, 0.4, 0.4) +
+// ToDtype(float32, scale) + Normalize, seeded end to end through Compose.
+static void test_train_recipe() {
+    const auto img = synthetic_image();
+    const T::Compose train(
+            {T::RandomResizedCrop(T::random_resized_crop_option().size({224})), T::RandomHorizontalFlip(),
+             T::ColorJitter(T::color_jitter_option().brightness({0.4}).contrast({0.4}).saturation({0.4})),
+             T::ToDtype(T::to_dtype_option().dtype(torch::kFloat32).scale(true)),
+             T::Normalize(T::normalize_option().mean({0.485, 0.456, 0.406}).std({0.229, 0.224, 0.225}))});
+    using namespace golden;
+    const std::array<const std::vector<double> *, 3> grids{&train0_grid, &train1_grid, &train2_grid};
+    const std::array<double, 3> sums{train0_sum, train1_sum, train2_sum};
+    const std::array<double, 3> sums_sq{train0_sum_sq, train1_sum_sq, train2_sum_sq};
+    const std::array<double, 3> next{train0_next_draw, train1_next_draw, train2_next_draw};
+    for (int seed = 0; seed < 3; ++seed) {
+        torch::manual_seed(seed);
+        check_recipe(train(img), *grids[seed], sums[seed], sums_sq[seed]);
+        TM_CHECK(torch::rand({1}).item<double>() == next[seed]);
+    }
+}
+
 int main() {
     TM_RUN(test_imagenet_recipe);
     TM_RUN(test_classes_match_functional);
@@ -255,5 +583,14 @@ int main() {
     TM_RUN(test_validation);
     TM_RUN(test_gaussian_blur);
     TM_RUN(test_random_color);
+    TM_RUN(test_random_crop);
+    TM_RUN(test_random_resized_crop);
+    TM_RUN(test_random_resize);
+    TM_RUN(test_color_jitter);
+    TM_RUN(test_random_warps);
+    TM_RUN(test_erasing_zoom_noise);
+    TM_RUN(test_containers);
+    TM_RUN(test_deterministic_misc);
+    TM_RUN(test_train_recipe);
     return tm_test::summary("vision_test_transform");
 }

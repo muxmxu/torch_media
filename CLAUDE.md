@@ -5,7 +5,8 @@ reimplements **torchaudio / torchvision** functionality on top of **native libto
 (`torch::Tensor`) operators**. MIT licensed. Audio covers torchaudio.functional and torchaudio.transforms
 (see develop_log/2026-06-01); vision covers the core torchvision.transforms.v2 resize / crop / pad / dtype / color /
 rotate / affine / perspective ops as functional ops and transform classes, point-wise identical to torchvision
-(develop_log/2026-10-23/progress07, progress09), plus image I/O (torchvision.io-style uint8 decode_image).
+(develop_log/2026-10-23/progress07, progress09), the random augmentation classes and containers with seeded parity
+(progress10), plus image I/O (torchvision.io-style uint8 decode_image).
 
 ## Collaboration model (development, not research)
 
@@ -48,8 +49,13 @@ See `develop_log/README.md` for file conventions, templates, and naming.
   setters; namespaces `torchmedia::{audio,vision}::{io,functional,transform}`, `torchmedia::audio::separation` and
   `torchmedia::audio::compliance::kaldi` (torchaudio.compliance.kaldi).
 - **No heavy runtime deps**: prefer header-only / vendored single-header over system libraries.
+- **Seeded parity**: a random vision transform class replicates its torchvision class's parameter draws (same torch
+  calls, order and dtypes, on the global generator), so `torch::manual_seed(s)` reproduces `torch.manual_seed(s)`
+  (develop_log/2026-10-23/progress10 D3) — for serialized calls: concurrent calls interleave the draws (progress10 D1).
 - **Python-order scalar math**: a function that reproduces Python float arithmetic (e.g. torchvision's affine matrix)
-  starts with `TORCHMEDIA_FP_CONTRACT_OFF` (clang otherwise fuses `a * b + c` into FMAs and breaks bit-exactness);
+  starts with `TORCHMEDIA_FP_CONTRACT_OFF` (clang otherwise fuses `a * b + c` into FMAs and breaks bit-exactness)
+  and takes the sin of an angle whose cos it also needs through `detail::py_sin` (Darwin clang merges the pair into
+  `__sincos_stret`, 1 ulp off `math.sin`; progress10 D6);
   `-ffast-math` / `-ffp-contract=fast` builds are not bit-exact (develop_log/2026-10-23/progress09 D4). The
   `torch_media` CMake target adds `-ffp-contract=on` for consumers so GCC never fuses across statements; the audio
   scalar loops (lfilter / phaser / flanger / vad) rely on that (progress08) — keep both mechanisms.
