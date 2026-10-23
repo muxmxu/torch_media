@@ -4,6 +4,7 @@
 // A non-zero return code marks the ctest case as failed.
 #include <cmath>
 #include <cstdio>
+#include <exception>
 #include <string>
 #include <torch/torch.h>
 
@@ -26,13 +27,25 @@ namespace tm_test {
             detail = "shape mismatch";
             return false;
         }
-        const auto af = a.detach().to(torch::kCPU, torch::kDouble);
-        const auto bf = b.detach().to(torch::kCPU, torch::kDouble);
+        // to CPU first: some devices (MPS) cannot hold float64.
+        const auto af = a.detach().to(torch::kCPU).to(torch::kDouble);
+        const auto bf = b.detach().to(torch::kCPU).to(torch::kDouble);
         if (torch::allclose(af, bf, rtol, atol))
             return true;
         const double maxdiff = (af - bf).abs().max().template item<double>();
         detail = "max|delta|=" + std::to_string(maxdiff) + " (atol=" + std::to_string(atol) + ")";
         return false;
+    }
+
+    // Run one test function; an unexpected exception becomes a recorded failure instead of aborting the binary.
+    template<class Fn>
+    inline void run(const char *name, Fn &&fn) {
+        try {
+            fn();
+        } catch (const std::exception &e) {
+            const std::string what = e.what();
+            record(false, name, __FILE__, __LINE__, "unexpected exception: " + what.substr(0, what.find('\n')));
+        }
     }
 
     inline int summary(const char *name) {
@@ -43,6 +56,8 @@ namespace tm_test {
 } // namespace tm_test
 
 #define TM_CHECK(cond) ::tm_test::record((cond), #cond, __FILE__, __LINE__)
+
+#define TM_RUN(test_fn) ::tm_test::run(#test_fn, test_fn)
 
 #define TM_CHECK_CLOSE(a, b, atol)                                                                                     \
     ::tm_test::record(std::abs(static_cast<double>(a) - static_cast<double>(b)) <= (atol), #a " ~= " #b, __FILE__,     \

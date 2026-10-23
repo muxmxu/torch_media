@@ -1,7 +1,7 @@
 #pragma once
 #ifndef LIB_TORCH_MEDIA_AUDIO_FUNCTIONAL_BEAMFORMING_HPP
 #define LIB_TORCH_MEDIA_AUDIO_FUNCTIONAL_BEAMFORMING_HPP
-#include <torch/linalg.h>
+#include <torch/torch.h>
 #include "../globel_include.hpp"
 
 // Multichannel beamforming (mirrors the MVDR / RTF ops in torchaudio.functional). All operate on
@@ -126,11 +126,11 @@ namespace torchmedia::audio::functional {
     inline auto rtf_evd(const_tensor_lref_t psd_s) -> tensor_t {
         using namespace torch::indexing;
         if (!psd_s.is_complex()) {
-            handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}), "psd_s must be complex.");
+            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}), "psd_s must be complex.");
         }
         if (psd_s.size(-1) != psd_s.size(-2)) {
-            handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                               "The last two dimensions of psd_s must match.");
+            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
+                                                                      "The last two dimensions of psd_s must match.");
         }
         const auto eig = torch::linalg::eigh(psd_s, "L");
         const auto v = std::get<1>(eig); // eigenvectors (columns), ascending eigenvalues
@@ -143,8 +143,8 @@ namespace torchmedia::audio::functional {
         using namespace torch::indexing;
         detail::assert_psd_matrices(psd_s, psd_n);
         if (n_iter <= 0) {
-            handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                               "The number of iterations must be greater than 0.");
+            return handle_exceptions<tensor_t, std::invalid_argument>(
+                    torch::empty({1}), "The number of iterations must be greater than 0.");
         }
         if (diagonal_loading) {
             psd_n = _tik_reg(psd_n, diag_eps);
@@ -165,8 +165,8 @@ namespace torchmedia::audio::functional {
     // Apply precomputed beamforming weights (mirrors apply_beamforming).
     inline auto apply_beamforming(const_tensor_lref_t beamform_weights, const_tensor_lref_t specgram) -> tensor_t {
         if (!(beamform_weights.is_complex() && specgram.is_complex())) {
-            handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                               "beamform_weights and specgram must be complex.");
+            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
+                                                                      "beamform_weights and specgram must be complex.");
         }
         return torch::einsum("...fc,...cft->...ft", {beamform_weights.conj(), specgram});
     }

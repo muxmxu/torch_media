@@ -4,9 +4,7 @@
 #include <cmath>
 #include <limits>
 #include <optional>
-#include <torch/fft.h>
-#include <torch/nn/functional/conv.h>
-#include <torch/nn/options/conv.h>
+#include <torch/torch.h>
 #include "../globel_include.hpp"
 
 namespace torchmedia::audio::functional {
@@ -20,18 +18,19 @@ namespace torchmedia::audio::functional {
         namespace F = torch::nn::functional;
 
         if (a_coeffs.sizes() != b_coeffs.sizes()) {
-            handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                               "Expected coeffs to be the same size.");
+            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
+                                                                      "Expected coeffs to be the same size.");
         }
         if (waveform.dim() != 3) {
-            handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                               "Expected waveform to be 3 dimensional.");
+            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
+                                                                      "Expected waveform to be 3 dimensional.");
         }
         const int64_t n_channel = waveform.size(1);
         const int64_t n_sample = waveform.size(2);
         const int64_t n_order = a_coeffs.size(1);
         if (n_order <= 0) {
-            handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}), "Expected n_order to be positive.");
+            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
+                                                                      "Expected n_order to be positive.");
         }
 
         // Left-pad the input by n_order-1 and allocate a zero-initialised output buffer.
@@ -67,18 +66,18 @@ namespace torchmedia::audio::functional {
     inline auto lfilter(tensor_t waveform, tensor_t a_coeffs, tensor_t b_coeffs, bool clamp = true,
                         bool batching = true) -> tensor_t {
         if (a_coeffs.sizes() != b_coeffs.sizes()) {
-            handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                               "Expected coeffs to be the same size.");
+            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
+                                                                      "Expected coeffs to be the same size.");
         }
         if (a_coeffs.dim() > 2) {
-            handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                               "Expected coeffs to have at most 2 dimensions.");
+            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
+                                                                      "Expected coeffs to have at most 2 dimensions.");
         }
 
         if (a_coeffs.dim() > 1) {
             if (batching) {
                 if (waveform.dim() <= 0 || waveform.size(-2) != a_coeffs.size(0)) {
-                    handle_exceptions<tensor_t, std::invalid_argument>(
+                    return handle_exceptions<tensor_t, std::invalid_argument>(
                             torch::empty({1}), "Expected number of batches in waveform and coeffs to be the same.");
                 }
             } else {
@@ -246,8 +245,8 @@ namespace torchmedia::audio::functional {
             width_slope = 0.479;
             gain = -9.62;
         } else {
-            handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                               "Sample rate must be 44100 (audio-CD) or 48000 (DAT)");
+            return handle_exceptions<tensor_t, std::invalid_argument>(
+                    torch::empty({1}), "Sample rate must be 44100 (audio-CD) or 48000 (DAT)");
         }
         const double w0 = 2.0 * detail::pi * central_freq / sample_rate;
         const double A = std::exp(gain / 40.0 * std::log(10.0));
@@ -288,8 +287,8 @@ namespace torchmedia::audio::functional {
             poles[0] = 0.8699137;
             poles[1] = 0.9966946;
         } else {
-            handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                               "Sample rate must be 44.1k, 48k, 88.2k, or 96k");
+            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
+                                                                      "Sample rate must be 44.1k, 48k, 88.2k, or 96k");
         }
         double b0 = 1.0, b1 = -(zeros[0] + zeros[1]), b2 = zeros[0] * zeros[1];
         const double a0 = 1.0, a1 = -(poles[0] + poles[1]), a2 = poles[0] * poles[1];
@@ -311,7 +310,7 @@ namespace torchmedia::audio::functional {
     // Contrast enhancement (SoX). enhancement_amount in [0, 100].
     inline auto contrast(const_tensor_lref_t waveform, double enhancement_amount = 75.0) -> tensor_t {
         if (!(enhancement_amount >= 0.0 && enhancement_amount <= 100.0)) {
-            handle_exceptions<tensor_t, std::invalid_argument>(
+            return handle_exceptions<tensor_t, std::invalid_argument>(
                     torch::empty({1}), "Allowed range of values for enhancement_amount : 0-100");
         }
         const double contrast = enhancement_amount / 750.0;
@@ -522,16 +521,16 @@ namespace torchmedia::audio::functional {
             -> tensor_t {
         using namespace torch::indexing;
         if (modulation != "sinusoidal" && modulation != "triangular") {
-            handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                               "Only \"sinusoidal\" or \"triangular\" modulation.");
+            return handle_exceptions<tensor_t, std::invalid_argument>(
+                    torch::empty({1}), "Only \"sinusoidal\" or \"triangular\" modulation.");
         }
         if (interpolation != "linear" && interpolation != "quadratic") {
-            handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                               "Only \"linear\" or \"quadratic\" interpolation.");
+            return handle_exceptions<tensor_t, std::invalid_argument>(
+                    torch::empty({1}), "Only \"linear\" or \"quadratic\" interpolation.");
         }
         const auto actual_shape = waveform_in.sizes().vec();
         if (actual_shape[actual_shape.size() - 2] > 4) {
-            handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}), "Max 4 channels allowed");
+            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}), "Max 4 channels allowed");
         }
         auto waveform = waveform_in.reshape({-1, actual_shape[actual_shape.size() - 2], actual_shape.back()});
         const double feedback_gain = regen / 100.0;
@@ -669,8 +668,8 @@ namespace torchmedia::audio::functional {
         int64_t cepstrum_end =
                 std::min<int64_t>(static_cast<int64_t>(std::floor(sample_rate * 0.5 / hp_lifter_freq)), dft_len_ws / 4);
         if (cepstrum_end <= cepstrum_start) {
-            handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                               "cepstrum_start must be smaller than cepstrum_end.");
+            return handle_exceptions<tensor_t, std::invalid_argument>(
+                    torch::empty({1}), "cepstrum_start must be smaller than cepstrum_end.");
         }
 
         const auto noise_up_time_mult =

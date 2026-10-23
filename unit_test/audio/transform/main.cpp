@@ -93,10 +93,10 @@ static void test_griffinlim() {
 
     // (2) golden vs torchaudio.transforms.GriffinLim (deterministic: rand_init=false).
     TM_CHECK(out.dim() == 1 && out.size(0) == 16);
-    const auto golden = torch::tensor({-0.29289332f, 0.73676556f, 2.27640009f, 3.30954194f, 3.81394100f, 4.78316593f,
-                                       6.18080521f, 6.99543953f, 7.78199863f, 9.00509930f, 10.63291740f, 11.37394619f,
-                                       11.79281616f, 12.76417637f, 14.27148819f, 14.65474415f});
-    TM_CHECK_TENSOR_CLOSE(out, golden, 1e-2, 1e-2);
+    const auto golden = torch::tensor({-0.29289332f, 0.736765623f, 2.27640057f, 3.30954361f, 3.81394148f, 4.78316498f,
+                                       6.18080425f, 6.9954381f, 7.78199816f, 9.00509834f, 10.6329165f, 11.3739462f,
+                                       11.7928171f, 12.7641764f, 14.2714882f, 14.6547432f});
+    TM_CHECK_TENSOR_CLOSE(out, golden, 1e-5, 1e-6);
 }
 
 static void test_griffinlim_momentum_validation() {
@@ -819,15 +819,15 @@ static void test_effects_option_setters() {
 static void test_convolution_noise() {
     const auto x = torch::randn({1, 8});
     const auto y = torch::randn({1, 3});
-    for (const auto mode: {fn::full, fn::valid, fn::same}) {
+    for (const auto mode: {fn::convolve_mode::full, fn::convolve_mode::valid, fn::convolve_mode::same}) {
         TM_CHECK_TENSOR_CLOSE(tf::Convolve(tf::convolve_option().mode(mode))(x, y), fn::convolve(x, y, mode), 1e-5,
                               1e-5);
         TM_CHECK_TENSOR_CLOSE(tf::FFTConvolve(tf::convolve_option().mode(mode))(x, y), fn::fftconvolve(x, y, mode),
                               1e-5, 1e-5);
     }
     // default mode is 'full'; forward aliases.
-    TM_CHECK_TENSOR_CLOSE(tf::Convolve().forward(x, y), fn::convolve(x, y, fn::full), 1e-5, 1e-5);
-    TM_CHECK_TENSOR_CLOSE(tf::FFTConvolve().forward(x, y), fn::fftconvolve(x, y, fn::full), 1e-5, 1e-5);
+    TM_CHECK_TENSOR_CLOSE(tf::Convolve().forward(x, y), fn::convolve(x, y), 1e-5, 1e-5);
+    TM_CHECK_TENSOR_CLOSE(tf::FFTConvolve().forward(x, y), fn::fftconvolve(x, y), 1e-5, 1e-5);
 
     // AddNoise: with and without lengths.
     const auto wav = torch::randn({2, 10});
@@ -992,6 +992,214 @@ static void test_mvdr_validation_and_setters() {
     TM_CHECK(tf::PSD(po)(spec, mask).size(-1) == 3);
 }
 
+// ======================== 2026-10-23 audit follow-up (progress02, task04-task09) ========================
+// Transform-side regressions of the functional parity fixes. Shared golden values are printed by
+// unit_test/audio/functional/gen_golden.py, transform-only ones by gen_golden.py here (torchaudio 2.5.1).
+static auto threw_inv(const std::function<void()> &fnc) -> bool {
+    try {
+        fnc();
+    } catch (const std::invalid_argument &) {
+        return true;
+    }
+    return false;
+}
+static auto vec(const std::vector<float> &v) -> tensor_t { return torch::tensor(v); }
+static auto mps_or_skip() -> c10::optional<torch::Device> {
+    return torch::mps::is_available() ? c10::optional<torch::Device>(torch::kMPS) : c10::nullopt;
+}
+
+// task04 -- AmplitudeToDB: torchaudio top_db packing (G1-1), top_db >= 0 (new), exact float64 (G1-7).
+static void test_amplitude_to_db_parity() {
+    auto c = torch::arange(1, 25, torch::kFloat).reshape({2, 3, 4});
+    c[1].mul_(1e-6);
+    const tf::AmplitudeToDB t40(tf::amplitude_to_db_option().top_db(40.0));
+    const auto out = t40(c); // (C, F, T): channel 1 is clipped to the GLOBAL max - 40 dB
+    TM_CHECK_TENSOR_CLOSE(out[1], torch::full({3, 4}, -29.2081871f), 1e-4, 1e-5);
+    TM_CHECK_CLOSE(out.max().item<float>(), 10.7918119, 1e-4);
+    TM_CHECK(threw_inv([] { tf::AmplitudeToDB(tf::amplitude_to_db_option().top_db(-5.0)); }));
+    const auto x64 = torch::tensor({1e-12, 0.3, 2.0}, torch::kDouble).reshape({1, 3});
+    TM_CHECK_TENSOR_CLOSE(tf::AmplitudeToDB()(x64), 10.0 * torch::log10(torch::clamp_min(x64, 1e-10)), 1e-12, 0.0);
+}
+
+// task05/task06 -- Spectrogram frame_length + unknown method + N-D; GriffinLim length/rank/rand_init.
+static void test_spectral_parity() {
+    const auto x = ramp16();
+    const auto fl = tf::Spectrogram(
+            tf::spectrogram_option().n_fft(8).win_length(8).hop_length(4).power(1.0).normalized(true).normalize_method(
+                    "frame_length"))(x);
+    TM_CHECK_TENSOR_CLOSE(fl[0], vec({1.62132013f, 5.65685368f, 11.3137074f, 16.970562f, 19.2383289f}), 1e-5, 1e-5);
+    TM_CHECK(threw_inv(
+            [&] { (void) tf::Spectrogram(tf::spectrogram_option().normalized(true).normalize_method("foo"))(x); }));
+    const auto nd = tf::Spectrogram(tf::spectrogram_option().n_fft(8))(torch::randn({2, 3, 16}));
+    TM_CHECK(nd.sizes() == torch::IntArrayRef({2, 3, 5, 5}));
+
+    const auto mag = tf::Spectrogram(tf::spectrogram_option().n_fft(8).win_length(8).hop_length(4))(x);
+    const auto base = tf::griffinlim_option().n_fft(8).win_length(8).hop_length(4).n_iter(8).momentum(0.99);
+    auto g18 = base;
+    const auto out18 = tf::GriffinLim(g18.rand_init(false).length(18))(mag);
+    TM_CHECK_TENSOR_CLOSE(out18.slice(0, 14), vec({11.5963821f, 13.2079496f, 14.0422859f, 14.814682f}), 1e-5, 1e-5);
+    auto gr = base;
+    torch::manual_seed(0); // default rand_init=true: torch.rand(complex) like torchaudio
+    const auto outr = tf::GriffinLim(gr.n_iter(4).momentum(0.5))(mag);
+    TM_CHECK_TENSOR_CLOSE(outr.slice(0, 0, 4), vec({0.146446496f, 0.303864747f, 2.44942617f, 3.81121278f}), 1e-5, 1e-5);
+    TM_CHECK(threw_inv([&] { (void) tf::GriffinLim(tf::griffinlim_option().n_fft(8))(mag[0]); }));
+}
+
+// task07 -- MFCC/LFCC multichannel top_db (G3-1/G1-1), LFCC + MelScale use sample_rate // 2 (new).
+static void test_feature_parity() {
+    const double pi = std::acos(-1.0);
+    const auto s = torch::sin(2.0 * pi * 0.11 * torch::arange(64, torch::kFloat));
+    const auto st = torch::stack({s, 1e-4 * torch::cos(2.0 * pi * 0.23 * torch::arange(64, torch::kFloat))});
+    const auto mf = tf::MFCC(
+            tf::mfcc_option().n_mfcc(4).mel(tf::mel_spectrogram_option().n_fft(16).hop_length(8).n_mels(6)))(st);
+    TM_CHECK(mf.sizes() == torch::IntArrayRef({2, 4, 9}));
+    const auto mf4 = tf::MFCC(tf::mfcc_option().n_mfcc(4).mel(
+            tf::mel_spectrogram_option().n_fft(16).hop_length(8).n_mels(6)))(torch::stack({st, st})); // (B, C, L)
+    TM_CHECK(mf4.sizes() == torch::IntArrayRef({2, 2, 4, 9}));
+    TM_CHECK_TENSOR_CLOSE(mf4[1], mf, 1e-4, 1e-5);
+    TM_CHECK_TENSOR_CLOSE(mf[1][0].slice(0, 0, 3), vec({-169.484497f, -169.483749f, -169.483643f}), 1e-3, 1e-5);
+
+    // LFCC at 11025 Hz: f_max = float(11025 // 2) -> identical to the 16 kHz golden (frequency-scale invariance).
+    const auto lf = tf::LFCC(tf::lfcc_option().sample_rate(11025).n_filter(4).n_lfcc(4).spec(
+            tf::spectrogram_option().n_fft(8).win_length(8).hop_length(4)))(ramp16());
+    const auto g16 = tf::LFCC(tf::lfcc_option().sample_rate(16000).n_filter(4).n_lfcc(4).spec(
+            tf::spectrogram_option().n_fft(8).win_length(8).hop_length(4)))(ramp16());
+    TM_CHECK_TENSOR_CLOSE(lf, g16, 1e-4, 1e-5);
+    TM_CHECK_TENSOR_CLOSE(lf[0], vec({-2.70190024f, 4.80322838f, 10.1434956f, 13.5267315f, 23.5368462f}), 1e-4, 1e-5);
+    // f_min in (sr // 2, sr / 2] is above the effective f_max at odd rates.
+    TM_CHECK(threw_inv([] { tf::MelScale(tf::mel_scale_option().sample_rate(11025).f_min(5512.25)); }));
+}
+
+// task08 -- Resample: kernel computed in float64 then cached as float32 (G4-12), validation in the constructor
+// (G4-2/G4-3), float32 target length (G4-6), rank/dtype checks (G4-14/G4-5); Speed/PitchShift reuse it.
+static void test_resample_parity() {
+    const tf::Resample r(tf::resample_option().orig_freq(48000).new_freq(16000));
+    const auto gk = vec({-0.0f,
+                         -8.17537966e-07f,
+                         -0.000183017488f,
+                         -0.000538223714f,
+                         0.000244590978f,
+                         0.00264129974f,
+                         0.00362526067f,
+                         -0.000861472392f,
+                         -0.00897746626f,
+                         -0.0108616697f,
+                         0.00169034046f,
+                         0.0213740058f,
+                         0.025451893f,
+                         -0.00251341448f,
+                         -0.0467810147f,
+                         -0.0594799332f,
+                         0.00311387354f,
+                         0.135345906f,
+                         0.271942794f,
+                         0.330000013f,
+                         0.271942794f,
+                         0.135345906f,
+                         0.00311387354f,
+                         -0.0594799332f,
+                         -0.0467810147f,
+                         -0.00251341448f,
+                         0.025451893f,
+                         0.0213740058f,
+                         0.00169034046f,
+                         -0.0108616697f,
+                         -0.00897746626f,
+                         -0.000861472392f,
+                         0.00362526067f,
+                         0.00264129974f,
+                         0.000244590978f,
+                         -0.000538223714f,
+                         -0.000183017488f,
+                         -8.17537966e-07f,
+                         -0.0f,
+                         -0.0f,
+                         -0.0f});
+    TM_CHECK(r.kernel().scalar_type() == torch::kFloat);
+    // dtype option: the kernel is computed and cached in that dtype (torchaudio Resample(dtype=...)).
+    const tf::Resample r64(tf::resample_option().orig_freq(48000).new_freq(16000).dtype(torch::kDouble));
+    TM_CHECK(r64.kernel().scalar_type() == torch::kDouble);
+    TM_CHECK_TENSOR_CLOSE(r64.kernel(),
+                          fn::_sinc_resample_kernel(48000, 16000, 16000, fn::resample_option(),
+                                                    tensor_options_t().dtype(torch::kDouble))
+                                  .first,
+                          0.0, 0.0);
+    TM_CHECK_TENSOR_CLOSE(r.kernel().flatten(), gk, 1e-9, 0.0);
+    TM_CHECK(tf::Resample(tf::resample_option().orig_freq(44100).new_freq(16000))(torch::zeros({1, 180697})).size(-1) ==
+             65559);
+    TM_CHECK(threw_inv([] { tf::Resample(tf::resample_option().orig_freq(0).new_freq(16000)); }));
+    TM_CHECK(threw_inv([] { tf::Resample(tf::resample_option().orig_freq(16000).new_freq(0)); }));
+    TM_CHECK(threw_inv(
+            [] { tf::Resample(tf::resample_option().orig_freq(16000).new_freq(8000).lowpass_filter_width(0)); }));
+    TM_CHECK(threw_inv([] { tf::Resample(tf::resample_option().orig_freq(16000).new_freq(8000).rolloff(0.0)); }));
+    TM_CHECK(threw_inv([&] { (void) r(torch::tensor(1.0f)); }));
+    TM_CHECK(threw_inv([&] { (void) r(torch::zeros({1, 30}, torch::kShort)); }));
+    TM_CHECK(threw_inv([] { tf::Speed(tf::speed_option().factor(0.0)); }));
+}
+
+// Cached buffers (window, fb, DCT, filter, kernel, phase advance) follow the input dtype/device (new finding).
+static void test_buffers_follow_input() {
+    torch::manual_seed(0);
+    const auto x = torch::randn({1, 2048});
+    const auto x64 = x.to(torch::kDouble);
+    const tf::MelSpectrogram mel(tf::mel_spectrogram_option().n_fft(64).n_mels(8));
+    TM_CHECK(mel(x64).scalar_type() == torch::kDouble);
+    TM_CHECK_TENSOR_CLOSE(mel(x64), mel(x), 1e-3, 1e-4);
+    const tf::MFCC mfcc(tf::mfcc_option().n_mfcc(4).mel(tf::mel_spectrogram_option().n_fft(64).n_mels(8)));
+    TM_CHECK(mfcc(x64).scalar_type() == torch::kDouble);
+    const tf::LFCC lfcc(tf::lfcc_option().n_filter(8).n_lfcc(4).spec(tf::spectrogram_option().n_fft(64)));
+    TM_CHECK(lfcc(x64).scalar_type() == torch::kDouble);
+    const auto spec64 = tf::Spectrogram(tf::spectrogram_option().n_fft(64))(x64);
+    TM_CHECK(tf::InverseMelScale(tf::inverse_mel_scale_option().n_stft(33).n_mels(8))(
+                     tf::MelScale(tf::mel_scale_option().n_stft(33).n_mels(8))(spec64))
+                     .scalar_type() == torch::kDouble);
+    const tf::Resample r(tf::resample_option().orig_freq(48000).new_freq(16000));
+    TM_CHECK_TENSOR_CLOSE(r(x64), fn::resample(x64, 48000, 16000), 1e-6, 0.0);
+    TM_CHECK(tf::Speed(tf::speed_option().factor(1.5))(x64).first.scalar_type() == torch::kDouble);
+    TM_CHECK(tf::PitchShift(tf::pitch_shift_option().n_steps(12))(x64).scalar_type() == torch::kDouble);
+    if (const auto dev = mps_or_skip()) {
+        const auto xd = x.to(*dev);
+        TM_CHECK_TENSOR_CLOSE(tf::Spectrogram()(xd), tf::Spectrogram()(x), 1e-2, 1e-4);
+        TM_CHECK_TENSOR_CLOSE(mfcc(xd), mfcc(x), 1e-2, 1e-4);
+        TM_CHECK_TENSOR_CLOSE(r(xd), r(x), 1e-4, 1e-4);
+        // (istft-based GriffinLim / PitchShift need aten ops MPS lacks: unfold_backward, angle)
+    }
+}
+
+// task11 -- review round 2 (progress02 D12). Goldens: gen_golden.py "task11" section (torchaudio 2.5.1).
+static void test_r2_pitch_shift_float64() {
+    // P1/R1: PitchShift builds the kernel in a non-float32 input's dtype, as torchaudio's lazy init does
+    // (the float32 kernel cast up was 6.4e-5 off here). torchaudio T.PitchShift(11025, 3, n_fft=400).double();
+    // the ~8e-8 left is its float64-cast window buffer, the same gap torchaudio has between its own F and T.
+    const auto t = torch::arange(3001, torch::kDouble);
+    const auto x = torch::stack({torch::sin(t * 0.05), 0.5 * torch::cos(t * 0.031)});
+    const tf::PitchShift ps(tf::pitch_shift_option().sample_rate(11025).n_steps(3).n_fft(400));
+    const auto y = ps(x);
+    TM_CHECK(y.scalar_type() == torch::kDouble);
+    TM_CHECK_TENSOR_CLOSE(y, fn::pitch_shift(x, 11025, 3, 12, 400), 0.0, 0.0);
+    TM_CHECK_CLOSE(y[0][2964].item<double>(), -0.804910047985357, 1e-6);
+    TM_CHECK_CLOSE(y[0][2954].item<double>(), -0.5985449840155338, 1e-6);
+    TM_CHECK_CLOSE(y[0][2977].item<double>(), -0.6640172823143292, 1e-6);
+    const auto xf = x.to(torch::kFloat); // float32 input keeps the cached float32 kernel
+    TM_CHECK_TENSOR_CLOSE(ps(xf), fn::pitch_shift(xf, 11025, 3, 12, 400), 0.0, 0.0);
+}
+
+static void test_r2_resample_kernel_and_equal_rates() {
+    // R2: a kernel with nf > 1 pins torchaudio's dtype=None phase (int64 arange, float32 division); computing the
+    // phase in float64 moves single taps by 1.9e-6. Checksums are float64 sums of torchaudio's float32 kernel.
+    const auto k = tf::Resample(tf::resample_option().orig_freq(44100).new_freq(16000)).kernel().to(torch::kDouble);
+    TM_CHECK(k.sizes() == torch::IntArrayRef({160, 1, 475}));
+    const auto wts = torch::sin(torch::arange(k.numel(), torch::kDouble) * 0.7).reshape(k.sizes());
+    TM_CHECK_CLOSE((k * wts).sum().item<double>(), -0.5908894421753382, 1e-9);
+    TM_CHECK_CLOSE(k.sum().item<double>(), 160.074687641316, 1e-9);
+    TM_CHECK_CLOSE(k.flatten()[38717].item<double>(), 0.1638711839914322, 0.0);
+
+    // P3: equal rates skip the filter-argument checks (torchaudio builds no kernel then).
+    const auto x = torch::randn({2, 100});
+    TM_CHECK(tf::Resample(tf::resample_option().orig_freq(8000).new_freq(8000).lowpass_filter_width(0))(x).equal(x));
+    TM_CHECK(tf::Resample(tf::resample_option().orig_freq(8000).new_freq(8000).rolloff(0.0))(x).equal(x));
+}
+
 int main() {
     test_spectrogram();
     test_spectral_centroid();
@@ -1027,5 +1235,12 @@ int main() {
     test_mvdr_offline();
     test_mvdr_online();
     test_mvdr_validation_and_setters();
+    TM_RUN(test_amplitude_to_db_parity);
+    TM_RUN(test_spectral_parity);
+    TM_RUN(test_feature_parity);
+    TM_RUN(test_resample_parity);
+    TM_RUN(test_buffers_follow_input);
+    TM_RUN(test_r2_pitch_shift_float64);
+    TM_RUN(test_r2_resample_kernel_and_equal_rates);
     return tm_test::summary("audio_test_transform");
 }

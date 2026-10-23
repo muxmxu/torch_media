@@ -16,6 +16,8 @@ namespace torchmedia::audio::transform {
         int _new_freq = 16000;
         int _lowpass_filter_width = 6;
         double _rolloff = 0.99;
+        // Kernel precision (torchaudio `dtype`): unset => computed in float64 and cached as float32.
+        c10::optional<torch::ScalarType> _dtype = c10::nullopt;
 
         auto orig_freq(int f) -> resample_option & {
             _orig_freq = f;
@@ -33,18 +35,29 @@ namespace torchmedia::audio::transform {
             _rolloff = r;
             return *this;
         }
+        auto dtype(torch::ScalarType d) -> resample_option & {
+            _dtype = d;
+            return *this;
+        }
     } resample_option_t;
 
     class Resample {
     public:
+        // The kernel is cached once (torchaudio dtype semantics) and moved to each input's device and dtype on use.
         explicit Resample(resample_option opt = {}) : _opt(opt) {
+            functional::resample_option fopt;
+            fopt.lowpass_filter_width = _opt._lowpass_filter_width;
+            fopt.rolloff = _opt._rolloff;
+            if (const auto err = functional::_check_resample_args(_opt._orig_freq, _opt._new_freq, fopt);
+                !err.empty()) {
+                (void) handle_exceptions<int, std::invalid_argument>("Resample: " + err);
+                return; // LIB_TORCH_MEDIA_NO_EXCEPTIONS: never build a kernel from invalid arguments
+            }
             if (_opt._orig_freq != _opt._new_freq) {
                 _gcd = std::gcd(_opt._orig_freq, _opt._new_freq);
-                functional::resample_option fopt;
-                fopt.lowpass_filter_width = _opt._lowpass_filter_width;
-                fopt.rolloff = _opt._rolloff;
                 auto kw = functional::_sinc_resample_kernel(_opt._orig_freq, _opt._new_freq, _gcd, fopt,
-                                                            tensor_options_t().dtype(torch::kFloat));
+                                                            _opt._dtype ? tensor_options_t().dtype(*_opt._dtype)
+                                                                        : tensor_options_t());
                 _kernel = kw.first;
                 _width = kw.second;
             }
@@ -53,6 +66,10 @@ namespace torchmedia::audio::transform {
         auto operator()(const_tensor_lref_t waveform) const -> tensor_t {
             if (_opt._orig_freq == _opt._new_freq) {
                 return waveform; // identity short-circuit
+            }
+            if (!_kernel.defined()) { // LIB_TORCH_MEDIA_NO_EXCEPTIONS: the constructor rejected the arguments
+                return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
+                                                                          "Resample: invalid arguments.");
             }
             return functional::_apply_sinc_resample_kernel(waveform, _opt._orig_freq, _opt._new_freq, _gcd, _kernel,
                                                            _width);
@@ -160,7 +177,7 @@ namespace torchmedia::audio::transform {
         std::vector<Speed> _speeders;
     };
 
-    // ---------------- PitchShift (stft -> phase_vocoder -> istft -> resample, eager kernel) ----------------
+    // ---------------- PitchShift (stft -> phase_vocoder -> istft -> resample, eager float32 kernel) ----------------
     typedef struct pitch_shift_option {
         int _sample_rate = 16000;
         int _n_steps = 0;
@@ -216,11 +233,21 @@ namespace torchmedia::audio::transform {
         auto operator()(const_tensor_lref_t waveform) const -> tensor_t {
             const auto stretched = functional::_stretch_waveform(
                     waveform, _opt._n_steps, _opt._bins_per_octave, _opt._n_fft, c10::optional<int>(_win_length),
-                    c10::optional<int>(_hop_length), c10::optional<tensor_t>(_window));
-            const tensor_t shifted = _orig_freq == _opt._sample_rate
-                                             ? stretched
-                                             : functional::_apply_sinc_resample_kernel(
-                                                       stretched, _orig_freq, _opt._sample_rate, _gcd, _kernel, _width);
+                    c10::optional<int>(_hop_length), c10::optional<tensor_t>(_window.to(waveform.device())));
+            tensor_t shifted = stretched;
+            if (_orig_freq != _opt._sample_rate) {
+                // torchaudio builds the kernel lazily in the input's dtype; the cached one is float32 (the common
+                // case). shortcut: a non-float32 input rebuilds the kernel per call (functional::pitch_shift's cost),
+                // cache one per dtype if float64 PitchShift gets hot.
+                const auto kernel =
+                        waveform.scalar_type() == _kernel.scalar_type()
+                                ? _kernel
+                                : functional::_sinc_resample_kernel(_orig_freq, _opt._sample_rate, _gcd,
+                                                                    functional::resample_option(), waveform.options())
+                                          .first;
+                shifted = functional::_apply_sinc_resample_kernel(stretched, _orig_freq, _opt._sample_rate, _gcd,
+                                                                  kernel, _width);
+            }
             return functional::_fix_waveform_shape(shifted, waveform.sizes().vec());
         }
 
@@ -275,7 +302,7 @@ namespace torchmedia::audio::transform {
                 (void) handle_exceptions<int, std::invalid_argument>(
                         "TimeStretch: no fixed_rate set; pass a valid rate to the call.");
             }
-            return functional::phase_vocoder(complex_specgrams, rate, _phase_advance);
+            return functional::phase_vocoder(complex_specgrams, rate, _phase_advance.to(complex_specgrams.device()));
         }
 
         auto forward(const_tensor_lref_t complex_specgrams, c10::optional<double> overriding_rate = c10::nullopt) const

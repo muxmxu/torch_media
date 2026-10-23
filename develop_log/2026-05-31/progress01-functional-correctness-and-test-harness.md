@@ -2,7 +2,7 @@
 id: 2026-05-31/progress01
 date: 2026-05-31
 author: human+ai
-status: active
+status: done
 refs: [2026-05-30/progress01]
 supersedes:
 commits: []
@@ -63,8 +63,9 @@ with dead test functions. A `.venv` (torch/torchaudio 2.5.1) is now available lo
   with `return_complex=true` internally, then `abs()` the complex result before `pow(power)`.
 
 ## Open / TODO (carry-over)
-- Tier-1 expansion: `create_dct`+`mfcc`, `griffinlim`, `resample`, `inverse_spectrogram` (next progress).
-- `mel_filter_bank` vectorization (replace per-element `.item()` loops) — perf, can be a follow-up.
+- Tier-1 expansion: `create_dct`+`mfcc`, `griffinlim`, `resample` — done in 2026-05-31/progress02;
+  `inverse_spectrogram` — done in 2026-06-01/progress01.
+- `mel_filter_bank` vectorization (replace per-element `.item()` loops) — done in 2026-10-23/progress02 (task07).
 
 ## Agent log
 - 2026-05-31 [ai] Ran a 4-way audit workflow; confirmed 5 bugs (D1) and designed the test/coverage strategy
@@ -75,3 +76,5 @@ with dead test functions. A `.venv` (torch/torchaudio 2.5.1) is now available lo
   each via red-test -> fix -> green with golden values from the .venv torchaudio; removed dead
   _check_shape_compatible. Result: ctest 100% green; _functional.hpp & _functional_methods_options.hpp at
   100% region/function/line/branch coverage (llvm-cov, _vendor/ excluded). Added gen_golden.py.
+- 2026-10-23 [ai] Status corrected to `done` (both tasks were done; flagged stale by the 2026-10-23 audit);
+  carry-overs annotated with where they landed.

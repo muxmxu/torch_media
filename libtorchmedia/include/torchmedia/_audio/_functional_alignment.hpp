@@ -33,12 +33,14 @@ namespace torchmedia::audio::functional {
         // Validation (mirrors the Python guard).
         if (L > 0) {
             if ((tgt == blank).any().item<bool>()) {
-                handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                                   "targets must not contain the blank index.");
+                return {handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
+                                                                           "targets must not contain the blank index."),
+                        torch::empty({1})};
             }
             if (tgt.max().item<int64_t>() >= C) {
-                handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                                   "max(targets) must be < the number of classes.");
+                return {handle_exceptions<tensor_t, std::invalid_argument>(
+                                torch::empty({1}), "max(targets) must be < the number of classes."),
+                        torch::empty({1})};
             }
         }
 

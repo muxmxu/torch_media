@@ -39,7 +39,7 @@ mag = T.Spectrogram(n_fft=NFFT, win_length=WIN, hop_length=HOP, power=2.0)(x)
 gl = T.GriffinLim(n_fft=NFFT, win_length=WIN, hop_length=HOP, power=2.0,
                   n_iter=8, momentum=0.99, rand_init=False, length=N)(mag)
 show("griffinlim_shape", list(gl.shape))               # [16]
-show("griffinlim", gl.flatten().tolist())
+show("griffinlim", [float(f"{v:.9g}") for v in gl.flatten().tolist()])
 
 # ---- InverseSpectrogram (round-trip of the complex STFT recovers x) ----
 spec_c = T.Spectrogram(n_fft=NFFT, win_length=WIN, hop_length=HOP, power=None)(x)
@@ -97,3 +97,26 @@ show("inverse_mel_scale", inv_ms.flatten().tolist())
 ones8 = torch.ones(8)
 for shp in ["linear", "exponential", "logarithmic", "quarter_sine", "half_sine"]:
     show(f"fade_{shp}", T.Fade(fade_in_len=3, fade_out_len=3, fade_shape=shp)(ones8).tolist())
+
+# ======================= 2026-10-23 audit follow-up (progress02, task04-task09) =======================
+# The functional gen_golden.py prints the shared values (amplitude_to_DB packing, frame_length, griffinlim
+# length/rand_init, MFCC stereo); only transform-specific goldens are here.
+# LFCC at an odd rate: f_max defaults to float(sample_rate // 2), so 11025 Hz equals the 16 kHz golden above.
+show("lfcc_11025", T.LFCC(sample_rate=11025, n_filter=N_MELS, n_lfcc=N_MELS,
+                          speckwargs=dict(n_fft=NFFT, win_length=WIN, hop_length=HOP))(x).flatten().tolist())
+# Resample caches a kernel computed in float64 and stored as float32 (dtype=None).
+show("resample_kernel_48k_16k", [float(f"{float(v):.9g}") for v in T.Resample(48000, 16000).kernel.flatten()])
+show("resample_44k1_16k_len", T.Resample(44100, 16000)(torch.zeros(1, 180697)).shape[-1])  # 65559
+
+# ======================= task11 -- review round 2 (progress02 D12) =======================
+import math
+_t = torch.arange(3001, dtype=torch.float64)
+_x2 = torch.stack([torch.sin(_t * 0.05), 0.5 * torch.cos(_t * 0.031)])
+# PitchShift on float64 input builds its kernel in float64 (lazy init with dtype=input.dtype).
+_ps = T.PitchShift(11025, 3, n_fft=400).double()(_x2)
+show("pitch_shift_f64 [0,2964]/[0,2954]/[0,2977]", [repr(float(_ps[0, i])) for i in (2964, 2954, 2977)])
+# Resample kernel at an nf > 1 pair (44.1k -> 16k: nf = 160): float64 checksums of the float32 kernel.
+_k = T.Resample(44100, 16000).kernel.double()
+_wts = torch.sin(torch.arange(_k.numel(), dtype=torch.float64) * 0.7).reshape(_k.shape)
+show("resample_kernel_44k1_16k shape/sum/wsum/[38717]",
+     [tuple(_k.shape), repr(float(_k.sum())), repr(float((_k * _wts).sum())), repr(float(_k.flatten()[38717]))])

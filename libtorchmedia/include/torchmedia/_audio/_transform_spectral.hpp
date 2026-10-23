@@ -10,13 +10,12 @@
 
 namespace torchmedia::audio::transform {
     namespace detail {
-        // torchaudio default-derivation: win_length defaults to n_fft; hop_length to win_length/2.
-        inline auto derive_win_length(int win_length, int n_fft) -> int { return win_length > 0 ? win_length : n_fft; }
-        inline auto derive_hop_length(int hop_length, int win_length) -> int {
-            return hop_length > 0 ? hop_length : win_length / 2;
-        }
+        // torchaudio default-derivation (win_length -> n_fft, hop_length -> win_length / 2), shared with functional.
+        using functional::detail::derive_hop_length;
+        using functional::detail::derive_win_length;
         // Cache the analysis window once (float32, like torchaudio's registered buffer). An explicit
-        // window passed via the option overrides the default Hann window.
+        // window passed via the option overrides the default Hann window. Calls move it to the input's device
+        // (the C++ stand-in for torchaudio's module.to(device)).
         inline auto make_window(const tensor_t &explicit_window, int win_length) -> tensor_t {
             return explicit_window.defined() ? explicit_window
                                              : torch::hann_window(win_length, tensor_options_t().dtype(torch::kFloat));
@@ -99,7 +98,7 @@ namespace torchmedia::audio::transform {
         auto operator()(const_tensor_lref_t waveform) const -> tensor_t {
             auto fopt = functional::spectrogram_option()
                                 .pad(_opt._pad)
-                                .window(_window)
+                                .window(_window.to(waveform.device()))
                                 .n_fft(_opt._n_fft)
                                 .hop_length(_opt._hop_length)
                                 .win_length(_opt._win_length)
@@ -182,9 +181,9 @@ namespace torchmedia::audio::transform {
 
         auto operator()(const_tensor_lref_t spectrogram, c10::optional<int64_t> length = c10::nullopt) const
                 -> tensor_t {
-            return functional::inverse_spectrogram(spectrogram, length, _opt._pad, _window, _opt._n_fft,
-                                                   _opt._hop_length, _opt._win_length, _opt._normalized, _opt._center,
-                                                   _opt._pad_mode, _opt._onesided);
+            return functional::inverse_spectrogram(spectrogram, length, _opt._pad, _window.to(spectrogram.device()),
+                                                   _opt._n_fft, _opt._hop_length, _opt._win_length, _opt._normalized,
+                                                   _opt._center, _opt._pad_mode, _opt._onesided);
         }
 
         auto forward(const_tensor_lref_t spectrogram, c10::optional<int64_t> length = c10::nullopt) const -> tensor_t {
@@ -264,7 +263,7 @@ namespace torchmedia::audio::transform {
             g.n_fft = _opt._n_fft;
             g.hop_length = _opt._hop_length;
             g.win_length = _opt._win_length;
-            g.window = _window;
+            g.window = _window.to(specgram.device());
             g.power = _opt._power;
             g.n_iter = _opt._n_iter;
             g.momentum = _opt._momentum;
@@ -326,8 +325,8 @@ namespace torchmedia::audio::transform {
         }
 
         auto operator()(const_tensor_lref_t waveform) const -> tensor_t {
-            return functional::spectral_centroid(waveform, _opt._sample_rate, _opt._pad, _window, _opt._n_fft,
-                                                 _opt._hop_length, _opt._win_length);
+            return functional::spectral_centroid(waveform, _opt._sample_rate, _opt._pad, _window.to(waveform.device()),
+                                                 _opt._n_fft, _opt._hop_length, _opt._win_length);
         }
 
         auto forward(const_tensor_lref_t waveform) const -> tensor_t { return (*this)(waveform); }

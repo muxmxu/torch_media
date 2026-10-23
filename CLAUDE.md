@@ -2,7 +2,8 @@
 
 torch_media (a.k.a. **TorchMedia / libtorchmedia**) is a **header-only C++ library** that
 reimplements **torchaudio / torchvision** functionality on top of **native libtorch
-(`torch::Tensor`) operators**. MIT licensed. Audio is partially implemented; vision is stubs.
+(`torch::Tensor`) operators**. MIT licensed. Audio covers torchaudio.functional and torchaudio.transforms
+(see develop_log/2026-06-01); vision has initial functional ops and image I/O.
 
 ## Collaboration model (development, not research)
 
@@ -68,7 +69,8 @@ See `develop_log/README.md` for file conventions, templates, and naming.
   assertion-based tests using `unit_test/test_util.hpp` (`TM_CHECK`, `TM_CHECK_TENSOR_CLOSE`) and
   registered with ctest. No eyeball / print-only tests.
 - A new or changed function is not "done" until covered; target **100% line coverage** for
-  `_audio/_functional*.hpp` and `_audio/_separation.hpp` (vendored `_vendor/` is excluded).
+  every `_audio/*.hpp` header (vendored `_vendor/` is excluded), measured as the union over the audio test
+  binaries (develop_log/2026-10-23/progress02 D11).
 - Golden reference values: prefer closed-form truths and libtorch self-reference (portable, no deps).
   Use the local `.venv` (torch/torchaudio 2.5.1) as a development-time point-wise cross-check.
 - `ctest --test-dir build` must be green before a task is marked done.

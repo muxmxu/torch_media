@@ -103,7 +103,8 @@ SOX -> FFmpeg (WIP in `_io.hpp`). Mux wants a dependency-light / "native" approa
 ## Open / TODO (carry-over)
 - FLAC / MP3 / OGG decode backends (dr_flac / dr_mp3 / stb_vorbis) — next progress.
 - torch-native `functional::resample` (sinc-as-convolution) — separate progress.
-- `TORCHMEDIA_WITH_FFMPEG` optional path + `THIRD_PARTY_LICENSES` file.
+- `TORCHMEDIA_WITH_FFMPEG` optional path. (`THIRD_PARTY_LICENSES` landed with task01; stale entry corrected
+  2026-10-23 after the audit flagged it.)
 - 24-bit / float32 WAV round-trip tests.
 
 ## Agent log

@@ -336,7 +336,7 @@ namespace torchmedia::audio::transform {
 
     // ---------------- Convolve / FFTConvolve (reuse functional::convolve_mode) ----------------
     typedef struct convolve_option {
-        functional::convolve_mode _mode = functional::full;
+        functional::convolve_mode _mode = functional::convolve_mode::full;
         auto mode(functional::convolve_mode m) -> convolve_option & {
             _mode = m;
             return *this;

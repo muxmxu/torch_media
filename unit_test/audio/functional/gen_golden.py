@@ -73,7 +73,7 @@ specg = F.spectrogram(wavg, pad=0, window=wing, n_fft=256, hop_length=64, win_le
                       normalized=False, center=True, pad_mode="reflect", onesided=True)
 recg = F.griffinlim(specg, window=wing, n_fft=256, hop_length=64, win_length=256, power=2.0,
                     n_iter=32, momentum=0.99, length=None, rand_init=False)
-show("griffinlim shape/sum/[0,1000]", [tuple(recg.shape), round(float(recg.sum()), 4), round(float(recg[0, 1000]), 6)])
+show("griffinlim shape/sum/[0,1000]", [tuple(recg.shape), repr(float(recg.sum())), repr(float(recg[0, 1000]))])
 
 # Tier 1 -- resample
 xr = torch.sin(2 * torch.pi * 3.0 * torch.arange(64.0) / 64.0).unsqueeze(0)
@@ -207,3 +207,77 @@ import math as _m
 _sr=16000; _t=torch.arange(int(0.5*_sr))/_sr
 _sig=torch.cat([torch.zeros(int(0.5*_sr)), 0.5*torch.sin(2*_m.pi*300*_t)]).reshape(1,-1)
 show("vad_out_len", int(F.vad(_sig,_sr).size(-1)))
+
+# ======================= 2026-10-23 audit follow-up (progress02, task04-task09) =======================
+import math
+
+def g9(t):  # 9 significant digits: enough to pin float32 values
+    return [float(f"{float(v):.9g}") for v in t.flatten()]
+
+# task04 -- amplitude_to_DB: top_db cutoff over (C, F, T) per packed batch item; AmplitudeToDB() defaults
+_c = torch.arange(1, 25, dtype=torch.float32).reshape(2, 3, 4)
+_c[1] *= 1e-6
+show("adb3_t40", g9(F.amplitude_to_DB(_c, 10.0, 1e-10, 0.0, 40.0)))
+show("adb4_t40", g9(F.amplitude_to_DB(torch.stack([_c, _c * 1e-3]), 10.0, 1e-10, 0.0, 40.0)))
+show("adb_default", g9(T.AmplitudeToDB()(_c)))
+show("adb_amin0", F.amplitude_to_DB(torch.tensor([[0.0, 1e-45, 1.0]]), 10.0, 0.0, 0.0, None).tolist())
+show("adb_f64", [repr(float(v)) for v in F.amplitude_to_DB(torch.tensor([[0.5, 0.25, 2.0]], dtype=torch.float64),
+                                                            20.0, 1e-10, math.log10(2.0), None).flatten()])
+show("db_to_amp_f64", [repr(float(v)) for v in F.DB_to_amplitude(torch.tensor([3.0, -7.5], dtype=torch.float64), 0.1, 0.3)])
+
+# task05 -- spectrogram normalized="frame_length" == torch.stft(normalized=True) (amplitude * n_fft^-0.5)
+_r = torch.arange(16, dtype=torch.float32)
+show("spec_fl_w8", g9(F.spectrogram(_r, 0, torch.hann_window(8), 8, 4, 8, 1.0, "frame_length")))
+show("spec_fl_w6", g9(F.spectrogram(_r, 0, torch.hann_window(6), 8, 4, 6, 1.0, "frame_length")))
+
+# task06 -- griffinlim: length passed to every istft; rand_init = torch.rand(complex) (seed 0)
+_mag = F.spectrogram(_r, 0, torch.hann_window(8), 8, 4, 8, 2.0, False)
+show("gl_len18", g9(F.griffinlim(_mag, torch.hann_window(8), 8, 4, 8, 2.0, 8, 0.99, 18, False)))
+torch.manual_seed(0)
+show("gl_rand_seed0", g9(F.griffinlim(_mag, torch.hann_window(8), 8, 4, 8, 2.0, 4, 0.5, None, True)))
+
+# task07 -- mel filterbank at an odd rate (sample_rate // 2 for bins and default f_max); MFCC sample_rate + stereo top_db
+for _ms, _nm in (("htk", None), ("slaney", "slaney")):
+    show(f"fb11025_{_ms}", g9(F.melscale_fbanks(9, 0.0, float(11025 // 2), 3, 11025, _nm, _ms).t()))
+_s = torch.sin(2 * math.pi * 0.11 * torch.arange(64.0))
+_st = torch.stack([_s, 1e-4 * torch.cos(2 * math.pi * 0.23 * torch.arange(64.0))])
+_mk = dict(n_fft=16, hop_length=8, n_mels=6)
+show("mfcc_sr8000", g9(T.MFCC(sample_rate=8000, n_mfcc=4, melkwargs=_mk)(_s)))
+show("mfcc_stereo", g9(T.MFCC(sample_rate=16000, n_mfcc=4, melkwargs=_mk)(_st)))
+
+# task08 -- resample: kernel dtype follows the waveform; float32 target length; torchaudio kernel multiply order
+_xr = torch.sin(2 * torch.pi * 3.0 * torch.arange(64.0) / 64.0).unsqueeze(0)
+_r64 = F.resample(_xr.double(), 64, 48)
+show("resample_f64 sum/[0,1]", [repr(float(_r64.sum())), repr(float(_r64[0, 1]))])
+show("resample_len_180697", F.resample(torch.zeros(1, 180697), 44100, 16000).shape[-1])  # 65559
+import torchaudio.functional.functional as _FF
+_k, _wd = _FF._get_sinc_resample_kernel(48000, 16000, 16000, dtype=torch.float32)
+show("kernel_f32_48k_16k width", _wd)
+show("kernel_f32_48k_16k", [repr(float(v)) for v in _k.flatten()])
+# pitch_shift at -12 steps on an odd length: Python round() is half-to-even (stretch length 1000, not 1001)
+_ps12 = F.pitch_shift(torch.sin(torch.arange(2001.0) * 0.05).unsqueeze(0), 16000, -12, n_fft=512)
+show("pitch_shift_m12 [2000]/[1999]/[1000]", [float(_ps12[0, 2000]), float(_ps12[0, 1999]), float(_ps12[0, 1000])])
+
+# coverage gaps (filtering / beamforming / alignment paths never exercised before)
+for _r in (48000, 88200):
+    show(f"riaa_{_r}", g9(F.riaa_biquad(torch.tensor([0.1, -0.2, 0.3, -0.4, 0.5, -0.6, 0.7, -0.8]), _r)))
+_wf = torch.tensor([[0.1, -0.2, 0.3, -0.4, 0.5, -0.6, 0.7, -0.8], [0.2, -0.1, 0.4, -0.3, 0.6, -0.5, 0.8, -0.7]])
+show("flanger_tri", g9(F.flanger(_wf, 8000, modulation="triangular", interpolation="linear")))
+_lg = torch.tensor([[2., 0, 0], [0, 3, 0], [0, 2, 0], [2, 0, 0], [0, 0, 3], [0, 0, 4]]).reshape(1, 6, 3)
+_p, _sc = F.forced_align(torch.log_softmax(_lg, -1), torch.tensor([[1, 2]], dtype=torch.int32), blank=0)
+show("forced_align_last_token", [_p.tolist(), g9(_sc)])
+_Ms = torch.complex(torch.arange(1, 13, dtype=torch.float32).reshape(3, 2, 2), torch.arange(1, 13, dtype=torch.float32).reshape(3, 2, 2) * 0.2)
+_Mn = torch.complex(torch.arange(13, 25, dtype=torch.float32).reshape(3, 2, 2) * 0.1, torch.arange(1, 13, dtype=torch.float32).reshape(3, 2, 2) * 0.3)
+_r1 = F.rtf_power(_Ms @ _Ms.conj().transpose(-1, -2) + 2 * torch.eye(2), _Mn @ _Mn.conj().transpose(-1, -2) + 2 * torch.eye(2), 0, n_iter=1)
+show("rtf_power_n1", [g9(_r1.real), g9(_r1.imag)])
+
+# ======================= task11 -- review round 2 (progress02 D12) =======================
+# create_dct is built in float32 (a float64 build cast down is up to 1.9e-5 off at these entries).
+_d40, _d13 = F.create_dct(40, 128, None), F.create_dct(13, 40, "ortho")
+show("dct40x128 [122,36]/[84,34]/[98,28]", [repr(float(_d40[r, c])) for r, c in ((122, 36), (84, 34), (98, 28))])
+show("dct13x40o [34,12]/[27,11]", [repr(float(_d13[r, c])) for r, c in ((34, 12), (27, 11))])
+# spectral_centroid on float64 input: torchaudio's bin frequencies are a float32 linspace.
+_t = torch.arange(3001, dtype=torch.float64)
+_x2 = torch.stack([torch.sin(_t * 0.05), 0.5 * torch.cos(_t * 0.031)])
+_sc = F.spectral_centroid(_x2, 16000, 0, torch.hann_window(384, dtype=torch.float64), 384, 96, 384)
+show("sc_f64_16k [0,0]/[0,31]/[0,1]", [repr(float(_sc[0, i])) for i in (0, 31, 1)])

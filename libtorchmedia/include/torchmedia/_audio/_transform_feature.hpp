@@ -30,15 +30,18 @@ namespace torchmedia::audio::transform {
 
     class AmplitudeToDB {
     public:
-        explicit AmplitudeToDB(amplitude_to_db_option opt = {}) : _opt(opt) {}
+        explicit AmplitudeToDB(amplitude_to_db_option opt = {}) : _opt(opt) {
+            if (_opt._has_top_db && _opt._top_db < 0.0) {
+                (void) handle_exceptions<int, std::invalid_argument>("AmplitudeToDB: top_db must be positive value.");
+            }
+        }
 
         auto operator()(const_tensor_lref_t signal) const -> tensor_t {
-            const float multiplier = _opt._stype == db_stype::power ? 10.0f : 20.0f;
             const auto o = functional::amplitude_to_db_option()
-                                   .set_multiplier(multiplier)
-                                   .set_amin(1e-10f)
-                                   .set_db_multiplier(0.0f)
-                                   .set_top_db(static_cast<float>(_opt._top_db))
+                                   .set_multiplier(_opt._stype == db_stype::power ? 10.0 : 20.0)
+                                   .set_amin(1e-10)
+                                   .set_db_multiplier(0.0)
+                                   .set_top_db(_opt._top_db)
                                    .set_apply_top_db(_opt._has_top_db);
             return functional::amplitude_to_DB(signal, o);
         }
@@ -90,10 +93,9 @@ namespace torchmedia::audio::transform {
     } mel_scale_option_t;
 
     namespace detail {
-        // torchaudio raises when f_min > f_max (f_max defaulting to Nyquist).
+        // torchaudio raises when f_min > f_max (f_max defaulting to float(sample_rate // 2)).
         inline void check_f_min_max(double f_min, double f_max, int sample_rate) {
-            const double eff_f_max = f_max > 0.0 ? f_max : sample_rate / 2.0;
-            if (f_min > eff_f_max) {
+            if (f_min > functional::detail::effective_f_max(f_max, sample_rate)) {
                 (void) handle_exceptions<int, std::invalid_argument>("MelScale: require f_min <= f_max.");
             }
         }
@@ -108,8 +110,10 @@ namespace torchmedia::audio::transform {
         }
 
         // _fb is (n_mels, n_stft); functional::mel_scale projects it (rank-preserving matmul:
-        // (..., freq, time) -> (..., n_mels, time)).
-        auto operator()(const_tensor_lref_t specgram) const -> tensor_t { return functional::mel_scale(specgram, _fb); }
+        // (..., freq, time) -> (..., n_mels, time)) after moving it to the input's device and dtype.
+        auto operator()(const_tensor_lref_t specgram) const -> tensor_t {
+            return functional::mel_scale(specgram, _fb.to(specgram.device(), specgram.scalar_type()));
+        }
 
         auto forward(const_tensor_lref_t specgram) const -> tensor_t { return (*this)(specgram); }
 
@@ -199,7 +203,7 @@ namespace torchmedia::audio::transform {
             }
             const int64_t time = shape.back();
             const auto packed = melspec.reshape({-1, static_cast<int64_t>(_opt._n_mels), time}); // (B, n_mels, time)
-            const auto A = _fb.unsqueeze(0); // (1, n_mels, n_stft)
+            const auto A = _fb.to(melspec.device(), melspec.scalar_type()).unsqueeze(0); // (1, n_mels, n_stft)
             const auto solution = std::get<0>(torch::linalg_lstsq(
                     A, packed, c10::nullopt, c10::optional<c10::string_view>(detail::driver_name(_opt._driver))));
             const auto specgram = torch::relu(solution); // (B, n_stft, time)
@@ -300,30 +304,29 @@ namespace torchmedia::audio::transform {
 
     class MelSpectrogram {
     public:
-        explicit MelSpectrogram(mel_spectrogram_option opt = {}) : _opt(opt) {
-            const int win = detail::derive_win_length(_opt._win_length, _opt._n_fft);
-            const int hop = detail::derive_hop_length(_opt._hop_length, win);
-            _spectrogram = Spectrogram(spectrogram_option()
-                                               .pad(_opt._pad)
-                                               .n_fft(_opt._n_fft)
-                                               .win_length(win)
-                                               .hop_length(hop)
-                                               .power(_opt._power)
-                                               .normalized(_opt._normalized)
-                                               .center(_opt._center)
-                                               .pad_mode(_opt._pad_mode)
-                                               .onesided(true)
-                                               .return_complex(false)
-                                               .window(_opt._window));
-            _mel_scale = MelScale(mel_scale_option()
-                                          .n_mels(_opt._n_mels)
-                                          .sample_rate(_opt._sample_rate)
-                                          .n_stft(_opt._n_fft / 2 + 1)
-                                          .f_min(_opt._f_min)
-                                          .f_max(_opt._f_max)
-                                          .norm(_opt._norm)
-                                          .mel_scale(_opt._mel_scale));
-        }
+        // Members are built in the initializer list (Spectrogram derives win/hop from 0), so no default-configured
+        // sub-transform is constructed and thrown away.
+        explicit MelSpectrogram(mel_spectrogram_option opt = {}) :
+            _opt(std::move(opt)), _spectrogram(spectrogram_option()
+                                                       .pad(_opt._pad)
+                                                       .n_fft(_opt._n_fft)
+                                                       .win_length(_opt._win_length)
+                                                       .hop_length(_opt._hop_length)
+                                                       .power(_opt._power)
+                                                       .normalized(_opt._normalized)
+                                                       .center(_opt._center)
+                                                       .pad_mode(_opt._pad_mode)
+                                                       .onesided(true)
+                                                       .return_complex(false)
+                                                       .window(_opt._window)),
+            _mel_scale(mel_scale_option()
+                               .n_mels(_opt._n_mels)
+                               .sample_rate(_opt._sample_rate)
+                               .n_stft(_opt._n_fft / 2 + 1)
+                               .f_min(_opt._f_min)
+                               .f_max(_opt._f_max)
+                               .norm(_opt._norm)
+                               .mel_scale(_opt._mel_scale)) {}
 
         auto operator()(const_tensor_lref_t waveform) const -> tensor_t { return _mel_scale(_spectrogram(waveform)); }
 
@@ -372,30 +375,34 @@ namespace torchmedia::audio::transform {
 
     class MFCC {
     public:
-        explicit MFCC(mfcc_option opt = {}) : _opt(opt) {
+        explicit MFCC(mfcc_option opt = {}) :
+            _opt(std::move(opt)), _melspec(with_sample_rate(_opt._mel, _opt._sample_rate)),
+            _amplitude_to_db(amplitude_to_db_option().stype(db_stype::power).top_db(80.0)) {
             if (_opt._dct_type != 2) {
                 (void) handle_exceptions<int, std::invalid_argument>("MFCC: only dct_type == 2 is supported.");
             }
-            mel_spectrogram_option mel = _opt._mel;
-            mel._sample_rate = _opt._sample_rate; // torchaudio: MelSpectrogram(sample_rate, **melkwargs)
-            if (_opt._n_mfcc > mel._n_mels) {
+            if (_opt._n_mfcc > _opt._mel._n_mels) {
                 (void) handle_exceptions<int, std::invalid_argument>(
                         "MFCC: cannot select more MFCC coefficients than mel bins.");
             }
-            _melspec = MelSpectrogram(mel);
-            _amplitude_to_db = AmplitudeToDB(amplitude_to_db_option().stype(db_stype::power).top_db(80.0));
-            _dct = functional::create_dct(_opt._n_mfcc, mel._n_mels, _opt._norm); // (n_mels, n_mfcc)
+            _dct = functional::create_dct(_opt._n_mfcc, _opt._mel._n_mels, _opt._norm); // (n_mels, n_mfcc)
         }
 
         auto operator()(const_tensor_lref_t waveform) const -> tensor_t {
             const auto mel = _melspec(waveform);
             const auto feat = _opt._log_mels ? torch::log(mel + 1e-6) : _amplitude_to_db(mel);
-            return torch::matmul(feat.transpose(-2, -1), _dct).transpose(-2, -1);
+            return torch::matmul(feat.transpose(-2, -1), _dct.to(feat.device(), feat.scalar_type())).transpose(-2, -1);
         }
 
         auto forward(const_tensor_lref_t waveform) const -> tensor_t { return (*this)(waveform); }
 
     private:
+        // torchaudio: MelSpectrogram(sample_rate=sample_rate, **melkwargs) -- MFCC's rate overrides the mel option's.
+        static auto with_sample_rate(mel_spectrogram_option mel, int sample_rate) -> mel_spectrogram_option {
+            mel._sample_rate = sample_rate;
+            return mel;
+        }
+
         mfcc_option _opt;
         MelSpectrogram _melspec;
         AmplitudeToDB _amplitude_to_db;
@@ -465,7 +472,7 @@ namespace torchmedia::audio::transform {
             _spectrogram = Spectrogram(_opt._spec);
             _amplitude_to_db = AmplitudeToDB(amplitude_to_db_option().stype(db_stype::power).top_db(80.0));
             const int n_freqs = _opt._spec._n_fft / 2 + 1;
-            const double eff_f_max = _opt._f_max > 0.0 ? _opt._f_max : _opt._sample_rate / 2.0;
+            const double eff_f_max = functional::detail::effective_f_max(_opt._f_max, _opt._sample_rate);
             _filter = functional::linear_fbanks(n_freqs, _opt._f_min, eff_f_max, _opt._n_filter,
                                                 _opt._sample_rate); // (n_freqs, n_filter)
             _dct = functional::create_dct(_opt._n_lfcc, _opt._n_filter, _opt._norm); // (n_filter, n_lfcc)
@@ -473,9 +480,10 @@ namespace torchmedia::audio::transform {
 
         auto operator()(const_tensor_lref_t waveform) const -> tensor_t {
             auto spec = _spectrogram(waveform); // (..., n_freqs, time)
-            spec = torch::matmul(spec.transpose(-2, -1), _filter).transpose(-2, -1); // (..., n_filter, time)
+            const auto like_spec = [&spec](const tensor_t &t) { return t.to(spec.device(), spec.scalar_type()); };
+            spec = torch::matmul(spec.transpose(-2, -1), like_spec(_filter)).transpose(-2, -1); // (..., n_filter, time)
             spec = _opt._log_lf ? torch::log(spec + 1e-6) : _amplitude_to_db(spec);
-            return torch::matmul(spec.transpose(-2, -1), _dct).transpose(-2, -1); // (..., n_lfcc, time)
+            return torch::matmul(spec.transpose(-2, -1), like_spec(_dct)).transpose(-2, -1); // (..., n_lfcc, time)
         }
 
         auto forward(const_tensor_lref_t waveform) const -> tensor_t { return (*this)(waveform); }

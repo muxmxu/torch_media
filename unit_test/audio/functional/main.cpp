@@ -1,10 +1,12 @@
 // Assertion-based tests for the audio functional layer (target: 100% coverage of _functional*.hpp).
 // Golden values verified against torchaudio 2.5.1 (see gen_golden.py). Bug regression tests are RED
 // against the pre-fix _functional.hpp and GREEN after task02's fixes.
+#include <chrono>
 #include <cmath>
 #include <stdexcept>
 #include <torch/torch.h>
 #include <torchmedia.hpp>
+#include <type_traits>
 #include "test_util.hpp"
 
 using namespace torchmedia::audio::functional;
@@ -14,32 +16,32 @@ static const double PI = std::acos(-1.0);
 static void test_convolve_full_length() {
     auto x = torch::tensor({1.f, 2.f, 3.f, 4.f}).reshape({1, 4});
     auto y = torch::tensor({1.f, 1.f}).reshape({1, 2});
-    TM_CHECK(convolve(x, y, full).size(-1) == 5); // N + M - 1
+    TM_CHECK(convolve(x, y, convolve_mode::full).size(-1) == 5); // N + M - 1
 }
 
 // bug#4: 'same' returns the FIRST input's length; 'valid' = max-min+1 (x shorter than y)
 static void test_convolve_modes() {
     auto x = torch::tensor({1.f, 2.f, 3.f}).reshape({1, 3});
     auto y = torch::tensor({1.f, 1.f, 1.f, 1.f, 1.f}).reshape({1, 5});
-    TM_CHECK(convolve(x, y, full).size(-1) == 7);
-    TM_CHECK(convolve(x, y, same).size(-1) == 3); // first input length
-    TM_CHECK(convolve(x, y, valid).size(-1) == 3); // 5 - 3 + 1
+    TM_CHECK(convolve(x, y, convolve_mode::full).size(-1) == 7);
+    TM_CHECK(convolve(x, y, convolve_mode::same).size(-1) == 3); // first input length
+    TM_CHECK(convolve(x, y, convolve_mode::valid).size(-1) == 3); // 5 - 3 + 1
 }
 
 static void test_convolve_broadcast_and_errors() {
     // differing ndim -> dimension-alignment (unsqueeze) branches
-    TM_CHECK(convolve(torch::randn({1, 10}), torch::randn({4}), full).size(-1) == 13); // unsqueeze y
-    TM_CHECK(convolve(torch::randn({5}), torch::randn({1, 3}), full).size(-1) == 7); // unsqueeze x
+    TM_CHECK(convolve(torch::randn({1, 10}), torch::randn({4}), convolve_mode::full).size(-1) == 13); // unsqueeze y
+    TM_CHECK(convolve(torch::randn({5}), torch::randn({1, 3}), convolve_mode::full).size(-1) == 7); // unsqueeze x
 
     // multi-dim leading dims with broadcasting
     auto x = torch::randn({2, 1, 10});
     auto y = torch::randn({1, 3, 4});
-    auto out = convolve(x, y, full);
+    auto out = convolve(x, y, convolve_mode::full);
     TM_CHECK(out.size(0) == 2 && out.size(1) == 3);
 
     bool threw_0d = false;
     try {
-        convolve(torch::tensor(1.0f), torch::tensor(1.0f), full);
+        convolve(torch::tensor(1.0f), torch::tensor(1.0f), convolve_mode::full);
     } catch (const std::invalid_argument &) {
         threw_0d = true;
     }
@@ -47,7 +49,7 @@ static void test_convolve_broadcast_and_errors() {
 
     bool threw_0d_y = false; // x is >=1D, y is 0D -> exercises the y.dim()==0 side of the ||
     try {
-        (void) convolve(torch::tensor({1.f, 2.f}).reshape({1, 2}), torch::tensor(1.0f), full);
+        (void) convolve(torch::tensor({1.f, 2.f}).reshape({1, 2}), torch::tensor(1.0f), convolve_mode::full);
     } catch (const std::invalid_argument &) {
         threw_0d_y = true;
     }
@@ -139,14 +141,7 @@ static void test_spectrogram_branches() {
                                           .normalized(true)
                                           .normalize_method("frame_length"));
     TM_CHECK(sp_fl.size(-2) == 201);
-    // normalized=true but an unrecognized method -> neither normalize branch taken
-    auto sp_none = spectrogram(sig, spectrogram_option()
-                                            .window(torch::hann_window(400))
-                                            .power(2.0)
-                                            .return_complex(false)
-                                            .normalized(true)
-                                            .normalize_method("none"));
-    TM_CHECK(sp_none.size(-2) == 201);
+    // an unrecognized method now throws: see test_spectrogram_frame_length_parity
 }
 
 // ---------------- mel (bug#1) ----------------
@@ -242,8 +237,8 @@ static void test_griffinlim() {
     g.rand_init = false;
     auto rec = griffinlim(spec, g);
     TM_CHECK(rec.size(-1) == 1984); // golden shape
-    TM_CHECK_CLOSE(rec.sum().item<double>(), 901.7087, 5.0); // golden sum
-    TM_CHECK_CLOSE(rec[0][1000].item<double>(), -0.03503, 0.02); // golden sample (same ATen ops -> close)
+    TM_CHECK_CLOSE(rec.sum().item<double>(), 901.7086791992188, 1e-3); // golden sum (same ATen ops -> bit-exact)
+    TM_CHECK_CLOSE(rec[0][1000].item<double>(), -0.035030048340559006, 1e-6); // golden sample
 }
 
 static void test_griffinlim_branches() {
@@ -597,11 +592,12 @@ static void test_feature_ops() {
 static void test_fftconvolve_addnoise_speed() {
     auto x = torch::tensor({{1.f, 2.f, 3.f, 4.f}});
     auto y = torch::tensor({{1.f, 1.f, 1.f}});
-    TM_CHECK_TENSOR_CLOSE(fftconvolve(x, y, full), torch::tensor({{1.f, 3.f, 6.f, 9.f, 7.f, 4.f}}), 1e-4, 1e-4);
-    TM_CHECK_TENSOR_CLOSE(fftconvolve(x, y, valid), torch::tensor({{6.f, 9.f}}), 1e-4, 1e-4);
-    TM_CHECK_TENSOR_CLOSE(fftconvolve(x, y, same), torch::tensor({{3.f, 6.f, 9.f, 7.f}}), 1e-4, 1e-4);
+    TM_CHECK_TENSOR_CLOSE(fftconvolve(x, y, convolve_mode::full), torch::tensor({{1.f, 3.f, 6.f, 9.f, 7.f, 4.f}}), 1e-4,
+                          1e-4);
+    TM_CHECK_TENSOR_CLOSE(fftconvolve(x, y, convolve_mode::valid), torch::tensor({{6.f, 9.f}}), 1e-4, 1e-4);
+    TM_CHECK_TENSOR_CLOSE(fftconvolve(x, y, convolve_mode::same), torch::tensor({{3.f, 6.f, 9.f, 7.f}}), 1e-4, 1e-4);
     // fftconvolve agrees with the time-domain convolve()
-    TM_CHECK_TENSOR_CLOSE(fftconvolve(x, y, full), convolve(x, y, full), 1e-4, 1e-4);
+    TM_CHECK_TENSOR_CLOSE(fftconvolve(x, y, convolve_mode::full), convolve(x, y, convolve_mode::full), 1e-4, 1e-4);
 
     auto wav = torch::tensor({{1.f, 2.f, 3.f, 4.f}, {0.5f, -0.5f, 0.5f, -0.5f}});
     auto noise = torch::tensor({{0.1f, 0.1f, 0.1f, 0.1f}, {0.2f, -0.2f, 0.2f, -0.2f}});
@@ -997,6 +993,544 @@ static void test_coverage_gaps() {
     TM_CHECK(cmn_nv1.sizes() == torch::IntArrayRef({4, 3}));
 }
 
+// ======================== 2026-10-23 audit follow-up (progress02, task04-task09) ========================
+// Golden values: gen_golden.py "2026-10-23 audit follow-up" section (torchaudio 2.5.1).
+static auto ramp16() -> torch::Tensor { return torch::arange(16, torch::kFloat); }
+static auto vec(const std::vector<float> &v) -> torch::Tensor { return torch::tensor(v); }
+static auto mps_or_skip() -> c10::optional<torch::Device> {
+    return torch::mps::is_available() ? c10::optional<torch::Device>(torch::kMPS) : c10::nullopt;
+}
+
+// task04 -- amplitude_to_DB mirrors torchaudio: top_db cutoff over (C, F, T) per packed batch item (G1-1/G3-1),
+// AmplitudeToDB() defaults (G1-2), amin without a FLT_MIN floor (G1-6), double-precision parameters (G1-7).
+static auto adb_input() -> torch::Tensor {
+    auto c = torch::arange(1, 25, torch::kFloat).reshape({2, 3, 4});
+    c[1].mul_(1e-6);
+    return c;
+}
+static const std::vector<float> g_adb_ch0 = {0.0f,        3.01030016f, 4.77121258f, 6.02060032f,
+                                             6.98970032f, 7.78151274f, 8.45098019f, 9.0309f,
+                                             9.54242516f, 10.0f,       10.4139271f, 10.7918119f};
+
+static void test_amplitude_to_DB_top_db_packing() {
+    const auto c = adb_input();
+    const auto o40 = amplitude_to_db_option().set_db_multiplier(0.0).set_top_db(40.0);
+    // 3-D (C, F, T): one cutoff (global max - 40) shared by both channels -> channel 1 is clipped to -29.208.
+    auto g3 = g_adb_ch0;
+    g3.insert(g3.end(), 12, -29.2081871f);
+    TM_CHECK_TENSOR_CLOSE(amplitude_to_DB(c, o40), vec(g3).reshape({2, 3, 4}), 1e-4, 1e-5);
+    // 4-D (B, C, F, T): one cutoff per batch item.
+    auto g4 = g3;
+    for (const float v: {-30.0f, -26.9897003f, -25.2287865f, -23.9793987f, -23.0102997f, -22.2184868f, -21.5490189f,
+                         -20.969101f, -20.4575748f, -20.0f, -19.5860729f, -19.2081871f}) {
+        g4.push_back(v);
+    }
+    g4.insert(g4.end(), 12, -59.2081871f);
+    TM_CHECK_TENSOR_CLOSE(amplitude_to_DB(torch::stack({c, c * 1e-3}), o40), vec(g4).reshape({2, 2, 3, 4}), 1e-4, 1e-5);
+    // 2-D (F, T) packs to one channel: the cutoff is the max over the whole matrix.
+    TM_CHECK_TENSOR_CLOSE(amplitude_to_DB(torch::tensor({{1.0f, 1e-6f}, {0.1f, 1e-2f}}), o40),
+                          torch::tensor({{0.0f, -40.0f}, {-10.0f, -20.0f}}), 1e-4, 1e-5);
+    // top_db needs (F, T): torchaudio raises for 1-D input.
+    TM_CHECK(raises_inv([&] { (void) amplitude_to_DB(c.flatten(), o40); }));
+}
+
+static void test_amplitude_to_DB_defaults_amin_precision() {
+    // default option == torchaudio AmplitudeToDB(): ref 1.0 (db_multiplier 0), no top_db.
+    auto gd = g_adb_ch0;
+    for (const float v: {-48.8605652f, -48.5387192f, -48.23909f, -47.9587975f, -47.6955109f, -47.4472771f, -47.2124634f,
+                         -46.9897003f, -46.7778053f, -46.5757751f, -46.3827209f, -46.1978874f}) {
+        gd.push_back(v);
+    }
+    TM_CHECK_TENSOR_CLOSE(amplitude_to_DB(adb_input()), vec(gd).reshape({2, 3, 4}), 1e-4, 1e-5);
+    // amin is used as given: amin=0 maps an exact zero to -inf like torch.clamp(x, min=0) + log10.
+    const auto z = amplitude_to_DB(torch::tensor({0.0f, 1e-45f, 1.0f}).reshape({1, 3}),
+                                   amplitude_to_db_option().set_amin(0.0));
+    TM_CHECK(std::isinf(z[0][0].item<float>()) && z[0][0].item<float>() < 0.0f);
+    TM_CHECK_CLOSE(z[0][1].item<float>(), -448.5346984863281, 1e-3);
+    // double parameters keep float64 input exact (db_multiplier = log10(2), multiplier 20).
+    const auto x64 = torch::tensor({0.5, 0.25, 2.0}, torch::kDouble).reshape({1, 3});
+    const auto d64 =
+            amplitude_to_DB(x64, amplitude_to_db_option().set_multiplier(20.0).set_db_multiplier(std::log10(2.0)));
+    TM_CHECK_TENSOR_CLOSE(d64,
+                          torch::tensor({-12.041199826559248, -18.06179973983887, 0.0}, torch::kDouble).reshape({1, 3}),
+                          1e-12, 0.0);
+    TM_CHECK_TENSOR_CLOSE(db_to_amplitude(torch::tensor({3.0, -7.5}, torch::kDouble), 0.1, 0.3),
+                          torch::tensor({0.12302687708123816, 0.05956621435290105}, torch::kDouble), 1e-15, 0.0);
+}
+
+// task05 -- spectrogram: frame_length == torch.stft(normalized=true) (G2-1), unknown method throws (G2-8),
+// N-D input packed to (-1, L) (G2-3/G3-5), win/hop 0 => derived from n_fft (G2-5/G3-6).
+static void test_spectrogram_frame_length_parity() {
+    const auto opt = spectrogram_option()
+                             .n_fft(8)
+                             .win_length(8)
+                             .hop_length(4)
+                             .power(1.0)
+                             .return_complex(false)
+                             .normalized(true)
+                             .normalize_method("frame_length");
+    const auto g8 = vec({1.62132013f,  5.65685368f,     11.3137074f,     16.970562f,      19.2383289f,
+                         0.207106829f, 3.13561893f,     5.8165369f,      8.59256077f,     10.0821371f,
+                         0.707106769f, 0.292893291f,    0.29289344f,     0.292893618f,    0.612372339f,
+                         0.207106829f, 0.0606605262f,   0.0606608614f,   0.0606610291f,   0.207107008f,
+                         0.207106665f, 3.37174782e-07f, 6.74349565e-07f, 6.74349565e-07f, 0.146445796f});
+    TM_CHECK_TENSOR_CLOSE(spectrogram(ramp16(), opt), g8.reshape({5, 5}), 1e-5, 1e-5);
+    // win_length (6) != n_fft (8): the scale is n_fft^-0.5, not 1/win_length.
+    auto opt6 = opt;
+    opt6.win_length(6);
+    const auto g6 =
+            vec({0.883883476f,    4.2426405f,  8.48528099f,   12.7279215f,  14.6724653f,  0.37499997f,  3.00390244f,
+                 5.87378502f,     8.7729435f,  10.2146606f,   0.353553414f, 0.883883297f, 1.51038051f,  2.18660665f,
+                 2.70416307f,     0.37499997f, 0.0884265229f, 0.172907904f, 0.258251131f, 0.359783262f, 0.176776648f,
+                 1.68587391e-07f, 0.0f,        0.0f,          0.176776692f});
+    TM_CHECK_TENSOR_CLOSE(spectrogram(ramp16(), opt6), g6.reshape({5, 5}), 1e-5, 1e-5);
+    // an unknown method throws instead of silently skipping normalization (torchaudio ValueError).
+    auto bad = opt;
+    bad.normalize_method("none");
+    TM_CHECK(raises_inv([&] { (void) spectrogram(ramp16(), bad); }));
+}
+
+static void test_spectrogram_nd_and_defaults() {
+    torch::manual_seed(0);
+    const auto x = torch::randn({2, 3, 64});
+    const auto opt = spectrogram_option().n_fft(16).win_length(16).hop_length(8).return_complex(false);
+    const auto s = spectrogram(x, opt);
+    TM_CHECK(s.sizes() == torch::IntArrayRef({2, 3, 9, 9}));
+    TM_CHECK_TENSOR_CLOSE(s[1][2], spectrogram(x[1][2], opt), 1e-6, 1e-6);
+    const auto c = spectrogram(torch::randn({2, 2, 2, 64}), spectrogram_option().n_fft(16).return_complex(true));
+    TM_CHECK(c.is_complex() && c.sizes() == torch::IntArrayRef({2, 2, 2, 9, 9}));
+
+    // only n_fft set: win_length = n_fft, hop_length = win_length / 2 (torchaudio transform defaults).
+    const auto w = torch::randn({1, 1024});
+    const auto d = spectrogram(w, spectrogram_option().n_fft(256).return_complex(false));
+    TM_CHECK(d.sizes() == torch::IntArrayRef({1, 129, 9}));
+    TM_CHECK_TENSOR_CLOSE(
+            d, spectrogram(w, spectrogram_option().n_fft(256).win_length(256).hop_length(128).return_complex(false)),
+            0.0, 0.0);
+    // the default n_fft=400 still derives win 400 / hop 200.
+    TM_CHECK_TENSOR_CLOSE(spectrogram(w, spectrogram_option()),
+                          spectrogram(w, spectrogram_option().win_length(400).hop_length(200)), 0.0, 0.0);
+    mel_spectrogram_option mo;
+    mo.n_fft = 1024;
+    TM_CHECK(melspectrogram(torch::randn({1, 16000}), mo).sizes() == torch::IntArrayRef({1, 128, 32}));
+    TM_CHECK(raises_inv([] { (void) spectrogram(torch::tensor(1.0f), spectrogram_option()); })); // no time dim
+}
+
+// task06 -- griffinlim: length in every istft (G2-2), torchaudio rand_init (G2-6), momentum/rank validation
+// (G2-7/G2-9), window dtype follows the spectrogram (G2-10), derived win/hop (G2-5); inverse_spectrogram rank.
+static auto gl8() -> griffinlim_option {
+    griffinlim_option g;
+    g.n_fft = 8;
+    g.win_length = 8;
+    g.hop_length = 4;
+    g.n_iter = 8;
+    g.momentum = 0.99;
+    return g;
+}
+
+static void test_griffinlim_parity() {
+    const auto mag =
+            spectrogram(ramp16(), spectrogram_option().n_fft(8).win_length(8).hop_length(4).return_complex(false));
+    auto g = gl8();
+    g.length = 18; // != the inferred 16
+    const auto g18 = vec({-2.98023224e-08f, 0.990252018f, 2.11276579f, 3.04415154f, 4.02314472f, 4.97991943f,
+                          5.23739147f, 6.26294136f, 7.63227892f, 9.41060448f, 12.111124f, 12.6491499f, 12.0032158f,
+                          11.616848f, 11.5963821f, 13.2079496f, 14.0422859f, 14.814682f});
+    TM_CHECK_TENSOR_CLOSE(griffinlim(mag, g), g18, 1e-5, 1e-5);
+
+    auto gr = gl8();
+    gr.n_iter = 4;
+    gr.momentum = 0.5;
+    gr.rand_init = true;
+    torch::manual_seed(0); // torch.rand(complex) draws the same stream in Python and C++
+    const auto grand = vec({0.146446496f, 0.303864747f, 2.44942617f, 3.81121278f, 4.06707764f, 4.39426899f, 6.08368301f,
+                            7.81170273f, 8.2752037f, 8.28270435f, 9.15467739f, 11.0375671f, 12.1425934f, 12.9706297f,
+                            13.7202454f, 13.6415434f});
+    TM_CHECK_TENSOR_CLOSE(griffinlim(mag, gr), grand, 1e-5, 1e-5);
+
+    // momentum outside [0, 1) and rank < 2 throw.
+    for (const double m: {1.0, 1.5, -0.5}) {
+        auto gm = gl8();
+        gm.momentum = m;
+        TM_CHECK(raises_inv([&] { (void) griffinlim(mag, gm); }));
+    }
+    TM_CHECK(raises_inv([&] { (void) griffinlim(mag[0], gl8()); }));
+    TM_CHECK(raises_inv([] {
+        (void) inverse_spectrogram(torch::ones({5}, torch::kComplexFloat), c10::nullopt, 0, torch::hann_window(8), 8, 4,
+                                   8);
+    }));
+    TM_CHECK(raises_inv([] { // unknown normalization (torchaudio: "Invalid normalized parameter")
+        (void) inverse_spectrogram(torch::ones({5, 3}, torch::kComplexFloat), c10::nullopt, 0, torch::hann_window(8), 8,
+                                   4, 8, "foo");
+    }));
+
+    // float64 spectrogram: the default window is float64 too.
+    auto gw = gl8();
+    gw.window = torch::hann_window(8, torch::kDouble);
+    const auto out64 = griffinlim(mag.to(torch::kDouble), gl8());
+    TM_CHECK(out64.scalar_type() == torch::kDouble);
+    TM_CHECK_TENSOR_CLOSE(out64, griffinlim(mag.to(torch::kDouble), gw), 1e-12, 0.0);
+
+    // only n_fft set: win_length = n_fft, hop_length = win_length / 2.
+    griffinlim_option gd;
+    gd.n_fft = 8;
+    gd.n_iter = 2;
+    auto ge = gd;
+    ge.win_length = 8;
+    ge.hop_length = 4;
+    TM_CHECK_TENSOR_CLOSE(griffinlim(mag, gd), griffinlim(mag, ge), 0.0, 0.0);
+}
+
+// task07 -- mel filterbank mirrors melscale_fbanks (sample_rate // 2, vectorized: G3-9/G3-3), invalid strings throw
+// (G3-11), fb/DCT follow the waveform dtype/device (G3-2), mfcc sample_rate/n_mfcc (G3-7/G3-10), stereo top_db.
+static void test_mel_filter_bank_parity() {
+    const auto g_htk = vec(
+            {-0.0f,        0.793843091f, 0.00830203854f, 0.0f,        0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.206156909f,
+             0.991697967f, 0.549680114f, 0.0945501179f,  0.0f,        0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.450319916f,
+             0.905449867f, 0.79108566f,  0.52739042f,    0.26369521f, 0.0f});
+    TM_CHECK_TENSOR_CLOSE(mel_filter_bank(3, 0.0, 0.0, 11025, 9, "", "htk"), g_htk.reshape({3, 9}), 1e-7, 1e-6);
+    const auto g_sla = vec({-0.0f,
+                            0.00137791259f,
+                            4.61866402e-05f,
+                            0.0f,
+                            0.0f,
+                            0.0f,
+                            0.0f,
+                            0.0f,
+                            0.0f,
+                            0.0f,
+                            3.22826527e-05f,
+                            0.000914578442f,
+                            0.000488945283f,
+                            1.63211153e-05f,
+                            0.0f,
+                            0.0f,
+                            0.0f,
+                            0.0f,
+                            0.0f,
+                            0.0f,
+                            0.0f,
+                            0.000234882114f,
+                            0.00047820303f,
+                            0.000368132372f,
+                            0.000245421601f,
+                            0.0001227108f,
+                            0.0f});
+    TM_CHECK_TENSOR_CLOSE(mel_filter_bank(3, 0.0, 0.0, 11025, 9, "slaney", "slaney"), g_sla.reshape({3, 9}), 1e-10,
+                          1e-6);
+
+    // vectorized: the old per-element .item() loop took ~0.1 s for one 128 x 1025 bank.
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 20; ++i) {
+        (void) mel_filter_bank(128, 0.0, 0.0, 44100, 1025, "slaney", "slaney");
+    }
+    TM_CHECK(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < 0.5);
+
+    TM_CHECK(raises_inv([] { (void) mel_filter_bank(4, 0.0, 0.0, 16000, 9, "foo", "htk"); }));
+    TM_CHECK(raises_inv([] { (void) mel_filter_bank(4, 0.0, 0.0, 16000, 9, "", "foo"); }));
+    TM_CHECK(raises_inv([] { (void) create_dct(4, 8, "foo"); }));
+}
+
+static auto mel16() -> mel_spectrogram_option {
+    mel_spectrogram_option mo;
+    mo.n_fft = 16;
+    mo.win_length = 16;
+    mo.hop_length = 8;
+    mo.n_mels = 6;
+    return mo;
+}
+
+static void test_melspectrogram_mfcc_parity() {
+    const auto s = torch::sin(2.0 * PI * 0.11 * torch::arange(64, torch::kFloat));
+    mfcc_option fo;
+    fo.n_mfcc = 4;
+    fo.mel = mel16();
+    // mfcc_option.sample_rate is the rate (torchaudio MFCC(sample_rate, **melkwargs)); it overrides mel.sample_rate.
+    auto f8 = fo;
+    f8.sample_rate = 8000;
+    const auto g8 = vec({-1.68409872f, -7.84579754f, -8.1784296f,  -7.92232513f, -7.5800581f,  -7.77191257f,
+                         -8.15801334f, -7.99654627f, 4.18332243f,  -1.85283589f, 19.6016407f,  19.7420082f,
+                         19.6328907f,  19.4981213f,  19.5721436f,  19.7330456f,  19.663784f,   4.27806568f,
+                         -2.04555082f, -28.9420853f, -29.2900982f, -29.022089f,  -28.6645241f, -28.8648872f,
+                         -29.2687187f, -29.0997066f, -8.29948521f, 3.44941854f,  2.98183155f,  3.1396656f,
+                         3.01743221f,  2.8616848f,   2.94792175f,  3.12974548f,  3.05234623f,  -4.13999557f});
+    TM_CHECK_TENSOR_CLOSE(mfcc(s, f8), g8.reshape({4, 9}), 1e-3, 1e-5);
+    // stereo, channel 1 at -80 dB: torchaudio's top_db=80 cutoff is shared across channels (G3-1).
+    const auto st = torch::stack({s, 1e-4 * torch::cos(2.0 * PI * 0.23 * torch::arange(64, torch::kFloat))});
+    const auto gst = vec(
+            {-19.8038521f,     -28.1426048f,     -28.4079247f,     -28.2037907f,     -27.9293652f,     -28.0834026f,
+             -28.3916798f,     -28.2630272f,     -18.9366798f,     -36.8075142f,     -22.4600658f,     -22.2805557f,
+             -22.4192848f,     -22.5992641f,     -22.4991531f,     -22.2917538f,     -22.3794785f,     -34.0135078f,
+             -39.8719177f,     -56.8293381f,     -57.0345268f,     -56.8762512f,     -56.6677704f,     -56.7841911f,
+             -57.0218277f,     -56.921875f,      -42.4429398f,     -29.8638916f,     -19.9228096f,     -19.676405f,
+             -19.8660259f,     -20.1204853f,     -19.9777145f,     -19.6915054f,     -19.8110504f,     -31.8583241f,
+             -169.484497f,     -169.483749f,     -169.483643f,     -169.484482f,     -169.483871f,     -169.483551f,
+             -169.484436f,     -169.484009f,     -169.490204f,     -0.56785965f,     -0.568611145f,    -0.568725586f,
+             -0.567874908f,    -0.56848526f,     -0.568817139f,    -0.5679245f,      -0.568359375f,    -0.562156677f,
+             -7.62939453e-06f, -7.62939453e-06f, -7.62939453e-06f, -7.62939453e-06f, -7.62939453e-06f, -7.62939453e-06f,
+             -7.62939453e-06f, -7.62939453e-06f, -7.62939453e-06f, 0.567882538f,     0.568632126f,     0.568748474f,
+             0.567897797f,     0.568508148f,     0.56883812f,      0.567947388f,     0.568380356f,     0.562179565f});
+    TM_CHECK_TENSOR_CLOSE(mfcc(st, fo), gst.reshape({2, 4, 9}), 1e-3, 1e-5);
+
+    auto fbad = fo;
+    fbad.n_mfcc = 7; // > n_mels (6)
+    TM_CHECK(raises_inv([&] { (void) mfcc(s, fbad); }));
+    auto fnorm = fo;
+    fnorm.norm = "foo";
+    TM_CHECK(raises_inv([&] { (void) mfcc(s, fnorm); }));
+
+    // f_min > f_max throws (f_max defaults to sample_rate // 2, so 5512.25 Hz is above it at 11025 Hz).
+    auto mb = mel16();
+    mb.sample_rate = 11025;
+    mb.f_min = 5512.25;
+    TM_CHECK(raises_inv([&] { (void) melspectrogram(s, mb); }));
+    // onesided is deprecated in torchaudio and always true: onesided=false no longer breaks the fb matmul.
+    auto mo1 = mel16();
+    mo1.onesided = false;
+    TM_CHECK_TENSOR_CLOSE(melspectrogram(s, mo1), melspectrogram(s, mel16()), 0.0, 0.0);
+
+    // fb / DCT follow the waveform dtype (and device).
+    const auto m64 = melspectrogram(s.to(torch::kDouble), mel16());
+    TM_CHECK(m64.scalar_type() == torch::kDouble);
+    TM_CHECK_TENSOR_CLOSE(m64, melspectrogram(s, mel16()), 1e-4, 1e-5);
+    TM_CHECK(mfcc(s.to(torch::kDouble), fo).scalar_type() == torch::kDouble);
+    if (const auto dev = mps_or_skip()) {
+        TM_CHECK_TENSOR_CLOSE(mfcc(s.to(*dev), fo), mfcc(s, fo), 1e-3, 1e-4);
+    }
+}
+
+// task08 -- resample: identity (G4-4), validation (G4-2/G4-3/G4-14), kernel dtype follows the waveform (G4-5),
+// float32 target length (G4-6), torchaudio kernel multiply order (G4-11); speed/pitch_shift inherit them.
+static void test_resample_parity() {
+    torch::manual_seed(0);
+    const auto x = torch::randn({2, 100});
+    TM_CHECK(resample(x, 16000, 16000).equal(x));
+    TM_CHECK(raises_inv([&] { (void) resample(x, 0, 16000); }));
+    TM_CHECK(raises_inv([&] { (void) resample(x, 16000, 0); }));
+    TM_CHECK(raises_inv([&] { (void) resample(x, 0, 0); }));
+    TM_CHECK(raises_inv([&] { (void) resample(x, -16000, 8000); }));
+    resample_option lfw0;
+    lfw0.lowpass_filter_width = 0;
+    TM_CHECK(raises_inv([&] { (void) resample(x, 16000, 8000, lfw0); }));
+    resample_option roll0;
+    roll0.rolloff = 0.0;
+    TM_CHECK(raises_inv([&] { (void) resample(x, 16000, 8000, roll0); }));
+    TM_CHECK(raises_inv([] { (void) resample(torch::tensor(1.0f), 2, 1); }));
+    TM_CHECK(raises_inv([&] { (void) resample(x.to(torch::kShort), 2, 1); }));
+
+    const auto xr = torch::sin(2.0 * PI * 3.0 * torch::arange(64, torch::kFloat) / 64.0).reshape({1, 64});
+    const auto r64 = resample(xr.to(torch::kDouble), 64, 48);
+    TM_CHECK(r64.scalar_type() == torch::kDouble);
+    TM_CHECK_CLOSE(r64.sum().item<double>(), 0.020850907711279287, 1e-12);
+    TM_CHECK_CLOSE(r64[0][1].item<double>(), 0.3782239573026156, 1e-12);
+    TM_CHECK(resample(torch::zeros({1, 180697}), 44100, 16000).size(-1) == 65559);
+
+    const auto [kernel, width] = _sinc_resample_kernel(48000, 16000, 16000, resample_option(),
+                                                       torchmedia::tensor_options_t().dtype(torch::kFloat));
+    TM_CHECK(width == 19);
+    const auto gk = vec(
+            {1.59557077e-24f,  -8.17534328e-07f, -0.000183016979f, -0.000538223714f, 0.000244591618f, 0.00264129951f,
+             0.00362526113f,   -0.00086147018f,  -0.00897745974f,  -0.0108616734f,   0.00169034069f,  0.0213740002f,
+             0.0254518967f,    -0.00251340843f,  -0.0467810147f,   -0.0594799407f,   0.00311386609f,  0.135345891f,
+             0.271942765f,     0.330000013f,     0.271942765f,     0.135345891f,     0.00311386609f,  -0.0594799407f,
+             -0.0467810147f,   -0.00251340843f,  0.0254518967f,    0.0213740002f,    0.00169034069f,  -0.0108616734f,
+             -0.00897745974f,  -0.00086147018f,  0.00362526113f,   0.00264129951f,   0.000244591618f, -0.000538223714f,
+             -0.000183016979f, -8.17534328e-07f, 1.59557077e-24f,  1.59557077e-24f,  1.59557077e-24f});
+    TM_CHECK_TENSOR_CLOSE(kernel.flatten(), gk, 0.0, 0.0); // bit-exact with torchaudio's float32 kernel
+
+    // speed / pitch_shift reuse resample.
+    TM_CHECK(speed(x, 16000, 1.0).first.equal(x));
+    TM_CHECK(raises_inv([&] { (void) speed(x, 16000, 0.0); }));
+    TM_CHECK(speed(x.to(torch::kDouble), 16000, 1.5).first.scalar_type() == torch::kDouble);
+    const auto xl = torch::randn({1, 2000});
+    TM_CHECK_TENSOR_CLOSE(pitch_shift(xl, 16000, 0), xl, 1e-5, 1e-5); // only the stft/istft round trip remains
+    TM_CHECK(pitch_shift(xl.to(torch::kDouble), 16000, 2).scalar_type() == torch::kDouble);
+    // odd length at -12 steps: the stretch length round(2001 / 2) rounds half to even like Python (1000, not 1001),
+    // so the last sample is _fix_waveform_shape's zero padding.
+    const auto odd = torch::sin(torch::arange(2001, torch::kFloat) * 0.05).reshape({1, 2001});
+    const auto ps12 = pitch_shift(odd, 16000, -12);
+    TM_CHECK(ps12[0][2000].item<float>() == 0.0f);
+    TM_CHECK_CLOSE(ps12[0][1999].item<float>(), -0.16586455702781677, 1e-5);
+    TM_CHECK_CLOSE(ps12[0][1000].item<float>(), -0.10505791008472443, 1e-5);
+}
+
+// task09 -- convolve/fftconvolve share one input check: 0-D and non-broadcastable leading dims throw
+// std::invalid_argument (G1-5 + fftconvolve prelude); lower-rank operands are left-padded (documented extension).
+static void test_convolve_shape_checks() {
+    const auto full_mode = convolve_mode::full;
+    TM_CHECK(raises_inv([&] { (void) fftconvolve(torch::tensor(1.0f), torch::randn({3}), full_mode); }));
+    TM_CHECK(raises_inv([&] { (void) fftconvolve(torch::randn({3}), torch::tensor(1.0f), full_mode); }));
+    TM_CHECK(raises_inv([&] { (void) fftconvolve(torch::randn({2, 10}), torch::randn({3, 4}), full_mode); }));
+    TM_CHECK(raises_inv([&] { (void) convolve(torch::randn({2, 10}), torch::randn({3, 4}), full_mode); }));
+    const auto x = torch::randn({1, 10});
+    const auto y = torch::randn({4});
+    TM_CHECK_TENSOR_CLOSE(fftconvolve(x, y, full_mode), fftconvolve(x, y.unsqueeze(0), full_mode), 1e-6, 1e-6);
+    TM_CHECK_TENSOR_CLOSE(fftconvolve(y, x, full_mode), convolve(y, x, full_mode), 1e-5, 1e-5);
+    // mode defaults to full (torchaudio), and the scoped enum no longer collides with torch::full (G1-9).
+    TM_CHECK_TENSOR_CLOSE(convolve(x, y), convolve(x, y, full_mode), 0.0, 0.0);
+    TM_CHECK_TENSOR_CLOSE(fftconvolve(x, y), fftconvolve(x, y, full_mode), 0.0, 0.0);
+    static_assert(!std::is_convertible_v<convolve_mode, int>, "convolve_mode must be a scoped enum");
+}
+
+// Error/branch paths of the filtering, beamforming and alignment headers (their error sites now return the
+// handle_exceptions value; these were never exercised). Goldens: gen_golden.py "coverage gaps" section.
+static void test_coverage_gaps_filtering_beamforming_alignment() {
+    // _lfilter_core / lfilter validation.
+    const auto w3 = torch::randn({1, 1, 8});
+    TM_CHECK(raises_inv([&] { (void) _lfilter_core(w3, torch::ones({1, 3}), torch::ones({1, 2})); }));
+    TM_CHECK(raises_inv([] { (void) _lfilter_core(torch::randn({8}), torch::ones({1, 3}), torch::ones({1, 3})); }));
+    TM_CHECK(raises_inv([&] { (void) _lfilter_core(w3, torch::ones({1, 0}), torch::ones({1, 0})); }));
+    TM_CHECK(raises_inv([] { (void) lfilter(torch::randn({3, 8}), torch::ones({2, 3}), torch::ones({2, 3})); }));
+    // riaa_biquad 48 kHz / 88.2 kHz tables.
+    const auto w = filt_wav();
+    TM_CHECK_TENSOR_CLOSE(riaa_biquad(w, 48000),
+                          vec({0.0219737832f, -0.0224744882f, 0.0404246412f, -0.0439121127f, 0.059642449f,
+                               -0.0647824109f, 0.0792799741f, -0.0853421539f}),
+                          1e-6, 1e-5);
+    TM_CHECK_TENSOR_CLOSE(riaa_biquad(w, 88200),
+                          vec({0.0126710637f, -0.0125759393f, 0.0238931254f, -0.024962673f, 0.0352777243f,
+                               -0.0372097716f, 0.046782285f, -0.0493537933f}),
+                          1e-6, 1e-5);
+    // flanger: triangular LFO golden; bad interpolation and > 4 channels raise.
+    const auto wf = torch::stack({w, torch::tensor({0.2f, -0.1f, 0.4f, -0.3f, 0.6f, -0.5f, 0.8f, -0.7f})});
+    TM_CHECK_TENSOR_CLOSE(flanger(wf, 8000, 0.0, 2.0, 0.0, 71.0, 0.5, 25.0, "triangular", "linear").flatten(),
+                          vec({0.099999994f, -0.19975087f, 0.2991696f, -0.398256123f, 0.497010529f, -0.595432758f,
+                               0.693522811f, -0.791280627f, 0.116959058f, -0.0584795289f, 0.233918115f, -0.175438598f,
+                               0.350877196f, -0.292397648f, 0.467836231f, -0.409356713f}),
+                          1e-5, 1e-5);
+    TM_CHECK(raises_inv([&] { (void) flanger(wf, 8000, 0.0, 2.0, 0.0, 71.0, 0.5, 25.0, "sinusoidal", "cubic"); }));
+    TM_CHECK(raises_inv([] { (void) flanger(torch::randn({5, 8}), 8000); }));
+    // vad: lifter band that leaves no cepstrum bins.
+    TM_CHECK(raises_inv([] {
+        (void) vad(torch::randn({1, 8000}), 16000, 7.0, 0.25, 1.0, 0.25, 0.0, 0.35, 0.1, 0.01, 1.35, 20.0, std::nullopt,
+                   0.4, 50.0, 6000.0, 2000.0, 150.0);
+    }));
+
+    // beamforming validation + rtf_power n_iter == 1.
+    const auto c3 = torch::complex(torch::randn({3, 2, 2}), torch::randn({3, 2, 2}));
+    TM_CHECK(raises_inv([&] { (void) rtf_power(c3[0], c3[0], 0); })); // < 3-D
+    TM_CHECK(raises_inv([&] { (void) rtf_power(torch::real(c3), torch::real(c3), 0); })); // real
+    TM_CHECK(raises_inv([&] { (void) rtf_power(c3, c3.index({torch::indexing::Slice(0, 2)}), 0); })); // shape
+    const auto c32 = torch::complex(torch::randn({3, 2, 3}), torch::randn({3, 2, 3}));
+    TM_CHECK(raises_inv([&] { (void) rtf_power(c32, c32, 0); })); // not square
+    TM_CHECK(raises_inv([&] { (void) rtf_power(c3, c3, 0, 0); })); // n_iter <= 0
+    TM_CHECK(raises_inv([&] { (void) rtf_evd(torch::real(c3)); }));
+    TM_CHECK(raises_inv([&] { (void) rtf_evd(c32); }));
+    const auto ms = torch::complex(torch::arange(1, 13, torch::kFloat).reshape({3, 2, 2}),
+                                   torch::arange(1, 13, torch::kFloat).reshape({3, 2, 2}) * 0.2f);
+    const auto ps = torch::matmul(ms, ms.conj().transpose(-1, -2)) + 2.0f * torch::eye(2);
+    const auto mn = torch::complex(torch::arange(13, 25, torch::kFloat).reshape({3, 2, 2}) * 0.1f,
+                                   torch::arange(1, 13, torch::kFloat).reshape({3, 2, 2}) * 0.3f);
+    const auto pn = torch::matmul(mn, mn.conj().transpose(-1, -2)) + 2.0f * torch::eye(2);
+    const auto r1 = rtf_power(ps, pn, 0, 1);
+    TM_CHECK_TENSOR_CLOSE(torch::real(r1).flatten(), vec({7.2f, 11.44f, 65.44001f, 86.32f, 190.24f, 227.76f}), 1e-3,
+                          1e-5);
+    TM_CHECK_TENSOR_CLOSE(torch::imag(r1).flatten(), torch::zeros({6}), 1e-3, 0.0);
+
+    // forced_align: a path that ends on the last token (not the final blank); max(targets) >= C raises.
+    const auto logits =
+            torch::tensor({2.f, 0.f, 0.f, 0.f, 3.f, 0.f, 0.f, 2.f, 0.f, 2.f, 0.f, 0.f, 0.f, 0.f, 3.f, 0.f, 0.f, 4.f})
+                    .reshape({1, 6, 3});
+    const auto logp = torch::log_softmax(logits, -1);
+    const auto [paths, scores] =
+            forced_align(logp, torch::tensor({{1, 2}}, torch::kLong), c10::nullopt, c10::nullopt, 0);
+    TM_CHECK(paths.equal(torch::tensor({{0, 1, 1, 0, 2, 2}}, torch::kLong)));
+    TM_CHECK_CLOSE(scores[0][5].item<float>(), -0.0359762, 1e-5);
+    TM_CHECK(raises_inv(
+            [&] { (void) forced_align(logp, torch::tensor({{1, 3}}, torch::kLong), c10::nullopt, c10::nullopt, 0); }));
+}
+
+// task11 -- review round 2 (progress02 D12). Goldens: gen_golden.py "task11" section (torchaudio 2.5.1).
+static auto raises_any(const std::function<void()> &fnc) -> bool { // torch's own c10::Error included
+    try {
+        fnc();
+    } catch (const std::exception &) {
+        return true;
+    }
+    return false;
+}
+
+static void test_r2_create_dct() {
+    // P2: create_dct builds in float32 in torchaudio's op order (float64-then-cast was 1.9e-5 off).
+    const auto d40 = create_dct(40, 128, "");
+    TM_CHECK_CLOSE(d40[122][36].item<float>(), 0.29344236850738525, 1e-9);
+    TM_CHECK_CLOSE(d40[84][34].item<float>(), 0.3419055938720703, 1e-9);
+    TM_CHECK_CLOSE(d40[98][28].item<float>(), 0.29347845911979675, 1e-9);
+    const auto d13 = create_dct(13, 40, "ortho");
+    TM_CHECK(d13.sizes() == torch::IntArrayRef({40, 13}) && d13.scalar_type() == torch::kFloat);
+    TM_CHECK_CLOSE(d13[34][12].item<float>(), 0.10151462256908417, 1e-10);
+    TM_CHECK_CLOSE(d13[27][11].item<float>(), 0.04362407699227333, 1e-10);
+}
+
+static void test_r2_resample_equal_rates() {
+    // P3: equal rates return the input before the filter arguments are checked (torchaudio order).
+    torch::manual_seed(0);
+    const auto x = torch::randn({2, 100});
+    resample_option lfw0;
+    lfw0.lowpass_filter_width = 0;
+    resample_option roll0;
+    roll0.rolloff = 0.0;
+    TM_CHECK(resample(x, 16000, 16000, lfw0).equal(x));
+    TM_CHECK(resample(x, 16000, 16000, roll0).equal(x));
+    TM_CHECK(raises_inv([&] { (void) resample(x, 0, 0, lfw0); })); // the rates are still checked first
+}
+
+static void test_r2_spectrogram_args() {
+    const auto x = torch::randn({2, 1000});
+    // P4: normalize_method is validated even when normalized is false.
+    TM_CHECK(raises_inv([&] { (void) spectrogram(x, spectrogram_option().normalize_method("foo")); }));
+    // R6: only 0 derives win/hop; a negative value reaches torch, which raises (as in torchaudio).
+    TM_CHECK(raises_any([&] { (void) spectrogram(x, spectrogram_option().n_fft(64).win_length(64).hop_length(-1)); }));
+    TM_CHECK(raises_any([&] { (void) spectrogram(x, spectrogram_option().n_fft(64).win_length(-5)); }));
+    griffinlim_option gneg;
+    gneg.n_fft = 16;
+    gneg.hop_length = -1;
+    TM_CHECK(raises_any([&] { (void) griffinlim(torch::rand({9, 5}), gneg); }));
+}
+
+static void test_r2_spectral_centroid() {
+    // P5: spectral_centroid bin frequencies are float32 like torchaudio (a float64 linspace was 6e-6 Hz off).
+    const auto t = torch::arange(3001, torch::kDouble);
+    const auto xd = torch::stack({torch::sin(t * 0.05), 0.5 * torch::cos(t * 0.031)});
+    const auto sc = spectral_centroid(xd, 16000, 0, torch::hann_window(384, torch::kDouble), 384, 96, 384);
+    TM_CHECK(sc.scalar_type() == torch::kDouble && sc.sizes() == torch::IntArrayRef({2, 32}));
+    TM_CHECK_CLOSE(sc[0][0].item<double>(), 268.47082870419354, 1e-9);
+    TM_CHECK_CLOSE(sc[0][31].item<double>(), 224.7979686856453, 1e-9);
+    TM_CHECK_CLOSE(sc[0][1].item<double>(), 214.82245513204614, 1e-9);
+}
+
+static void test_r2_composite_checks() {
+    const auto x = torch::randn({2, 1000});
+    // R3: pitch_shift checks its rates before stretching; bins_per_octave 0 was a division by zero.
+    TM_CHECK(raises_inv([&] { (void) pitch_shift(x, 0, 2); }));
+    TM_CHECK(raises_inv([&] { (void) pitch_shift(x, 16000, 2, 0); }));
+    auto mscale = mel16();
+    mscale.mel_scale = "foo";
+    TM_CHECK(raises_inv([&] { (void) melspectrogram(x, mscale); }));
+    mfcc_option fnorm;
+    fnorm.mel = mel16();
+    fnorm.n_mfcc = 4;
+    fnorm.mel.norm = "foo";
+    TM_CHECK(raises_inv([&] { (void) mfcc(x, fnorm); }));
+}
+
+static void test_r2_griffinlim_integer_input() {
+    // R5: an integer spectrogram works again (the default window takes the dtype after pow).
+    const auto magl = torch::randint(0, 5, {9, 5}, torch::kLong);
+    griffinlim_option gi;
+    gi.n_fft = 16;
+    gi.n_iter = 2;
+    TM_CHECK_TENSOR_CLOSE(griffinlim(magl, gi), griffinlim(magl.to(torch::kFloat), gi), 0.0, 0.0);
+}
+
+static void test_r2_inverse_spectrogram_false() {
+    // R7: "false" means no normalization, mirroring the accepted "true" (torchaudio's bool normalized).
+    const auto spc = spectrogram(ramp16(), spectrogram_option().n_fft(8).win_length(8).hop_length(4));
+    const auto w8 = torch::hann_window(8);
+    TM_CHECK_TENSOR_CLOSE(inverse_spectrogram(spc, 16, 0, w8, 8, 4, 8, "false"),
+                          inverse_spectrogram(spc, 16, 0, w8, 8, 4, 8, "none"), 0.0, 0.0);
+}
+
 int main() {
     test_coverage_gaps();
     test_convolve_full_length();
@@ -1042,5 +1576,22 @@ int main() {
     test_sequential_feature_ops();
     test_vad();
     test_option_setters();
+    TM_RUN(test_amplitude_to_DB_top_db_packing);
+    TM_RUN(test_amplitude_to_DB_defaults_amin_precision);
+    TM_RUN(test_spectrogram_frame_length_parity);
+    TM_RUN(test_spectrogram_nd_and_defaults);
+    TM_RUN(test_griffinlim_parity);
+    TM_RUN(test_mel_filter_bank_parity);
+    TM_RUN(test_melspectrogram_mfcc_parity);
+    TM_RUN(test_resample_parity);
+    TM_RUN(test_convolve_shape_checks);
+    TM_RUN(test_coverage_gaps_filtering_beamforming_alignment);
+    TM_RUN(test_r2_create_dct);
+    TM_RUN(test_r2_resample_equal_rates);
+    TM_RUN(test_r2_spectrogram_args);
+    TM_RUN(test_r2_spectral_centroid);
+    TM_RUN(test_r2_composite_checks);
+    TM_RUN(test_r2_griffinlim_integer_input);
+    TM_RUN(test_r2_inverse_spectrogram_false);
     return tm_test::summary("audio_test_functional");
 }
