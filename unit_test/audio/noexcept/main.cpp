@@ -121,11 +121,66 @@ static void test_filtering_beamforming_alignment() {
     TM_CHECK(is_default(fn::rtf_evd(torch::real(c3))));
     TM_CHECK(is_default(fn::rtf_evd(c32)));
     TM_CHECK(is_default(fn::rtf_power(c3, c3, 0, 0)));
-    TM_CHECK(is_default(fn::apply_beamforming(torch::real(c3), torch::real(c3))));
+    TM_CHECK(is_default(fn::apply_beamforming(torch::real(c3[0]), torch::real(c3)))); // shapes match, not complex
 
     const auto logp = torch::log_softmax(torch::randn({1, 6, 3}), -1);
     TM_CHECK(is_default(fn::forced_align(logp, torch::tensor({{0, 1}}, torch::kLong)).first));
     TM_CHECK(is_default(fn::forced_align(logp, torch::tensor({{1, 3}}, torch::kLong)).first));
+}
+
+// progress04 (task12-task19): the new error sites. Composites check before calling their parts.
+static void test_p4_surface_sites() {
+    const auto w = torch::randn({2, 4000}) * 0.1;
+    TM_CHECK(returns_default([&] { return fn::vad(w, 16000, 7.0, 0.25, /*search_time=*/0.0); }));
+    TM_CHECK(returns_default([&] { return fn::phaser(w, 16000, 0.4, 0.74, /*delay_ms=*/0.0); }));
+    TM_CHECK(returns_default([&] { return fn::flanger(w[0], 8000); }));
+    TM_CHECK(returns_default([&] { return fn::compute_deltas(torch::randn({2, 6}), 5, "foo"); }));
+    const auto snr = torch::full({2}, 10.0);
+    TM_CHECK(returns_default([&] { return fn::add_noise(w, w, torch::tensor(10.0)); }));
+    TM_CHECK(returns_default([&] { return fn::add_noise(w, w.slice(-1, 0, 100), snr); }));
+    TM_CHECK(returns_default(
+            [&] { return fn::phase_vocoder(torch::ones({65}, torch::kComplexFloat), 1.5, torch::zeros({65, 1})); }));
+    TM_CHECK(returns_default([] { return fn::pitch_shift(torch::tensor(0.5f), 11025, 2); }));
+    TM_CHECK(returns_default([&] { return fn::pitch_shift(w, 16000, 2000); }));
+    TM_CHECK(returns_default([&] { return fn::_stretch_waveform(torch::tensor(0.5f), 2); }));
+    TM_CHECK(returns_default([] { return fn::detect_pitch_frequency(torch::tensor(0.5f), 16000); }));
+    TM_CHECK(returns_default([&] { return fn::detect_pitch_frequency(w, 16000, 0.0); }));
+
+    const auto lk = [](const std::vector<int64_t> &v) { return torch::tensor(v, torch::kLong).unsqueeze(0); };
+    const auto lp = torch::log_softmax(torch::randn({1, 8, 5}), -1);
+    TM_CHECK(returns_default([&] { return fn::forced_align(lp, lk({1, 2}), c10::nullopt, c10::nullopt, 7).first; }));
+    TM_CHECK(returns_default([&] { return fn::forced_align(lp[0], lk({1, 2})).first; }));
+    TM_CHECK(returns_default([&] { return fn::forced_align(torch::cat({lp, lp}), lk({1, 2})).first; }));
+    TM_CHECK(returns_default([&] { return fn::forced_align(lp, torch::empty({1, 0}, torch::kLong)).first; }));
+    TM_CHECK(returns_default([&] { return fn::forced_align(lp.to(torch::kBFloat16), lk({1, 2})).first; }));
+    TM_CHECK(returns_default([&] { return fn::forced_align(lp, lk({1, 2}), torch::tensor({6})).first; }));
+    TM_CHECK(returns_default([&] { return fn::forced_align(lp, lk({1, 2}), c10::nullopt, torch::tensor({1})).first; }));
+    TM_CHECK(returns_default([&] { return fn::forced_align(lp.slice(1, 0, 3), lk({1, 1, 2})).first; }));
+
+    const auto c3 = torch::complex(torch::randn({3, 2, 2}), torch::randn({3, 2, 2}));
+    const auto spec = torch::complex(torch::randn({2, 3, 4}), torch::randn({2, 3, 4})); // (channel, freq, time)
+    TM_CHECK(returns_default([&] { return fn::psd(spec, torch::ones({2, 3, 4})); }));
+    TM_CHECK(returns_default([&] { return fn::mvdr_weights_souden(torch::real(c3), torch::real(c3), 0); }));
+    TM_CHECK(returns_default(
+            [&] { return fn::mvdr_weights_souden(torch::real(c3), torch::real(c3), torch::tensor({1.0, 0.0})); }));
+    TM_CHECK(returns_default([&] { return fn::mvdr_weights_rtf(torch::real(c3[0]), torch::real(c3)); }));
+    TM_CHECK(returns_default([&] { return fn::mvdr_weights_rtf(c3[0][0], c3, torch::tensor({1.0, 0.0})); }));
+    TM_CHECK(returns_default([&] { return fn::rtf_power(c3, c3.slice(0, 0, 2), 0); }));
+    TM_CHECK(returns_default([&] { return fn::apply_beamforming(c3[0], spec.unsqueeze(0).expand({2, 2, 3, 4})); }));
+    tf::MVDR mvdr;
+    TM_CHECK(returns_default([&] { return mvdr(spec[0], torch::rand({3, 4})); })); // < 3-D
+    TM_CHECK(returns_default([&] { return mvdr(torch::real(spec), torch::rand({3, 4})); })); // real
+
+    TM_CHECK(returns_default([] { return tf::TimeStretch()(torch::ones({201, 4}, torch::kComplexFloat)); }));
+    TM_CHECK(returns_default([] {
+        return tf::InverseMelScale(tf::inverse_mel_scale_option().n_stft(201).n_mels(20))(torch::rand({2, 40, 10}));
+    }));
+    TM_CHECK(returns_default([] { return tf::InverseMelScale()(torch::rand({128})); }));
+    TM_CHECK(returns_default(
+            [] { return tf::PitchShift(tf::pitch_shift_option().bins_per_octave(0))(torch::randn({1, 64})); }));
+    TM_CHECK(returns_default([] {
+        return tf::Vol(tf::vol_option().gain(0.0).gain_type(tf::vol_gain_type::power))(torch::randn({1, 16}));
+    }));
 }
 
 int main() {
@@ -133,5 +188,6 @@ int main() {
     TM_RUN(test_spectral);
     TM_RUN(test_masking_metrics_loudness);
     TM_RUN(test_filtering_beamforming_alignment);
+    TM_RUN(test_p4_surface_sites);
     return tm_test::summary("audio_test_noexcept");
 }

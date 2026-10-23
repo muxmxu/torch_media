@@ -4,10 +4,15 @@
 //       (functional is golden-verified against torchaudio 2.5.1 in progress01 -> no venv needed).
 //   (2) golden: a deterministic explicit input matched against baked torchaudio.transforms 2.5.1
 //       values (see gen_golden.py) -> pins the torchaudio default derivation (win/hop, power, ...).
+// First include on purpose: every audio header must compile on its own (A1-13: _functional.hpp used lfilter and
+// treble_biquad without including _functional_filtering.hpp, so this line did not compile).
+#include <torchmedia/_audio/_transform_effects.hpp>
+// clang-format off
 #include <stdexcept>
 #include <torch/torch.h>
 #include <torchmedia.hpp>
 #include "test_util.hpp"
+// clang-format on
 
 namespace tf = torchmedia::audio::transform;
 namespace fn = torchmedia::audio::functional;
@@ -1200,6 +1205,80 @@ static void test_r2_resample_kernel_and_equal_rates() {
     TM_CHECK(tf::Resample(tf::resample_option().orig_freq(8000).new_freq(8000).rolloff(0.0))(x).equal(x));
 }
 
+// ======================== progress04 -- surface audit (task12-task19) ========================
+// Goldens: gen_golden.py "progress04" sections (torchaudio 2.5.1).
+static auto raises_inv(const std::function<void()> &f) -> bool {
+    try {
+        f();
+    } catch (const std::invalid_argument &) {
+        return true;
+    }
+    return false;
+}
+
+static void test_p4_effects_transforms() {
+    // Vad follows the input dtype (float64 used to throw in the float32 accessor) -- A1-02.
+    const double pi = std::acos(-1.0);
+    const auto t = torch::arange(8000, torch::kDouble) / 16000;
+    const auto sig = torch::cat({torch::zeros({8000}, torch::kDouble), 0.5 * torch::sin(2.0 * pi * 300.0 * t)});
+    const auto v = tf::Vad(tf::vad_option().sample_rate(16000))(sig);
+    TM_CHECK(v.scalar_type() == torch::kDouble && v.equal(fn::vad(sig, 16000)));
+    TM_CHECK(raises_inv([&] { (void) tf::Vad(tf::vad_option().sample_rate(16000).search_time(0.0))(sig); }));
+    // Vol: power gain 0 raises (torchaudio: math.log10(0)) instead of returning silence -- A1-11.
+    TM_CHECK(raises_inv([] {
+        (void) tf::Vol(tf::vol_option().gain(0.0).gain_type(tf::vol_gain_type::power))(torch::randn({1, 16}));
+    }));
+    TM_CHECK(tf::Vol(tf::vol_option().gain(0.0))(torch::randn({1, 16})).abs().sum().item<double>() == 0.0);
+}
+
+static void test_p4_time_transforms() {
+    // PitchShift: fractional n_steps (A2-06) and constructor validation (A2-04).
+    const double steps = 0.5;
+    const auto xp = torch::sin(torch::arange(3001.0) * 0.05).unsqueeze(0);
+    const tf::PitchShift ps(tf::pitch_shift_option().sample_rate(1000).n_steps(steps));
+    const auto yp = ps(xp);
+    TM_CHECK_TENSOR_CLOSE(yp, fn::pitch_shift(xp, 1000, steps), 0.0, 0.0);
+    TM_CHECK_CLOSE(yp[0][1500].item<double>(), 0.25565478205680847, 1e-6); // torchaudio F.pitch_shift(x, 1000, 0.5)
+    TM_CHECK(raises_inv([] { tf::PitchShift(tf::pitch_shift_option().bins_per_octave(0)); }));
+    TM_CHECK(raises_inv([] { tf::PitchShift(tf::pitch_shift_option().sample_rate(16000).n_steps(-240)); }));
+    // TimeStretch: an invalid overriding_rate is reported as such (A2-09).
+    const auto spec = torch::ones({9, 4}, torch::kComplexFloat);
+    const tf::TimeStretch ts(tf::time_stretch_option().n_freq(9).fixed_rate(1.2));
+    std::string msg;
+    try {
+        (void) ts(spec, 0.0);
+    } catch (const std::invalid_argument &e) {
+        msg = e.what();
+    }
+    TM_CHECK(msg.find("overriding_rate") != std::string::npos);
+}
+
+static void test_p4_specaugment_f64_seeded() {
+    // mask_along_axis draws torch.rand(1) on the CPU in float32 (A2-05): float64 masks equal torchaudio's.
+    const auto x = torch::arange(1, 1 + 2 * 30 * 40, torch::kDouble).reshape({2, 30, 40});
+    torch::manual_seed(0);
+    const auto y = tf::SpecAugment(tf::spec_augment_option()
+                                           .n_time_masks(2)
+                                           .time_mask_param(10)
+                                           .n_freq_masks(2)
+                                           .freq_mask_param(10)
+                                           .iid_masks(false)
+                                           .zero_masking(true))(x);
+    TM_CHECK(y.sum().item<double>() == 1852636.0);
+    TM_CHECK((y == 0).sum().item<int64_t>() == 744);
+}
+
+// Crash-class red tests last: before the fixes these read out of bounds or crash the process (A2-01..A2-03).
+static void test_p4_rank_checks() {
+    const tf::TimeStretch ts(tf::time_stretch_option().n_freq(65).fixed_rate(1.5));
+    TM_CHECK(raises_inv([&] { (void) ts(torch::ones({65}, torch::kComplexFloat)); }));
+    const tf::InverseMelScale ims(tf::inverse_mel_scale_option().n_stft(201).n_mels(40));
+    TM_CHECK(raises_inv([&] { (void) ims(torch::rand({40})); }));
+    TM_CHECK(raises_inv([&] { (void) ims(torch::rand({})); }));
+    const tf::PitchShift ps(tf::pitch_shift_option().sample_rate(11025).n_steps(2));
+    TM_CHECK(raises_inv([&] { (void) ps(torch::tensor(0.5f)); }));
+}
+
 int main() {
     test_spectrogram();
     test_spectral_centroid();
@@ -1242,5 +1321,9 @@ int main() {
     TM_RUN(test_buffers_follow_input);
     TM_RUN(test_r2_pitch_shift_float64);
     TM_RUN(test_r2_resample_kernel_and_equal_rates);
+    TM_RUN(test_p4_effects_transforms);
+    TM_RUN(test_p4_time_transforms);
+    TM_RUN(test_p4_specaugment_f64_seeded);
+    TM_RUN(test_p4_rank_checks);
     return tm_test::summary("audio_test_transform");
 }

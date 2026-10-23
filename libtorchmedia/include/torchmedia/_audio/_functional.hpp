@@ -4,11 +4,13 @@
 #include <algorithm>
 #include <cmath>
 #include <iterator>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <torch/torch.h>
 #include <utility>
 #include "../globel_include.hpp"
+#include "_functional_filtering.hpp" // lfilter / biquads for deemphasis and loudness
 #include "_functional_methods_options.hpp"
 
 namespace torchmedia::audio::functional {
@@ -547,6 +549,10 @@ namespace torchmedia::audio::functional {
         if (win_length < 3) {
             return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}), "win_length must be >= 3.");
         }
+        if (mode != "replicate" && mode != "constant" && mode != "reflect" && mode != "circular") {
+            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
+                                                                      "Unrecognised padding mode " + mode);
+        }
         const auto shape = specgram.sizes().vec();
         const int64_t time = shape.back();
         const auto packed = specgram.reshape({1, -1, time});
@@ -610,15 +616,25 @@ namespace torchmedia::audio::functional {
     // Scale `noise` to a target per-signal SNR (dB) and add it (mirrors torchaudio.functional.add_noise).
     inline auto add_noise(const_tensor_lref_t waveform, const_tensor_lref_t noise, const_tensor_lref_t snr,
                           const c10::optional<tensor_t> &lengths = c10::nullopt) -> tensor_t {
+        if (!(waveform.dim() >= 1 && waveform.dim() == noise.dim() && waveform.dim() - 1 == snr.dim() &&
+              (!lengths.has_value() || lengths->dim() == snr.dim()))) {
+            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
+                                                                      "Input leading dimensions don't match.");
+        }
+        if (waveform.size(-1) != noise.size(-1)) {
+            return handle_exceptions<tensor_t, std::invalid_argument>(
+                    torch::empty({1}), "Length dimensions of waveform and noise don't match.");
+        }
         tensor_t ws = waveform, ns = noise;
         if (lengths.has_value()) {
             const int64_t length = waveform.size(-1);
-            const auto mask = torch::arange(0, length, waveform.options()) < lengths.value().unsqueeze(-1);
+            const auto mask = torch::arange(length, lengths->options().dtype(torch::kLong)) < lengths->unsqueeze(-1);
             ws = waveform * mask;
             ns = noise * mask;
         }
-        const auto energy_signal = (ws * ws).sum(-1); // (...,)
-        const auto energy_noise = (ns * ns).sum(-1); // (...,)
+        // torch.linalg.vector_norm(...) ** 2 as in torchaudio (a plain sum of squares rounds differently).
+        const auto energy_signal = torch::linalg_vector_norm(ws, 2, {-1}, false).pow(2); // (...,)
+        const auto energy_noise = torch::linalg_vector_norm(ns, 2, {-1}, false).pow(2); // (...,)
         const auto original_snr_db = 10.0 * (torch::log10(energy_signal) - torch::log10(energy_noise));
         const auto scale = torch::pow(10.0, (original_snr_db - snr) / 20.0); // (...,)
         return waveform + scale.unsqueeze(-1) * noise;
@@ -669,6 +685,8 @@ namespace torchmedia::audio::functional {
     }
 
     // Fréchet distance between two multivariate Gaussians (mirrors torchaudio.functional.frechet_distance).
+    // Intentionally stricter: torchaudio's `size(0) != size(1) != mu.size(0)` is a chained comparison, so it accepts
+    // e.g. mu (4,) with sigma (3, 3); here any mismatch raises.
     inline auto frechet_distance(const_tensor_lref_t mu_x, const_tensor_lref_t sigma_x, const_tensor_lref_t mu_y,
                                  const_tensor_lref_t sigma_y) -> tensor_t {
         if (mu_x.dim() != 1 || sigma_x.dim() != 2 || sigma_x.size(0) != sigma_x.size(1) ||
@@ -717,8 +735,9 @@ namespace torchmedia::audio::functional {
         const auto shape = specgram.sizes().vec();
         auto packed = specgram.reshape({-1, shape[shape.size() - 2], shape.back()});
         const int64_t packed_axis = axis - dim + 3; // 1 (freq) or 2 (time) after packing to 3D
-        const auto value = torch::rand({1}, specgram.options()) * mp;
-        const auto min_value = torch::rand({1}, specgram.options()) * (packed.size(packed_axis) - value);
+        // torchaudio draws torch.rand(1): CPU float32 whatever the spectrogram's dtype/device (same masks per seed).
+        const auto value = torch::rand({1}) * mp;
+        const auto min_value = torch::rand({1}) * (packed.size(packed_axis) - value);
         const auto mask_start = min_value.to(torch::kLong).squeeze();
         const auto mask_end = (min_value.to(torch::kLong) + value.to(torch::kLong)).squeeze();
         auto mask = torch::arange(0, packed.size(packed_axis), specgram.options());
@@ -770,6 +789,10 @@ namespace torchmedia::audio::functional {
         namespace F = torch::nn::functional;
         if (rate == 1.0) {
             return complex_specgrams_in;
+        }
+        if (complex_specgrams_in.dim() < 2) { // torchaudio raises (RuntimeError) on 0-D / 1-D input
+            return handle_exceptions<tensor_t, std::invalid_argument>(
+                    torch::empty({1}), "phase_vocoder: expected a (..., freq, time) complex spectrogram.");
         }
         const double pi = std::acos(-1.0);
         const auto shape = complex_specgrams_in.sizes().vec();
@@ -838,11 +861,15 @@ namespace torchmedia::audio::functional {
     }
 
     // pitch_shift helper: STFT -> phase_vocoder time-stretch -> ISTFT (mirrors _stretch_waveform).
-    inline auto _stretch_waveform(const_tensor_lref_t waveform_in, int n_steps, int bins_per_octave = 12,
+    inline auto _stretch_waveform(const_tensor_lref_t waveform_in, double n_steps, int bins_per_octave = 12,
                                   int n_fft = 512, c10::optional<int> win_length_opt = c10::nullopt,
                                   c10::optional<int> hop_length_opt = c10::nullopt,
                                   const c10::optional<tensor_t> &window_opt = c10::nullopt) -> tensor_t {
         using namespace torch::indexing;
+        if (waveform_in.dim() < 1) {
+            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
+                                                                      "pitch_shift: expected a (..., time) waveform.");
+        }
         const int hop_length = hop_length_opt.has_value() ? hop_length_opt.value() : n_fft / 4;
         const int win_length = win_length_opt.has_value() ? win_length_opt.value() : n_fft;
         const auto window = window_opt.has_value()
@@ -851,7 +878,7 @@ namespace torchmedia::audio::functional {
         const auto shape = waveform_in.sizes().vec();
         const auto waveform = waveform_in.reshape({-1, shape.back()});
         const int64_t ori_len = shape.back();
-        const double rate = std::pow(2.0, -static_cast<double>(n_steps) / bins_per_octave);
+        const double rate = std::pow(2.0, -n_steps / bins_per_octave);
         const auto spec_f =
                 torch::stft(waveform, n_fft, hop_length, win_length, window, true, "reflect", false, true, true);
         const double pi = std::acos(-1.0);
@@ -878,19 +905,33 @@ namespace torchmedia::audio::functional {
         return ws.reshape(out_shape);
     }
 
-    // Pitch shift by n_steps via time-stretch + resample (mirrors torchaudio.functional.pitch_shift).
-    inline auto pitch_shift(const_tensor_lref_t waveform, int sample_rate, int n_steps, int bins_per_octave = 12,
+    // pitch_shift's resample source rate int(sample_rate / 2^(-n_steps / bins_per_octave)), checked before the int
+    // cast (an out-of-range double -> int is UB). Shared with transform::PitchShift. Returns an error message or "".
+    inline auto _pitch_shift_orig_freq(int sample_rate, double n_steps, int bins_per_octave, int &orig_freq) -> str_t {
+        if (bins_per_octave == 0) { // torchaudio: ZeroDivisionError
+            return "bins_per_octave must be non-zero.";
+        }
+        const double orig = sample_rate / std::pow(2.0, -n_steps / bins_per_octave);
+        if (!(orig >= 1.0 && orig <= std::numeric_limits<int>::max())) {
+            return "sample_rate * 2^(n_steps / bins_per_octave) must be in [1, INT_MAX].";
+        }
+        orig_freq = static_cast<int>(orig);
+        return _check_resample_args(orig_freq, sample_rate, resample_option());
+    }
+
+    // Pitch shift by n_steps (fractional allowed, as in torchaudio) via time-stretch + resample (mirrors
+    // torchaudio.functional.pitch_shift).
+    inline auto pitch_shift(const_tensor_lref_t waveform, int sample_rate, double n_steps, int bins_per_octave = 12,
                             int n_fft = 512, c10::optional<int> win_length = c10::nullopt,
                             c10::optional<int> hop_length = c10::nullopt,
                             const c10::optional<tensor_t> &window = c10::nullopt) -> tensor_t {
-        if (bins_per_octave == 0) { // torchaudio: ZeroDivisionError
-            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                                      "bins_per_octave must be non-zero.");
-        }
-        const double rate = std::pow(2.0, -static_cast<double>(n_steps) / bins_per_octave);
-        const int orig_freq = static_cast<int>(sample_rate / rate);
-        if (const auto err = _check_resample_args(orig_freq, sample_rate, resample_option()); !err.empty()) {
+        int orig_freq = 0;
+        if (const auto err = _pitch_shift_orig_freq(sample_rate, n_steps, bins_per_octave, orig_freq); !err.empty()) {
             return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}), err);
+        }
+        if (waveform.dim() < 1) { // torchaudio: IndexError
+            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
+                                                                      "pitch_shift: expected a (..., time) waveform.");
         }
         const auto waveform_stretch =
                 _stretch_waveform(waveform, n_steps, bins_per_octave, n_fft, win_length, hop_length, window);
@@ -906,8 +947,9 @@ namespace torchmedia::audio::functional {
                                                                       "Only up to 5 channels are supported.");
         }
         const double gate_duration = 0.4, overlap = 0.75, gamma_abs = -70.0, kweight_bias = -0.691;
-        const int64_t gate_samples = static_cast<int64_t>(std::llround(gate_duration * sample_rate));
-        const int64_t step = static_cast<int64_t>(std::llround(gate_samples * (1.0 - overlap)));
+        // Python round(): halves go to even (11025 Hz: round(1102.5) = 1102).
+        const auto gate_samples = static_cast<int64_t>(std::nearbyint(gate_duration * sample_rate));
+        const auto step = static_cast<int64_t>(std::nearbyint(gate_samples * (1.0 - overlap)));
 
         // K-weighting: high-shelf (+4 dB @ 1500 Hz) then a 38 Hz high-pass.
         auto waveform = treble_biquad(waveform_in, sample_rate, 4.0, 1500.0, 1.0 / std::sqrt(2.0));
@@ -1042,8 +1084,8 @@ namespace torchmedia::audio::functional {
             const auto s2 = waveform.index({Ellipsis, Slice(lag, None)})
                                     .unfold(-1, frame_size, frame_size)
                                     .index({Ellipsis, Slice(None, num_of_frames), Slice()});
-            const auto of = (s1 * s2).sum(-1) / (EPS + (s1 * s1).sum(-1).sqrt()).pow(2) /
-                            (EPS + (s2 * s2).sum(-1).sqrt()).pow(2);
+            const auto of = (s1 * s2).sum(-1) / (EPS + torch::linalg_vector_norm(s1, 2, {-1}, false)).pow(2) /
+                            (EPS + torch::linalg_vector_norm(s2, 2, {-1}, false)).pow(2);
             output_lag.push_back(of.unsqueeze(-1));
         }
         return torch::cat(output_lag, -1);
@@ -1083,16 +1125,24 @@ namespace torchmedia::audio::functional {
         return std::get<0>(torch::median(roll, -1));
     }
 
-    // Pitch detection via NCCF + median smoothing (mirrors detect_pitch_frequency).
+    // Pitch detection via NCCF + median smoothing (mirrors detect_pitch_frequency). Extension: win_length 1 or 2
+    // (no / minimal smoothing) works, where torchaudio's _median_smoothing fails on torch.cat([]).
     inline auto detect_pitch_frequency(const_tensor_lref_t waveform_in, int sample_rate, double frame_time = 1e-2,
                                        int win_length = 30, int freq_low = 85, int freq_high = 3400) -> tensor_t {
+        if (waveform_in.dim() < 1 || sample_rate <= 0 || freq_low <= 0 || freq_high <= 0 || win_length < 1 ||
+            !(frame_time > 0.0 && sample_rate * frame_time < 1e15)) { // torchaudio: ZeroDivisionError / IndexError
+            return handle_exceptions<tensor_t, std::invalid_argument>(
+                    torch::empty({1}), "detect_pitch_frequency: need a (..., time) waveform, positive sample_rate, "
+                                       "frame_time, freq_low, freq_high and win_length >= 1.");
+        }
         const auto shape = waveform_in.sizes().vec();
         const auto waveform = waveform_in.reshape({-1, shape.back()});
         const auto nccf = _compute_nccf(waveform, sample_rate, frame_time, freq_low);
         auto indices = _find_max_per_frame(nccf, sample_rate, freq_high);
         indices = _median_smoothing(indices, win_length);
         const double EPS = 1e-9;
-        const auto freq = sample_rate / (EPS + indices.to(torch::kFloat));
+        // Python `int / tensor` is tensor.reciprocal() * int (1 ulp off a correctly rounded division).
+        const auto freq = torch::reciprocal(EPS + indices.to(torch::kFloat)) * sample_rate;
         std::vector<int64_t> out_shape(shape.begin(), shape.end() - 1);
         out_shape.push_back(freq.size(-1));
         return freq.reshape(out_shape);

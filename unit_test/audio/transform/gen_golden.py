@@ -120,3 +120,13 @@ _k = T.Resample(44100, 16000).kernel.double()
 _wts = torch.sin(torch.arange(_k.numel(), dtype=torch.float64) * 0.7).reshape(_k.shape)
 show("resample_kernel_44k1_16k shape/sum/wsum/[38717]",
      [tuple(_k.shape), repr(float(_k.sum())), repr(float((_k * _wts).sum())), repr(float(_k.flatten()[38717]))])
+
+# ======================= progress04 -- surface audit (2026-10-23, task12-task19) =======================
+# SpecAugment(iid_masks=False) on float64: torch.rand(1) is drawn on the CPU in float32, so the masks equal float32's.
+_xs = torch.arange(1, 1 + 2 * 30 * 40, dtype=torch.float64).reshape(2, 30, 40)
+torch.manual_seed(0)
+_ys = T.SpecAugment(2, 10, 2, 10, iid_masks=False, zero_masking=True)(_xs)
+show("specaugment_f64_seed0 sum/zeros", [repr(float(_ys.sum())), int((_ys == 0).sum())])  # 1852636.0, 744
+# PitchShift with fractional n_steps (the functional value is pinned in the functional gen_golden.py).
+_pp = T.PitchShift(1000, 0.5)(torch.sin(torch.arange(3001.0) * 0.05).unsqueeze(0))
+show("pitch_shift_frac [0,1500]", repr(float(_pp[0, 1500])))

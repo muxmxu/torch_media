@@ -9,23 +9,39 @@
 // Tensor (one-hot) overloads.
 namespace torchmedia::audio::functional {
     namespace detail {
-        inline auto assert_psd_matrices(const_tensor_lref_t psd_s, const_tensor_lref_t psd_n) -> void {
+        // torchaudio's psd_s / psd_n checks. Returns an error message or "" (callers return handle_exceptions, so the
+        // LIB_TORCH_MEDIA_NO_EXCEPTIONS build stops too).
+        inline auto psd_matrices_error(const_tensor_lref_t psd_s, const_tensor_lref_t psd_n) -> str_t {
             if (psd_s.dim() < 3 || psd_n.dim() < 3) {
-                handle_exceptions<tensor_t, std::invalid_argument>(
-                        torch::empty({1}), "Expected at least 3D (..., freq, channel, channel) for psd_s/psd_n.");
+                return "Expected at least 3D (..., freq, channel, channel) for psd_s/psd_n.";
             }
             if (!(psd_s.is_complex() && psd_n.is_complex())) {
-                handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                                   "psd_s and psd_n must be complex.");
+                return "psd_s and psd_n must be complex.";
             }
             if (psd_s.sizes() != psd_n.sizes()) {
-                handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                                   "psd_s and psd_n must have the same shape.");
+                return "psd_s and psd_n must have the same shape.";
             }
             if (psd_s.size(-1) != psd_s.size(-2)) {
-                handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                                   "The last two dimensions of psd_s must match.");
+                return "The last two dimensions of psd_s must match.";
             }
+            return {};
+        }
+
+        // torchaudio mvdr_weights_rtf's checks: rtf (..., freq, channel), psd_n (..., freq, channel, channel).
+        inline auto rtf_psd_n_error(const_tensor_lref_t rtf, const_tensor_lref_t psd_n) -> str_t {
+            if (rtf.dim() < 2 || psd_n.dim() < 3) {
+                return "Expected at least 2D rtf (..., freq, channel) and 3D psd_n (..., freq, channel, channel).";
+            }
+            if (!(rtf.is_complex() && psd_n.is_complex())) {
+                return "rtf and psd_n must be complex.";
+            }
+            if (rtf.sizes() != psd_n.sizes().slice(0, psd_n.dim() - 1)) {
+                return "The dimensions of rtf and of psd_n without its last dimension must be the same.";
+            }
+            if (psd_n.size(-1) != psd_n.size(-2)) {
+                return "The last two dimensions of psd_n must match.";
+            }
+            return {};
         }
     } // namespace detail
 
@@ -49,6 +65,14 @@ namespace torchmedia::audio::functional {
                     bool normalize = true, double eps = 1e-10) -> tensor_t {
         using namespace torch::indexing;
         const auto specgram = specgram_in.transpose(-3, -2); // (..., freq, channel, time)
+        if (mask.has_value() &&
+            (mask->dim() < 1 ||
+             mask->sizes().slice(0, mask->dim() - 1) != specgram.sizes().slice(0, specgram.dim() - 2) ||
+             mask->size(-1) != specgram.size(-1))) { // e.g. a per-channel mask: PSD(multi_mask)
+            return handle_exceptions<tensor_t, std::invalid_argument>(
+                    torch::empty({1}), "The dimensions of mask except the channel dimension should be the same as "
+                                       "specgram: expected (..., freq, time).");
+        }
         auto psd_mat = torch::einsum("...ct,...et->...tce", {specgram, specgram.conj()});
         if (mask.has_value()) {
             auto m = mask.value();
@@ -65,7 +89,9 @@ namespace torchmedia::audio::functional {
                                     bool diagonal_loading = true, double diag_eps = 1e-7, double eps = 1e-8)
             -> tensor_t {
         using namespace torch::indexing;
-        detail::assert_psd_matrices(psd_s, psd_n);
+        if (const auto err = detail::psd_matrices_error(psd_s, psd_n); !err.empty()) {
+            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}), err);
+        }
         if (diagonal_loading) {
             psd_n = _tik_reg(psd_n, diag_eps);
         }
@@ -79,7 +105,9 @@ namespace torchmedia::audio::functional {
                                     bool diagonal_loading = true, double diag_eps = 1e-7, double eps = 1e-8)
             -> tensor_t {
         using namespace torch::indexing;
-        detail::assert_psd_matrices(psd_s, psd_n);
+        if (const auto err = detail::psd_matrices_error(psd_s, psd_n); !err.empty()) {
+            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}), err);
+        }
         if (diagonal_loading) {
             psd_n = _tik_reg(psd_n, diag_eps);
         }
@@ -94,6 +122,9 @@ namespace torchmedia::audio::functional {
                                  c10::optional<int64_t> reference_channel = c10::nullopt, bool diagonal_loading = true,
                                  double diag_eps = 1e-7, double eps = 1e-8) -> tensor_t {
         using namespace torch::indexing;
+        if (const auto err = detail::rtf_psd_n_error(rtf, psd_n); !err.empty()) {
+            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}), err);
+        }
         if (diagonal_loading) {
             psd_n = _tik_reg(psd_n, diag_eps);
         }
@@ -111,6 +142,9 @@ namespace torchmedia::audio::functional {
     inline auto mvdr_weights_rtf(const_tensor_lref_t rtf, tensor_t psd_n, const_tensor_lref_t reference_channel,
                                  bool diagonal_loading = true, double diag_eps = 1e-7, double eps = 1e-8) -> tensor_t {
         using namespace torch::indexing;
+        if (const auto err = detail::rtf_psd_n_error(rtf, psd_n); !err.empty()) {
+            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}), err);
+        }
         if (diagonal_loading) {
             psd_n = _tik_reg(psd_n, diag_eps);
         }
@@ -141,7 +175,9 @@ namespace torchmedia::audio::functional {
     inline auto rtf_power(const_tensor_lref_t psd_s, tensor_t psd_n, int64_t reference_channel, int n_iter = 3,
                           bool diagonal_loading = true, double diag_eps = 1e-7) -> tensor_t {
         using namespace torch::indexing;
-        detail::assert_psd_matrices(psd_s, psd_n);
+        if (const auto err = detail::psd_matrices_error(psd_s, psd_n); !err.empty()) {
+            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}), err);
+        }
         if (n_iter <= 0) {
             return handle_exceptions<tensor_t, std::invalid_argument>(
                     torch::empty({1}), "The number of iterations must be greater than 0.");
@@ -164,6 +200,13 @@ namespace torchmedia::audio::functional {
 
     // Apply precomputed beamforming weights (mirrors apply_beamforming).
     inline auto apply_beamforming(const_tensor_lref_t beamform_weights, const_tensor_lref_t specgram) -> tensor_t {
+        if (beamform_weights.dim() < 2 || specgram.dim() < 3 ||
+            beamform_weights.sizes().slice(0, beamform_weights.dim() - 2) !=
+                    specgram.sizes().slice(0, specgram.dim() - 3)) {
+            return handle_exceptions<tensor_t, std::invalid_argument>(
+                    torch::empty({1}), "The dimensions except the last two of beamform_weights should be the same as "
+                                       "the dimensions except the last three of specgram.");
+        }
         if (!(beamform_weights.is_complex() && specgram.is_complex())) {
             return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
                                                                       "beamform_weights and specgram must be complex.");

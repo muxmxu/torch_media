@@ -8,10 +8,11 @@
 #include "../globel_include.hpp"
 
 namespace torchmedia::audio::functional {
-    // Core IIR difference-equation evaluator (mirrors torchaudio's pure-torch _lfilter_core +
-    // _lfilter_core_generic_loop). `waveform` is (n_batch, n_channel, n_sample); coeffs are
-    // (n_channel, n_order) ordered [a0, a1, ...] (lower delay first). The recurrence is the one
-    // non-vectorizable piece (data dependency across time), so it is a sequential loop over samples.
+    // Core IIR difference-equation evaluator (mirrors torchaudio's compiled _lfilter op: FIR with b/a0 as a grouped
+    // conv1d, then the recurrence with a/a0). `waveform` is (n_batch, n_channel, n_sample); coeffs are
+    // (n_channel, n_order) ordered [a0, a1, ...] (lower delay first). The recurrence runs as torchaudio's scalar CPU
+    // loop for float32/float64 CPU input without autograd; otherwise (other devices, autograd, other dtypes) as its
+    // differentiable tensor-op loop (_lfilter_core_generic_loop), which costs ~5 us per sample.
     inline auto _lfilter_core(const_tensor_lref_t waveform, const_tensor_lref_t a_coeffs, const_tensor_lref_t b_coeffs)
             -> tensor_t {
         using namespace torch::indexing;
@@ -33,32 +34,51 @@ namespace torchmedia::audio::functional {
                                                                       "Expected n_order to be positive.");
         }
 
-        // Left-pad the input by n_order-1 and allocate a zero-initialised output buffer.
-        const auto padded_waveform = F::pad(waveform, F::PadFuncOptions({n_order - 1, 0}));
-        auto padded_output = torch::zeros_like(padded_waveform);
-
-        // Flip both coefficient sets ([a0,a1,..] -> [..,a1,a0]); normalise by a0.
-        auto a_flipped = a_coeffs.flip(1);
-        const auto b_flipped = b_coeffs.flip(1);
-
-        // FIR numerator part b*x in parallel via a depthwise (grouped) conv1d.
-        auto input_signal_windows =
-                F::conv1d(padded_waveform, b_flipped.unsqueeze(1), F::Conv1dFuncOptions().groups(n_channel));
-
+        // FIR part (b/a0) * x for all samples at once: a depthwise conv1d over the left-padded input.
         const auto a0 = a_coeffs.index({Slice(), Slice(None, 1)}); // (n_channel, 1)
-        input_signal_windows.div_(a0);
-        a_flipped = a_flipped / a0;
+        const auto input_signal_windows =
+                F::conv1d(F::pad(waveform, F::PadFuncOptions({n_order - 1, 0})), (b_coeffs / a0).flip(1).unsqueeze(1),
+                          F::Conv1dFuncOptions().groups(n_channel))
+                        .contiguous(); // (n_batch, n_channel, n_sample)
+        const auto a_flipped = (a_coeffs / a0).flip(1).contiguous(); // [.., a1, a0] / a0
+        auto padded_output =
+                torch::zeros({waveform.size(0), n_channel, n_sample + n_order - 1}, input_signal_windows.options());
 
-        // Sequential time recurrence (matches _lfilter_core_generic_loop).
-        const auto a_flipped_3 = a_flipped.unsqueeze(2); // (n_channel, n_order, 1)
-        for (int64_t i = 0; i < n_sample; ++i) {
-            auto o0 = input_signal_windows.index({Slice(), Slice(), i}); // (n_batch, n_channel)
-            const auto windowed = padded_output.index({Slice(), Slice(), Slice(i, i + n_order)}); // (nb, nc, no)
-            const auto corr = torch::matmul(windowed.transpose(0, 1), a_flipped_3).squeeze(-1).t(); // (nb, nc)
-            o0 = o0 - corr;
-            padded_output.index_put_({Slice(), Slice(), i + n_order - 1}, o0);
+        const auto dtype = padded_output.scalar_type();
+        if (padded_output.is_cpu() && (dtype == torch::kFloat || dtype == torch::kDouble) &&
+            !(input_signal_windows.requires_grad() || a_flipped.requires_grad())) {
+            // torchaudio's host_lfilter_core_loop: y[i + n_order - 1] = x[i] - sum_k y[i + k] * a_flipped[k]. Its
+            // `acc -= y * c` is compiled to a fused multiply-subtract in the arm64 reference wheel; an explicit fma
+            // reproduces it bit-exactly and does not depend on this compiler's contraction setting.
+            AT_DISPATCH_FLOATING_TYPES(dtype, "lfilter_core_loop", [&] {
+                const scalar_t *in = input_signal_windows.const_data_ptr<scalar_t>();
+                const scalar_t *coeff = a_flipped.const_data_ptr<scalar_t>();
+                scalar_t *out = padded_output.mutable_data_ptr<scalar_t>();
+                const int64_t n_out = padded_output.size(2);
+                at::parallel_for(0, padded_output.size(0) * n_channel, 1, [&](int64_t begin, int64_t end) {
+                    for (int64_t row = begin; row < end; ++row) {
+                        const scalar_t *x = in + row * n_sample;
+                        const scalar_t *c = coeff + (row % n_channel) * n_order;
+                        scalar_t *y = out + row * n_out;
+                        for (int64_t i = 0; i < n_sample; ++i) {
+                            scalar_t acc = x[i];
+                            for (int64_t k = 0; k < n_order; ++k) {
+                                acc = std::fma(-y[i + k], c[k], acc);
+                            }
+                            y[i + n_order - 1] = acc;
+                        }
+                    }
+                });
+            });
+        } else {
+            const auto a_flipped_3 = a_flipped.unsqueeze(2); // (n_channel, n_order, 1)
+            for (int64_t i = 0; i < n_sample; ++i) {
+                const auto windowed = padded_output.index({Slice(), Slice(), Slice(i, i + n_order)}); // (nb, nc, no)
+                const auto corr = torch::matmul(windowed.transpose(0, 1), a_flipped_3).squeeze(-1).t(); // (nb, nc)
+                padded_output.index_put_({Slice(), Slice(), i + n_order - 1},
+                                         input_signal_windows.index({Slice(), Slice(), i}) - corr);
+            }
         }
-
         return padded_output.index({Slice(), Slice(), Slice(n_order - 1, None)});
     }
 
@@ -319,7 +339,8 @@ namespace torchmedia::audio::functional {
         return torch::sin(temp1 + temp2);
     }
 
-    // DC shift, with an optional peak limiter (SoX). shift in [-2, 2].
+    // DC shift, with an optional peak limiter (SoX). shift in [-2, 2]. Intentional difference: torchaudio writes the
+    // result into its input tensor; here the input is left unchanged (same output).
     inline auto dcshift(const_tensor_lref_t waveform, double shift, std::optional<double> limiter_gain = std::nullopt)
             -> tensor_t {
         using namespace torch::indexing;
@@ -359,7 +380,10 @@ namespace torchmedia::audio::functional {
     // ---- dither (task18): probability-distribution dithering + optional noise shaping ----
 
     // Apply a probability distribution (TPDF/RPDF/GPDF) and requantise at 16-bit scale.
-    // TPDF is deterministic (Bartlett window); RPDF/GPDF draw random samples.
+    // TPDF is deterministic (Bartlett window); RPDF/GPDF draw random samples (same randint stream as torchaudio).
+    // Intentional GPDF difference: torchaudio sums its 7 samples into a VIEW of the first one, so it mutates the
+    // caller's tensor and re-reads that grown sample when an index repeats (its noise shaping then sees the mutated
+    // input too); here the 7 samples of the unmodified input are summed. Mono GPDF also works (torchaudio raises).
     inline auto _apply_probability_distribution(const_tensor_lref_t waveform_in,
                                                 const std::string &density_function = "TPDF") -> tensor_t {
         using namespace torch::indexing;
@@ -463,8 +487,6 @@ namespace torchmedia::audio::functional {
         const auto waveform = waveform_in.reshape({-1, actual_shape.back()});
         const double g = _db2linear(gain);
         const double col = colour / 200.0;
-        auto last_in = torch::zeros({waveform.size(0)}, waveform.options());
-        auto last_out = torch::zeros({waveform.size(0)}, waveform.options());
         auto temp = waveform * g + col;
         const auto mask1 = temp < -1;
         const auto mask2 = temp > 1;
@@ -474,11 +496,35 @@ namespace torchmedia::audio::functional {
         temp = torch::where(mask3, temp - temp.pow(3) * (1.0 / 3.0), temp);
         auto output = torch::zeros_like(waveform);
         const int64_t T = waveform.size(-1);
-        for (int64_t i = 0; i < T; ++i) {
-            const auto ti = temp.index({Slice(), i});
-            last_out = ti - last_in + 0.995 * last_out;
-            last_in = ti;
-            output.index_put_({Slice(), i}, waveform.index({Slice(), i}) * 0.5 + last_out * 0.75);
+        const auto dtype = waveform.scalar_type();
+        if (waveform.is_cpu() && (dtype == torch::kFloat || dtype == torch::kDouble) && !temp.requires_grad()) {
+            // torchaudio's compiled _overdrive_core_loop (overdrive.cpp), same double-literal arithmetic.
+            const auto wav = waveform.contiguous();
+            const auto tmp = temp.contiguous();
+            AT_DISPATCH_FLOATING_TYPES(dtype, "overdrive_core_loop", [&] {
+                const auto w_acc = wav.accessor<scalar_t, 2>();
+                const auto t_acc = tmp.accessor<scalar_t, 2>();
+                auto o_acc = output.accessor<scalar_t, 2>();
+                at::parallel_for(0, wav.size(0), 1, [&](int64_t begin, int64_t end) {
+                    for (int64_t c = begin; c < end; ++c) {
+                        scalar_t l_in = 0, l_out = 0;
+                        for (int64_t i = 0; i < T; ++i) {
+                            l_out = t_acc[c][i] - l_in + 0.995 * l_out;
+                            l_in = t_acc[c][i];
+                            o_acc[c][i] = w_acc[c][i] * 0.5 + l_out * 0.75;
+                        }
+                    }
+                });
+            });
+        } else { // other devices, autograd, other dtypes: torchaudio's _overdrive_core_loop_generic
+            auto last_in = torch::zeros({waveform.size(0)}, waveform.options());
+            auto last_out = torch::zeros({waveform.size(0)}, waveform.options());
+            for (int64_t i = 0; i < T; ++i) {
+                const auto ti = temp.index({Slice(), i});
+                last_out = ti - last_in + 0.995 * last_out;
+                last_in = ti;
+                output.index_put_({Slice(), i}, waveform.index({Slice(), i}) * 0.5 + last_out * 0.75);
+            }
         }
         return torch::clamp(output, -1.0, 1.0).reshape(actual_shape);
     }
@@ -490,9 +536,17 @@ namespace torchmedia::audio::functional {
         using namespace torch::indexing;
         const auto actual_shape = waveform_in.sizes().vec();
         auto waveform = waveform_in.reshape({-1, actual_shape.back()});
-        const int64_t delay_buf_len = static_cast<int64_t>(delay_ms * 0.001 * sample_rate + 0.5);
+        const double delay_len = delay_ms * 0.001 * sample_rate + 0.5;
+        const double mod_len = sample_rate / mod_speed + 0.5;
+        // torchaudio fails here too (ZeroDivisionError / IndexError); unchecked, both lengths index empty buffers.
+        if (!(delay_len >= 1.0 && delay_len < 1e15 && mod_len >= 1.0 && mod_len < 1e15)) {
+            return handle_exceptions<tensor_t, std::invalid_argument>(
+                    torch::empty({1}),
+                    "phaser: delay_ms and mod_speed must give delay and LFO buffers of >= 1 sample.");
+        }
+        const auto delay_buf_len = static_cast<int64_t>(delay_len);
         auto delay_buf = torch::zeros({waveform.size(0), delay_buf_len}, waveform.options());
-        const int64_t mod_buf_len = static_cast<int64_t>(sample_rate / mod_speed + 0.5);
+        const auto mod_buf_len = static_cast<int64_t>(mod_len);
         const auto mod_buf =
                 _generate_wave_table(sinusoidal ? "SINE" : "TRIANGLE", "INT", mod_buf_len, 1.0,
                                      static_cast<double>(delay_buf_len), detail::pi / 2.0, waveform.options());
@@ -529,6 +583,10 @@ namespace torchmedia::audio::functional {
                     torch::empty({1}), "Only \"linear\" or \"quadratic\" interpolation.");
         }
         const auto actual_shape = waveform_in.sizes().vec();
+        if (actual_shape.size() < 2) { // torchaudio: IndexError
+            return handle_exceptions<tensor_t, std::invalid_argument>(
+                    torch::empty({1}), "flanger: expected a (..., channel, time) waveform.");
+        }
         if (actual_shape[actual_shape.size() - 2] > 4) {
             return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}), "Max 4 channels allowed");
         }
@@ -592,7 +650,8 @@ namespace torchmedia::audio::functional {
     // ---- VAD (task05): SoX cepstral-power voice-activity detector ----
 
     // Single-window cepstral-power measure (mirrors _measure). `spectrum`/`noise_spectrum` are views and
-    // are updated in place across windows.
+    // are updated in place across windows. Like torchaudio, the work buffers are float32 (the spectrum's dtype)
+    // whatever the samples' dtype: a float64 window product is rounded to float32 on assignment.
     inline auto _measure(int64_t measure_len_ws, const tensor_t &samples, tensor_t spectrum, tensor_t noise_spectrum,
                          const tensor_t &spectrum_window, int64_t spectrum_start, int64_t spectrum_end,
                          const tensor_t &cepstrum_window, int64_t cepstrum_start, int64_t cepstrum_end,
@@ -601,16 +660,16 @@ namespace torchmedia::audio::functional {
             -> double {
         using namespace torch::indexing;
         const int64_t dft_len_ws = spectrum.size(-1);
-        auto dftBuf = torch::zeros({dft_len_ws}, samples.options());
+        auto dftBuf = torch::zeros({dft_len_ws}, spectrum.options());
         dftBuf.index_put_({Slice(None, measure_len_ws)},
-                          samples * spectrum_window.index({Slice(None, measure_len_ws)}));
+                          (samples * spectrum_window.index({Slice(None, measure_len_ws)})).to(dftBuf.scalar_type()));
         const auto _dftBuf = torch::fft::rfft(dftBuf);
         const double mult =
                 boot_count >= 0 ? static_cast<double>(boot_count) / (1.0 + boot_count) : measure_smooth_time_mult;
         auto _d = _dftBuf.index({Slice(spectrum_start, spectrum_end)}).abs();
         spectrum.index({Slice(spectrum_start, spectrum_end)}).mul_(mult).add_(_d * (1 - mult));
         _d = spectrum.index({Slice(spectrum_start, spectrum_end)}).pow(2);
-        const auto _zeros = torch::zeros({spectrum_end - spectrum_start}, samples.options());
+        const auto _zeros = torch::zeros({spectrum_end - spectrum_start}, spectrum.options());
         tensor_t _mult = boot_count >= 0
                                  ? _zeros
                                  : torch::where(_d > noise_spectrum.index({Slice(spectrum_start, spectrum_end)}),
@@ -618,7 +677,7 @@ namespace torchmedia::audio::functional {
         noise_spectrum.index({Slice(spectrum_start, spectrum_end)}).mul_(_mult).add_(_d * (1 - _mult));
         _d = torch::sqrt(torch::max(
                 _zeros, _d - noise_reduction_amount * noise_spectrum.index({Slice(spectrum_start, spectrum_end)})));
-        auto _cepstrum_Buf = torch::zeros({dft_len_ws >> 1}, samples.options());
+        auto _cepstrum_Buf = torch::zeros({dft_len_ws >> 1}, spectrum.options());
         _cepstrum_Buf.index_put_({Slice(spectrum_start, spectrum_end)}, _d * cepstrum_window);
         const auto _cep = torch::fft::rfft(_cepstrum_Buf);
         double result = torch::sum(_cep.index({Slice(cepstrum_start, cepstrum_end)}).abs().pow(2)).item<double>();
@@ -637,32 +696,42 @@ namespace torchmedia::audio::functional {
                     double lp_lifter_freq = 2000.0) -> tensor_t {
         using namespace torch::indexing;
         const double mdur = measure_duration.has_value() ? measure_duration.value() : 2.0 / measure_freq;
+        // These sizes index the loop below: 0 measures or a 0-sample period would write out of bounds or never end
+        // (torchaudio raises IndexError / ZeroDivisionError / "range() arg 3 must not be zero" there).
+        const double period = sample_rate / measure_freq + 0.5, n_measures = std::ceil(search_time * measure_freq);
+        if (waveform_in.dim() < 1 || !(period >= 1.0 && period < 1e15 && n_measures >= 1.0 && n_measures < 1e15) ||
+            !(sample_rate * mdur + 0.5 < 1e15 && hp_lifter_freq > 0.0 && lp_lifter_freq > 0.0)) {
+            return handle_exceptions<tensor_t, std::invalid_argument>(
+                    torch::empty({1}), "vad: need a (..., time) waveform, search_time > 0, 0 < measure_freq <= "
+                                       "2 * sample_rate, a finite measure_duration and positive lifter frequencies.");
+        }
         const int64_t measure_len_ws = static_cast<int64_t>(sample_rate * mdur + 0.5);
         const int64_t measure_len_ns = measure_len_ws;
         int64_t dft_len_ws = 16;
         while (dft_len_ws < measure_len_ws) {
             dft_len_ws *= 2;
         }
-        const int64_t measure_period_ns = static_cast<int64_t>(sample_rate / measure_freq + 0.5);
-        const int64_t measures_len = static_cast<int64_t>(std::ceil(search_time * measure_freq));
+        const auto measure_period_ns = static_cast<int64_t>(period);
+        const auto measures_len = static_cast<int64_t>(n_measures);
         const int64_t search_pre_trigger_len_ns = measures_len * measure_period_ns;
         const int64_t gap_len = static_cast<int64_t>(allowed_gap * measure_freq + 0.5);
         const int64_t fixed_pre_trigger_len_ns = static_cast<int64_t>(pre_trigger_time * sample_rate + 0.5);
         const int64_t samplesLen_ns = fixed_pre_trigger_len_ns + search_pre_trigger_len_ns + measure_len_ns;
 
-        auto spectrum_window = torch::full({measure_len_ws}, 2.0 / std::sqrt(static_cast<double>(measure_len_ws)),
-                                           waveform_in.options());
-        spectrum_window = spectrum_window * torch::hann_window(measure_len_ws, waveform_in.options());
+        // torchaudio keeps windows, spectra and the mults in float32 on the input's device, whatever its dtype.
+        const auto fopts = waveform_in.options().dtype(torch::kFloat);
+        auto spectrum_window =
+                torch::full({measure_len_ws}, 2.0 / std::sqrt(static_cast<double>(measure_len_ws)), fopts);
+        spectrum_window = spectrum_window * torch::hann_window(measure_len_ws, fopts);
 
         int64_t spectrum_start =
                 std::max<int64_t>(static_cast<int64_t>(hp_filter_freq / sample_rate * dft_len_ws + 0.5), 1);
         int64_t spectrum_end = std::min<int64_t>(static_cast<int64_t>(lp_filter_freq / sample_rate * dft_len_ws + 0.5),
                                                  dft_len_ws / 2);
 
-        auto cepstrum_window =
-                torch::full({spectrum_end - spectrum_start},
-                            2.0 / std::sqrt(static_cast<double>(spectrum_end) - spectrum_start), waveform_in.options());
-        cepstrum_window = cepstrum_window * torch::hann_window(spectrum_end - spectrum_start, waveform_in.options());
+        auto cepstrum_window = torch::full({spectrum_end - spectrum_start},
+                                           2.0 / std::sqrt(static_cast<double>(spectrum_end) - spectrum_start), fopts);
+        cepstrum_window = cepstrum_window * torch::hann_window(spectrum_end - spectrum_start, fopts);
 
         int64_t cepstrum_start = static_cast<int64_t>(std::ceil(sample_rate * 0.5 / lp_lifter_freq));
         int64_t cepstrum_end =
@@ -672,10 +741,8 @@ namespace torchmedia::audio::functional {
                     torch::empty({1}), "cepstrum_start must be smaller than cepstrum_end.");
         }
 
-        const auto noise_up_time_mult =
-                torch::tensor(std::exp(-1.0 / (noise_up_time * measure_freq)), waveform_in.options());
-        const auto noise_down_time_mult =
-                torch::tensor(std::exp(-1.0 / (noise_down_time * measure_freq)), waveform_in.options());
+        const auto noise_up_time_mult = torch::tensor(std::exp(-1.0 / (noise_up_time * measure_freq)), fopts);
+        const auto noise_down_time_mult = torch::tensor(std::exp(-1.0 / (noise_down_time * measure_freq)), fopts);
         const double measure_smooth_time_mult = std::exp(-1.0 / (measure_smooth_time * measure_freq));
         const double trigger_meas_time_mult = std::exp(-1.0 / (trigger_time * measure_freq));
         const int64_t boot_count_max = static_cast<int64_t>(boot_time * measure_freq - 0.5);
@@ -686,12 +753,14 @@ namespace torchmedia::audio::functional {
         const int64_t n_channels = waveform.size(0);
         const int64_t ilen = waveform.size(1);
 
-        auto mean_meas = torch::zeros({n_channels}, waveform.options());
-        auto spectrum = torch::zeros({n_channels, dft_len_ws}, waveform.options());
-        auto noise_spectrum = torch::zeros({n_channels, dft_len_ws}, waveform.options());
-        auto measures = torch::zeros({n_channels, measures_len}, waveform.options());
+        auto spectrum = torch::zeros({n_channels, dft_len_ws}, fopts);
+        auto noise_spectrum = torch::zeros({n_channels, dft_len_ws}, fopts);
+        // The per-measure bookkeeping is scalar: float32 like torchaudio's, but on the host (read via accessors).
+        auto mean_meas = torch::zeros({n_channels}, torch::kFloat);
+        auto measures = torch::zeros({n_channels, measures_len}, torch::kFloat);
         auto m_acc = measures.accessor<float, 2>();
         auto mm_acc = mean_meas.accessor<float, 1>();
+        const auto trigger = static_cast<float>(trigger_level); // torchaudio compares float32 tensors with it
 
         bool has_triggered = false;
         int64_t num_measures_to_flush = 0;
@@ -704,15 +773,16 @@ namespace torchmedia::audio::functional {
                                  spectrum_end, cepstrum_window, cepstrum_start, cepstrum_end, noise_reduction_amount,
                                  measure_smooth_time_mult, noise_up_time_mult, noise_down_time_mult, boot_count);
                 m_acc[i][measures_index] = static_cast<float>(meas);
-                mm_acc[i] =
-                        static_cast<float>(mm_acc[i] * trigger_meas_time_mult + meas * (1.0 - trigger_meas_time_mult));
-                has_triggered = has_triggered || (mm_acc[i] >= trigger_level);
+                // float32 tensor arithmetic as in torchaudio (two statements: no fused multiply-add).
+                const float decayed = mm_acc[i] * static_cast<float>(trigger_meas_time_mult);
+                mm_acc[i] = decayed + static_cast<float>(meas * (1.0 - trigger_meas_time_mult));
+                has_triggered = has_triggered || (mm_acc[i] >= trigger);
                 if (has_triggered) {
                     const int64_t n = measures_len;
                     int64_t k = measures_index, jTrigger = n, jZero = n, j = 0;
                     for (j = 0; j < n; ++j) {
-                        const double mk = m_acc[i][k];
-                        if (mk >= trigger_level && j <= jTrigger + gap_len) {
+                        const float mk = m_acc[i][k];
+                        if (mk >= trigger && j <= jTrigger + gap_len) {
                             jZero = jTrigger = j;
                         } else if (mk == 0 && jTrigger >= jZero) {
                             jZero = j;

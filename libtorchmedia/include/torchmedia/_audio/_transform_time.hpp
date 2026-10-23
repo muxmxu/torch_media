@@ -178,9 +178,11 @@ namespace torchmedia::audio::transform {
     };
 
     // ---------------- PitchShift (stft -> phase_vocoder -> istft -> resample, eager float32 kernel) ----------------
+    // API differences: always a Hann window (torchaudio: window_fn/wkwargs); float64 input works directly (torchaudio
+    // needs .double() on the module).
     typedef struct pitch_shift_option {
         int _sample_rate = 16000;
-        int _n_steps = 0;
+        double _n_steps = 0; // fractional steps allowed (torchaudio: "(fractional) steps to shift")
         int _bins_per_octave = 12;
         int _n_fft = 512;
         int _win_length = 0; // 0 => n_fft
@@ -190,7 +192,7 @@ namespace torchmedia::audio::transform {
             _sample_rate = s;
             return *this;
         }
-        auto n_steps(int n) -> pitch_shift_option & {
+        auto n_steps(double n) -> pitch_shift_option & {
             _n_steps = n;
             return *this;
         }
@@ -218,8 +220,14 @@ namespace torchmedia::audio::transform {
             _win_length = _opt._win_length > 0 ? _opt._win_length : _opt._n_fft;
             _hop_length = _opt._hop_length > 0 ? _opt._hop_length : _win_length / 4;
             _window = torch::hann_window(_win_length, tensor_options_t().dtype(torch::kFloat));
-            _rate = std::pow(2.0, -static_cast<double>(_opt._n_steps) / _opt._bins_per_octave);
-            _orig_freq = static_cast<int>(_opt._sample_rate / _rate);
+            // Stricter than torchaudio, which accepts these in its constructor and fails in the first call.
+            if (const auto err = functional::_pitch_shift_orig_freq(_opt._sample_rate, _opt._n_steps,
+                                                                    _opt._bins_per_octave, _orig_freq);
+                !err.empty()) {
+                (void) handle_exceptions<int, std::invalid_argument>("PitchShift: " + err);
+                _orig_freq = 0; // LIB_TORCH_MEDIA_NO_EXCEPTIONS: operator() returns the default value
+                return;
+            }
             if (_orig_freq != _opt._sample_rate) {
                 _gcd = std::gcd(_orig_freq, _opt._sample_rate);
                 auto kw = functional::_sinc_resample_kernel(_orig_freq, _opt._sample_rate, _gcd,
@@ -231,6 +239,10 @@ namespace torchmedia::audio::transform {
         }
 
         auto operator()(const_tensor_lref_t waveform) const -> tensor_t {
+            if (_orig_freq <= 0 || waveform.dim() < 1) {
+                return handle_exceptions<tensor_t, std::invalid_argument>(
+                        torch::empty({1}), "PitchShift: invalid arguments or a 0-D waveform.");
+            }
             const auto stretched = functional::_stretch_waveform(
                     waveform, _opt._n_steps, _opt._bins_per_octave, _opt._n_fft, c10::optional<int>(_win_length),
                     c10::optional<int>(_hop_length), c10::optional<tensor_t>(_window.to(waveform.device())));
@@ -260,7 +272,6 @@ namespace torchmedia::audio::transform {
         int _orig_freq = 0;
         int _gcd = 1;
         int _width = 0;
-        double _rate = 1.0;
         tensor_t _window;
         tensor_t _kernel;
     };
@@ -268,8 +279,9 @@ namespace torchmedia::audio::transform {
     // ---------------- TimeStretch (phase vocoder, cached phase-advance) ----------------
     typedef struct time_stretch_option {
         int _n_freq = 201;
-        int _hop_length = 0; // 0 => (n_freq-1)  [= n_fft/2 with n_fft=(n_freq-1)*2]
-        double _fixed_rate = -1.0; // < 0 => unset (must pass a rate to operator())
+        // 0 => (n_freq-1)  [= n_fft/2 with n_fft=(n_freq-1)*2]; torchaudio's explicit hop_length=0 is not expressible.
+        int _hop_length = 0;
+        double _fixed_rate = -1.0; // < 0 => unset (must pass a rate to operator()); input must be complex (no warning)
 
         auto n_freq(int n) -> time_stretch_option & {
             _n_freq = n;
@@ -298,9 +310,11 @@ namespace torchmedia::audio::transform {
         auto operator()(const_tensor_lref_t complex_specgrams,
                         c10::optional<double> overriding_rate = c10::nullopt) const -> tensor_t {
             const double rate = overriding_rate.has_value() ? overriding_rate.value() : _opt._fixed_rate;
-            if (rate <= 0.0) {
-                (void) handle_exceptions<int, std::invalid_argument>(
-                        "TimeStretch: no fixed_rate set; pass a valid rate to the call.");
+            if (!(rate > 0.0)) {
+                return handle_exceptions<tensor_t, std::invalid_argument>(
+                        torch::empty({1}), overriding_rate.has_value()
+                                                   ? "TimeStretch: overriding_rate must be positive."
+                                                   : "TimeStretch: no fixed_rate set; pass a valid rate to the call.");
             }
             return functional::phase_vocoder(complex_specgrams, rate, _phase_advance.to(complex_specgrams.device()));
         }

@@ -197,9 +197,13 @@ namespace torchmedia::audio::transform {
 
         auto operator()(const_tensor_lref_t melspec) const -> tensor_t {
             const auto shape = melspec.sizes().vec();
+            if (shape.size() < 2) { // torchaudio: IndexError
+                return handle_exceptions<tensor_t, std::invalid_argument>(
+                        torch::empty({1}), "InverseMelScale: expected a (..., n_mels, time) spectrogram.");
+            }
             if (shape[shape.size() - 2] != _opt._n_mels) {
-                (void) handle_exceptions<int, std::invalid_argument>(
-                        "InverseMelScale: input n_mels does not match the configured n_mels.");
+                return handle_exceptions<tensor_t, std::invalid_argument>(
+                        torch::empty({1}), "InverseMelScale: input n_mels does not match the configured n_mels.");
             }
             const int64_t time = shape.back();
             const auto packed = melspec.reshape({-1, static_cast<int64_t>(_opt._n_mels), time}); // (B, n_mels, time)
@@ -416,7 +420,7 @@ namespace torchmedia::audio::transform {
         int _n_lfcc = 40;
         int _dct_type = 2;
         double _f_min = 0.0;
-        double _f_max = 0.0;
+        double _f_max = 0.0; // <= 0 => sample_rate // 2; torchaudio's explicit 0.0 (all NaN) is not expressible
         std::string _norm = "ortho";
         bool _log_lf = false;
         spectrogram_option _spec{};

@@ -131,11 +131,12 @@ namespace torchmedia::audio::transform {
                         const c10::optional<tensor_t> &mask_n_opt = c10::nullopt) -> tensor_t {
             const auto dtype = specgram.scalar_type();
             if (specgram.dim() < 3) {
-                (void) handle_exceptions<int, std::invalid_argument>(
-                        "MVDR: expected at least a 3D tensor (..., channel, freq, time).");
+                return handle_exceptions<tensor_t, std::invalid_argument>(
+                        torch::empty({1}), "MVDR: expected at least a 3D tensor (..., channel, freq, time).");
             }
             if (!specgram.is_complex()) {
-                (void) handle_exceptions<int, std::invalid_argument>("MVDR: specgram must be a complex tensor.");
+                return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
+                                                                          "MVDR: specgram must be a complex tensor.");
             }
             // Promote cfloat -> cdouble for internal numerical stability (G7).
             const tensor_t spec = dtype == torch::kComplexFloat ? specgram.to(torch::kComplexDouble) : specgram;

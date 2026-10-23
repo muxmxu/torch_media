@@ -1,8 +1,8 @@
 #ifndef LIBTORCHMEDIA_AUDIO
 #define LIBTORCHMEDIA_AUDIO
 // clang-format off
-// Order matters: _functional_filtering.hpp must precede _functional.hpp (the latter uses lfilter
-// for deemphasis). Keep this block unsorted.
+// Each header includes what it uses (_functional.hpp pulls in _functional_filtering.hpp for deemphasis and
+// loudness), so the order below is only for reading. Keep this block unsorted.
 #include "_audio/_functional_filtering.hpp"
 #include "_audio/_functional.hpp"
 #include "_audio/_functional_beamforming.hpp"

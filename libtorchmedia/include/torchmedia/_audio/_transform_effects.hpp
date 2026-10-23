@@ -318,6 +318,10 @@ namespace torchmedia::audio::transform {
                     out = functional::gain(waveform, _opt._gain);
                     break;
                 case vol_gain_type::power:
+                    if (!(_opt._gain > 0.0)) { // torchaudio: math.log10 domain error
+                        return handle_exceptions<tensor_t, std::invalid_argument>(
+                                torch::empty({1}), "Vol: gain must be positive for gain_type power.");
+                    }
                     out = functional::gain(waveform, 10.0 * std::log10(_opt._gain));
                     break;
                 case vol_gain_type::amplitude:

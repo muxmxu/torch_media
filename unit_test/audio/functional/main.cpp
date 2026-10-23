@@ -1,6 +1,7 @@
 // Assertion-based tests for the audio functional layer (target: 100% coverage of _functional*.hpp).
 // Golden values verified against torchaudio 2.5.1 (see gen_golden.py). Bug regression tests are RED
 // against the pre-fix _functional.hpp and GREEN after task02's fixes.
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <stdexcept>
@@ -1531,6 +1532,400 @@ static void test_r2_inverse_spectrogram_false() {
                           inverse_spectrogram(spc, 16, 0, w8, 8, 4, 8, "none"), 0.0, 0.0);
 }
 
+// ======================== progress04 -- surface audit (task12-task19) ========================
+// Goldens: gen_golden.py "progress04" section (torchaudio 2.5.1).
+template<class Fn>
+static auto wall_ms(Fn &&f) -> double {
+    const auto t0 = std::chrono::steady_clock::now();
+    (void) f();
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// task12 -- lfilter / overdrive run torchaudio's compiled scalar loops on the CPU (A1-01, A1-05).
+static auto lf3d_input(torch::ScalarType dt) -> std::array<torch::Tensor, 3> {
+    const auto t = torch::arange(4000, torch::kDouble);
+    const auto k = torch::arange(6, torch::kDouble).reshape({6, 1});
+    const auto x =
+            (0.5 * torch::sin(t * (0.01 + 0.007 * k)) + 0.3 * torch::sin(t * (0.3 + 0.05 * k))).reshape({2, 3, 4000});
+    const auto a = torch::tensor({1.0, -1.6, 0.8, 2.0, -0.5, 0.1, 1.0, -1.98, 0.9801}, torch::kDouble).reshape({3, 3});
+    const auto b = torch::tensor({0.2, 0.3, 0.1, 0.5, 0.0, -0.5, 0.01, 0.02, 0.01}, torch::kDouble).reshape({3, 3});
+    return {x.to(dt), a.to(dt), b.to(dt)};
+}
+
+static void test_p4_lfilter_compiled_loop() {
+    const int64_t idx[5][3] = {{0, 0, 3999}, {0, 1, 123}, {1, 2, 3999}, {1, 2, 2000}, {0, 2, 57}};
+    const double g64[5] = {0.19155460062639007, 0.011517529585665685, 9.196526035082943, -5.892367795549261,
+                           11.238014013084832};
+    const double g32[5] = {0.19155456125736237, 0.01151752844452858, 9.196492195129395, -5.892395496368408,
+                           11.238103866577148};
+    const auto [x64, a64, b64] = lf3d_input(torch::kDouble);
+    const auto [x32, a32, b32] = lf3d_input(torch::kFloat);
+    const auto y64 = lfilter(x64, a64, b64, /*clamp=*/false);
+    const auto y32 = lfilter(x32, a32, b32, /*clamp=*/false);
+    TM_CHECK(y64.scalar_type() == torch::kDouble && y32.sizes() == x32.sizes());
+    for (int i = 0; i < 5; ++i) {
+        TM_CHECK_CLOSE(y64[idx[i][0]][idx[i][1]][idx[i][2]].item<double>(), g64[i], 1e-13); // bit-exact here
+        TM_CHECK_CLOSE(y32[idx[i][0]][idx[i][1]][idx[i][2]].item<double>(), g32[i], 1e-6); // ~1 ulp at 10
+    }
+    // Autograd keeps the differentiable tensor-op loop (torchaudio's generic loop), which agrees with the fast one.
+    const auto xg = x64.clone().requires_grad_(true);
+    const auto yg = lfilter(xg, a64, b64, false);
+    TM_CHECK_TENSOR_CLOSE(yg.detach(), y64, 1e-9, 1e-9);
+    yg.sum().backward();
+    TM_CHECK(xg.grad().defined() && xg.grad().sizes() == x64.sizes());
+    if (const auto mps = mps_or_skip()) { // non-CPU devices take the generic loop too
+        const auto xs = x32.index({torch::indexing::Ellipsis, torch::indexing::Slice(0, 200)});
+        TM_CHECK_TENSOR_CLOSE(lfilter(xs.to(*mps), a32.to(*mps), b32.to(*mps), false).cpu(),
+                              lfilter(xs, a32, b32, false), 5e-3, 1e-4); // MPS float32 matmul vs the scalar loop
+    }
+    // 10 s at 16 kHz: the per-sample tensor-op loop took ~800 ms, the compiled-style loop ~1 ms.
+    torch::manual_seed(0);
+    const auto x10 = torch::randn({1, 160000}) * 0.1;
+    TM_CHECK(wall_ms([&] { return lowpass_biquad(x10, 16000, 1000.0); }) < 100.0);
+    // Ill-conditioned order 6 with a0 = 1.7 (butter(5, 0.1) * 1.7): bit-exact only with the fused multiply-subtract
+    // and with b/a0 before the conv1d; the order-2 filters above give the same float32 values without either.
+    const auto a6 = torch::tensor(
+            {1.7, -6.773723303340971, 10.939274053468974, -8.931145789598856, 3.6807259465310254, -0.6118780166080454},
+            torch::kDouble);
+    const auto b6 = torch::tensor({0.00010165282662900549, 0.0005082641331450275, 0.001016528266290055,
+                                   0.001016528266290055, 0.0005082641331450275, 0.00010165282662900549},
+                                  torch::kDouble);
+    const auto y6_64 = lfilter(x64, a6, b6, false);
+    const auto y6_32 = lfilter(x32, a6.to(torch::kFloat), b6.to(torch::kFloat), false);
+    const int64_t i6[3][3] = {{0, 0, 3999}, {1, 1, 2500}, {1, 2, 777}};
+    const double g6_64[3] = {0.597813830452131, 0.18334021665192268, 0.03366486722150463};
+    const double g6_32[3] = {0.5977604985237122, 0.18334224820137024, 0.033612895756959915};
+    for (int i = 0; i < 3; ++i) {
+        TM_CHECK_CLOSE(y6_64[i6[i][0]][i6[i][1]][i6[i][2]].item<double>(), g6_64[i], 1e-13);
+        TM_CHECK_CLOSE(y6_32[i6[i][0]][i6[i][1]][i6[i][2]].item<double>(), g6_32[i], 0.0);
+    }
+}
+
+static void test_p4_overdrive_compiled_loop() {
+    const auto t = torch::arange(3000, torch::kDouble);
+    const auto ox = torch::stack({0.5 * torch::sin(t * 0.02) + 0.2 * torch::sin(t * 0.9),
+                                  0.35 * torch::sin(t * 0.05) - 0.1 * torch::cos(t * 1.3)});
+    const int64_t idx[3][2] = {{0, 2999}, {1, 1234}, {0, 7}};
+    const double g64[3] = {-0.7610693966554736, -0.6155380194883864, 0.5359604727307031};
+    const double g32[3] = {-0.7610692381858826, -0.6155380606651306, 0.5359604954719543};
+    const auto y64 = overdrive(ox, 30.0, 40.0);
+    const auto y32 = overdrive(ox.to(torch::kFloat), 30.0, 40.0);
+    for (int i = 0; i < 3; ++i) {
+        TM_CHECK_CLOSE(y64[idx[i][0]][idx[i][1]].item<double>(), g64[i], 1e-15);
+        TM_CHECK_CLOSE(y32[idx[i][0]][idx[i][1]].item<double>(), g32[i], 1e-9); // bit-exact
+    }
+    const auto og = ox.clone().requires_grad_(true);
+    TM_CHECK_TENSOR_CLOSE(overdrive(og, 30.0, 40.0).detach(), y64, 1e-12, 1e-12);
+    if (const auto mps = mps_or_skip()) {
+        const auto xs = ox.to(torch::kFloat).index({torch::indexing::Ellipsis, torch::indexing::Slice(0, 200)});
+        TM_CHECK_TENSOR_CLOSE(overdrive(xs.to(*mps), 30.0, 40.0).cpu(), overdrive(xs, 30.0, 40.0), 1e-5, 1e-5);
+    }
+    torch::manual_seed(0);
+    const auto x10 = torch::randn({1, 160000}) * 0.1;
+    TM_CHECK(wall_ms([&] { return overdrive(x10); }) < 100.0); // was ~800 ms
+}
+
+// task13 -- vad keeps torchaudio's float32 measurement state on the host whatever the input (A1-02), validates (A1-04).
+static auto vad_stereo(torch::ScalarType dt) -> torch::Tensor {
+    using torch::indexing::Slice;
+    const auto tv = torch::arange(16000, torch::kDouble) / 16000;
+    auto v = torch::zeros({2, 24000}, torch::kDouble);
+    v.index_put_({0, Slice(8000, torch::indexing::None)},
+                 0.5 * torch::sin(2.0 * PI * 300.0 * tv) * (1.0 + 0.3 * torch::sin(2.0 * PI * 3.0 * tv)));
+    v.index_put_({1, Slice(9000, torch::indexing::None)}, 0.3 * torch::sin(2.0 * PI * 520.0 * tv.slice(0, 0, 15000)));
+    return v.to(dt);
+}
+
+static void test_p4_vad_dtype_device() {
+    for (const auto dt: {torch::kFloat, torch::kDouble}) {
+        const auto v = vad_stereo(dt);
+        const auto o = vad(v, 16000, 7.0, 0.25, 1.0, 0.25, /*pre_trigger_time=*/0.1);
+        TM_CHECK(o.scalar_type() == dt && o.size(-1) == 18400); // torchaudio: 18400 for both dtypes
+        TM_CHECK(o.equal(v.slice(-1, 24000 - 18400)));
+    }
+    TM_CHECK(vad(vad_stereo(torch::kDouble)[0], 16000).dim() == 1); // 1-D float64
+    if (const auto mps = mps_or_skip()) { // used to write MPS memory through a CPU accessor (crash at exit)
+        const auto o = vad(vad_stereo(torch::kFloat).to(*mps), 16000, 7.0, 0.25, 1.0, 0.25, 0.1);
+        TM_CHECK(o.device().is_mps() && o.size(-1) == 18400);
+    }
+}
+
+static void test_p4_vad_validation() {
+    const auto v = vad_stereo(torch::kFloat);
+    TM_CHECK(raises_inv([&] { (void) vad(v, 16000, 7.0, 0.25, /*search_time=*/0.0); }));
+    TM_CHECK(raises_inv([&] { (void) vad(v, 16000, 7.0, 0.25, 1.0, 0.25, 0.0, 0.35, 0.1, 0.01, 1.35, /*mf=*/0.0); }));
+    TM_CHECK(raises_inv([&] { (void) vad(v, 16000, 7.0, 0.25, 1.0, 0.25, 0.0, 0.35, 0.1, 0.01, 1.35, 40000.0); }));
+    TM_CHECK(raises_inv([&] {
+        (void) vad(v, 16000, 7.0, 0.25, 1.0, 0.25, 0.0, 0.35, 0.1, 0.01, 1.35, 20.0, std::nullopt, 0.4, 50.0, 6000.0,
+                   /*hp_lifter_freq=*/0.0);
+    }));
+}
+
+// task14 -- loudness, dither, compute_deltas, add_noise, phaser, flanger (A1-03, A1-06..A1-09, A1-12).
+static void test_p4_loudness_11025() {
+    // gate step = Python round(1102.5) = 1102 (half to even); std::llround gave 1103.
+    const auto tl = torch::arange(33075, torch::kDouble) / 11025;
+    const auto lx =
+            torch::stack({0.3 * torch::sin(2.0 * PI * 440.0 * tl) * (1.0 + 0.5 * torch::sin(2.0 * PI * 3.0 * tl)),
+                          0.2 * torch::sin(2.0 * PI * 1000.0 * tl)})
+                    .to(torch::kFloat);
+    TM_CHECK_CLOSE(loudness(lx, 11025).item<double>(), -12.05608081817627, 1e-5);
+}
+
+static void test_p4_dither_seeded_and_intentional_differences() {
+    const auto dw =
+            torch::tensor({{0.1f, -0.2f, 0.3f, -0.4f, 0.5f, -0.6f}, {0.05f, -0.05f, 0.15f, -0.15f, 0.25f, -0.25f}});
+    const auto dw0 = dw.clone();
+    torch::manual_seed(0);
+    TM_CHECK_TENSOR_CLOSE(dither(dw, "RPDF").flatten(),
+                          vec({0.100006103515625f, -0.199981689453125f, 0.29998779296875f, -0.39996337890625f,
+                               0.499969482421875f, -0.5999755859375f, 0.04998779296875f, -0.04998779296875f,
+                               0.149993896484375f, -0.149993896484375f, 0.25f, -0.25f}),
+                          0.0, 0.0);
+    // Intentional GPDF difference: torchaudio sums its 7 samples into a VIEW of the first one (mutating the input,
+    // and re-reading the grown sample when an index repeats, as here: it differs at [0][4], [1][2], [1][3]). Golden:
+    // torchaudio's draws and math on an unaliased copy (gen_golden.py), with and without noise shaping.
+    torch::manual_seed(0);
+    TM_CHECK_TENSOR_CLOSE(dither(dw, "GPDF").flatten(),
+                          vec({0.100006103515625f, -0.199981689453125f, 0.29998779296875f, -0.39996337890625f, 0.5f,
+                               -0.599945068359375f, 0.050018310546875f, -0.04998779296875f, 0.1500244140625f,
+                               -0.14996337890625f, 0.25f, -0.249969482421875f}),
+                          0.0, 0.0);
+    torch::manual_seed(0);
+    TM_CHECK_TENSOR_CLOSE(dither(dw, "GPDF", true).flatten(),
+                          vec({0.100006103515625f, -0.19997557997703552f, 0.30000609159469604f, -0.39997559785842896f,
+                               0.5000365972518921f, -0.599945068359375f, 0.050018310546875f, -0.04996948316693306f,
+                               0.15003661811351776f, -0.14993897080421448f, 0.2500366270542145f, -0.249969482421875f}),
+                          0.0, 0.0);
+    TM_CHECK(dw.equal(dw0));
+    TM_CHECK(dither(dw[0], "GPDF").sizes() == torch::IntArrayRef({6})); // torchaudio raises on mono GPDF
+    (void) dcshift(dw, 0.3, 0.05);
+    TM_CHECK(dw.equal(dw0)); // torchaudio's dcshift with a limiter writes into its input
+}
+
+static void test_p4_effect_validation() {
+    const auto cd = torch::randn({2, 40, 20});
+    TM_CHECK(raises_inv([&] { (void) compute_deltas(cd, 5, "foo"); })); // torchaudio: Unrecognised padding mode
+    TM_CHECK(raises_inv([&] { (void) compute_deltas(cd, 5, "Replicate"); }));
+
+    const auto w = torch::randn({3, 1000});
+    const auto n = torch::randn({3, 1000});
+    const auto snr = torch::full({3}, 10.0);
+    TM_CHECK(raises_inv([&] { (void) add_noise(w, n, torch::tensor(10.0)); })); // 0-D snr
+    TM_CHECK(raises_inv([&] { (void) add_noise(w, n, snr, torch::full({1, 3}, 900, torch::kLong)); }));
+    TM_CHECK(raises_inv([&] { (void) add_noise(w, n.slice(-1, 0, 999), snr); })); // length mismatch
+    TM_CHECK(add_noise(w, n, snr, torch::full({3}, 900, torch::kLong)).sizes() == w.sizes());
+    // The lengths mask is an int64 arange. A float16 one also rounds lengths 2049 to 2048 in the comparison, which
+    // drops index 2048: the only signal sample here, so no noise would be added (o16[0][0] would stay 0).
+    auto w16 = torch::zeros({1, 2052}, torch::kHalf);
+    w16[0][2048] = 1.0;
+    const auto o16 = add_noise(w16, torch::ones({1, 2052}, torch::kHalf), torch::tensor({10.0}, torch::kHalf),
+                               torch::tensor({2049}, torch::kLong));
+    TM_CHECK_CLOSE(o16[0][0].item<double>(), 0.006977081298828125, 0.0); // torchaudio
+    // Energies are torch.linalg.vector_norm(...) ** 2 as in torchaudio (a plain sum of squares is 1 ulp off).
+    const auto tt = torch::arange(1000, torch::kDouble);
+    const auto kk = torch::arange(3, torch::kDouble).reshape({3, 1});
+    const auto an = add_noise((0.4 * torch::sin(tt * (0.05 + 0.02 * kk) + kk)).to(torch::kFloat),
+                              (0.3 * torch::cos(tt * (0.17 + 0.03 * kk))).to(torch::kFloat),
+                              torch::tensor({10.0f, 3.0f, -2.0f}), torch::tensor({1000, 700, 3}, torch::kLong));
+    TM_CHECK_CLOSE(an[2][356].item<double>(), 0.6446744203567505, 0.0);
+    TM_CHECK_CLOSE(an[2][315].item<double>(), -0.7973425388336182, 0.0);
+    TM_CHECK_CLOSE(an[2][179].item<double>(), -0.7008386850357056, 0.0);
+}
+
+// task15 / task16 / task17 -- spectral & time ops (A2-04..A2-08).
+static void test_p4_pitch_shift_fractional_steps() {
+    const double steps = 0.5; // torchaudio: "(fractional) steps"; an int parameter silently truncated it to 0
+    const auto xp = torch::sin(torch::arange(3001.0) * 0.05).unsqueeze(0);
+    const auto pp = pitch_shift(xp, 1000, steps);
+    TM_CHECK_CLOSE(pp[0][100].item<double>(), -0.9880214929580688, 1e-6);
+    TM_CHECK_CLOSE(pp[0][1500].item<double>(), 0.25565478205680847, 1e-6);
+    TM_CHECK_CLOSE(pp[0][2900].item<double>(), -0.12411279231309891, 1e-6);
+    TM_CHECK(raises_inv([&] { (void) pitch_shift(xp, 16000, 2000); })); // orig_freq overflows int (was UB)
+    TM_CHECK(raises_inv([&] { (void) pitch_shift(xp, 16000, -240); })); // orig_freq 0
+}
+
+static void test_p4_mask_rng_cpu_float32() {
+    // torchaudio draws torch.rand(1) (CPU, float32) whatever the spectrogram's dtype/device.
+    const auto ms = torch::arange(1, 1 + 2 * 30 * 100, torch::kDouble).reshape({2, 30, 100});
+    const auto zero_cols = [](const torch::Tensor &row) { return (row == 0).nonzero().flatten(); };
+    torch::manual_seed(0);
+    TM_CHECK(zero_cols(mask_along_axis(ms, 20, 0.0, 2)[0][0]).equal(torch::arange(69, 78)));
+    torch::manual_seed(0);
+    TM_CHECK(zero_cols(mask_along_axis(ms.to(torch::kLong), 20, 0.0, 2)[0][0]).equal(torch::arange(69, 78)));
+    torch::manual_seed(0);
+    TM_CHECK(zero_cols(mask_along_axis(ms, 10, 0.0, 1)[0].select(1, 0)).equal(torch::arange(19, 23)));
+    if (const auto mps = mps_or_skip()) {
+        torch::manual_seed(0);
+        const auto mm = mask_along_axis(ms.to(torch::kFloat).to(*mps), 20, 0.0, 2).cpu();
+        TM_CHECK(zero_cols(mm[0][0]).equal(torch::arange(69, 78)));
+    }
+}
+
+static auto dp_input() -> torch::Tensor {
+    const auto tp = torch::arange(16001, torch::kDouble) / 16000;
+    return torch::stack({torch::sin(2.0 * PI * 180.0 * tp) + 0.4 * torch::sin(2.0 * PI * 360.0 * tp + 0.3),
+                         torch::sin(2.0 * PI * 233.0 * tp) * (1.0 + 0.2 * torch::sin(2.0 * PI * 5.0 * tp)),
+                         torch::sin(2.0 * PI * 97.0 * tp) + 0.1 * torch::sin(2.0 * PI * 1100.0 * tp),
+                         torch::sin(2.0 * PI * 410.0 * tp + 1.0)})
+            .reshape({2, 2, 16001})
+            .to(torch::kFloat);
+}
+
+static void test_p4_detect_pitch_parity_and_validation() {
+    const auto x = dp_input();
+    const auto pf = detect_pitch_frequency(x, 16000);
+    TM_CHECK(pf.sizes() == torch::IntArrayRef({2, 2, 86}));
+    // Python `int / tensor` is reciprocal() * int: 181.8181915... where a correctly rounded division gives ...7627.
+    TM_CHECK(pf[0][0][5].item<float>() == 181.8181915283203f);
+    TM_CHECK(pf[0][1][50].item<float>() == 231.88406372070312f);
+    TM_CHECK(pf[1][0][85].item<float>() == 98.76543426513672f);
+    TM_CHECK(pf[1][1][0].item<float>() == 205.12820434570312f);
+    TM_CHECK_CLOSE(pf.to(torch::kDouble).sum().item<double>(), 77573.66893005371, 1e-7);
+    const auto nc = _compute_nccf(x[0][0].slice(0, 0, 4000), 16000, 0.01, 85); // torch.linalg.vector_norm
+    TM_CHECK_CLOSE(nc[3][40].item<double>(), -0.00801188126206398, 1e-12);
+    TM_CHECK_CLOSE(nc[10][88].item<double>(), 0.011401122435927391, 1e-12);
+    TM_CHECK_CLOSE(nc[24][150].item<double>(), -0.016313474625349045, 1e-12);
+    // On these tones vector_norm and sqrt(sum(x * x)) agree; on a noise-like signal they differ (5e-7 relative).
+    const auto tn = torch::arange(4000, torch::kDouble);
+    const auto ncn =
+            _compute_nccf((torch::sin(tn * tn * 1e-3) + 0.5 * torch::sin(tn * 2.3)).to(torch::kFloat), 16000, 0.01, 85);
+    TM_CHECK_CLOSE(ncn[24][158].item<double>(), -0.022163026034832, 0.0);
+    TM_CHECK_CLOSE(ncn[24][157].item<double>(), 0.015337648801505566, 0.0);
+    TM_CHECK_CLOSE(ncn[24][156].item<double>(), 0.016815871000289917, 0.0);
+
+    TM_CHECK(raises_inv([&] { (void) detect_pitch_frequency(x, 0); }));
+    TM_CHECK(raises_inv([&] { (void) detect_pitch_frequency(x, 16000, 0.0); }));
+    TM_CHECK(raises_inv([&] { (void) detect_pitch_frequency(x, 16000, 1e-2, 0); }));
+    TM_CHECK(raises_inv([&] { (void) detect_pitch_frequency(x, 16000, 1e-2, 30, 0); }));
+    TM_CHECK(raises_inv([&] { (void) detect_pitch_frequency(x, 16000, 1e-2, 30, 85, 0); }));
+    // Extension: win_length 1 (no smoothing) works; torchaudio's _median_smoothing fails on torch.cat([]).
+    TM_CHECK(detect_pitch_frequency(x, 16000, 1e-2, 1).sizes() == torch::IntArrayRef({2, 2, 101}));
+}
+
+// task18 -- forced_align mirrors torchaudio's compiled kernel and its checks (A3-1..A3-5, A3-9, A3-10).
+static void test_p4_forced_align_parity() {
+    const auto lk = [](const std::vector<int64_t> &v) { return torch::tensor(v, torch::kLong).unsqueeze(0); };
+    // ties: torchaudio stays on x0 unless x1/x2 is strictly larger, and ends on the token when the terminals tie.
+    auto [pt, st] = forced_align(torch::log_softmax(torch::zeros({1, 10, 5}), -1), lk({1, 2, 3}));
+    TM_CHECK(pt.equal(lk({1, 2, 3, 3, 3, 3, 3, 3, 3, 3})));
+    const auto lg = torch::log_softmax(torch::sin(torch::arange(30.0) * 1.3).reshape({1, 6, 5}), -1);
+    TM_CHECK(forced_align(lg, lk({1, 1, 2, 2})).first.equal(lk({1, 0, 1, 2, 0, 2}))); // T == L + R
+    // float64 accumulates in float64 (a float32 cast picks [1,0,2,2,3,3,3,3]).
+    const auto i = torch::arange(32, torch::kDouble);
+    const auto lg64 = torch::log_softmax(
+            (torch::floor(torch::remainder(i * 2, 3)) + 1e-10 * torch::sin(i * 1.7 + 2)).reshape({1, 8, 4}), -1);
+    TM_CHECK(forced_align(lg64, lk({1, 2, 3})).first.equal(lk({1, 0, 2, 2, 2, 2, 2, 3})));
+    // float16 accumulates in Half (a float32 cast picks [1,2,3,3,3,3,3,4,0,0,0,0]).
+    const auto lg16 = torch::tensor({-3.224609375,     -1.52734375,   -6.0234375,   -0.30712890625,   -5.23828125,
+                                     -2.83203125,      -1.8779296875, -5.86328125,  -0.2467041015625, -5.5234375,
+                                     -2.431640625,     -2.23828125,   -5.63671875,  -0.2247314453125, -5.75,
+                                     -2.02734375,      -2.599609375,  -5.35546875,  -0.239990234375,  -5.91796875,
+                                     -1.6328125,       -2.9609375,    -5.01953125,  -0.2958984375,    -6.02734375,
+                                     -1.263671875,     -3.322265625,  -4.65234375,  -0.401123046875,  -6.08203125,
+                                     -0.939453125,     -3.69140625,   -4.265625,    -0.56591796875,   -6.09375,
+                                     -0.67431640625,   -4.0703125,    -3.8828125,   -0.79736328125,   -6.07421875,
+                                     -0.4765625,       -4.45703125,   -3.5078125,   -1.09375,         -6.0234375,
+                                     -0.342529296875,  -4.83984375,   -3.142578125, -1.4423828125,    -5.94140625,
+                                     -0.26318359375,   -5.19140625,   -2.783203125, -1.826171875,     -5.8125,
+                                     -0.2283935546875, -5.50390625,   -2.421875,    -2.2265625,       -5.62890625},
+                                    torch::kHalf)
+                              .reshape({1, 12, 5});
+    TM_CHECK(forced_align(lg16, lk({1, 2, 3, 4})).first.equal(lk({1, 2, 3, 3, 3, 3, 3, 0, 0, 0, 0, 4})));
+    // blank != 0 and int32 targets: paths take the targets' dtype.
+    const auto lgb = torch::log_softmax(torch::cos(torch::arange(40.0) * 0.9).reshape({1, 8, 5}), -1);
+    const auto [pb, sb] = forced_align(lgb, torch::tensor({{1, 3, 4}}, torch::kInt), c10::nullopt, c10::nullopt, 2);
+    TM_CHECK(pb.scalar_type() == torch::kInt && pb.equal(torch::tensor({{1, 2, 3, 3, 2, 2, 4, 2}}, torch::kInt)));
+    TM_CHECK_TENSOR_CLOSE(sb.flatten(),
+                          vec({-1.2012882232666016f, -1.0840137004852295f, -1.1872434616088867f, -2.324695348739624f,
+                               -1.446059226989746f, -1.3689641952514648f, -0.7990177869796753f, -2.0998730659484863f}),
+                          0.0, 0.0);
+    // lengths that match are accepted.
+    TM_CHECK(forced_align(lgb, lk({1, 3, 4}), torch::tensor({8}), torch::tensor({3}), 2).first.size(1) == 8);
+}
+
+static void test_p4_forced_align_validation() {
+    const auto lk = [](const std::vector<int64_t> &v) { return torch::tensor(v, torch::kLong).unsqueeze(0); };
+    const auto lp = torch::log_softmax(torch::sin(torch::arange(40.0)).reshape({1, 8, 5}), -1);
+    const auto lp5 = lp.slice(1, 0, 5);
+    TM_CHECK(raises_inv([&] { (void) forced_align(lp5, lk({1, 1, 2, 2})); })); // T 5 < L 4 + R 2
+    TM_CHECK(raises_inv([&] { (void) forced_align(lp.slice(1, 0, 3), lk({1, 2, 3, 4})); })); // T < L
+    TM_CHECK(raises_inv([&] { (void) forced_align(lp, lk({1, 2}), c10::nullopt, c10::nullopt, -1); }));
+    TM_CHECK(raises_inv([&] { (void) forced_align(lp, lk({1, 2}), c10::nullopt, c10::nullopt, 5); }));
+    TM_CHECK(raises_inv([&] { (void) forced_align(lp, torch::tensor({{1, 2}, {3, 4}}, torch::kLong)); }));
+    TM_CHECK(raises_inv([&] { (void) forced_align(torch::cat({lp, lp}), lk({1, 2})); })); // batch 2
+    TM_CHECK(raises_inv([&] { (void) forced_align(lp[0], lk({1, 2})); })); // 2-D log_probs
+    TM_CHECK(raises_inv([&] { (void) forced_align(lp, torch::tensor({1, 2}, torch::kLong)); })); // 1-D targets
+    TM_CHECK(raises_inv([&] { (void) forced_align(lp, torch::empty({1, 0}, torch::kLong)); })); // empty targets
+    TM_CHECK(raises_inv([&] { (void) forced_align(lp, lk({1, 2}), torch::tensor({6}), c10::nullopt); }));
+    TM_CHECK(raises_inv([&] { (void) forced_align(lp, lk({1, 2}), c10::nullopt, torch::tensor({1})); }));
+    TM_CHECK(raises_inv([&] { (void) forced_align(lp, lk({1, -2})); })); // negative target (stricter)
+
+    const auto tok = torch::tensor({0, 1, 1, 0, 2, 2, 2, 0, 0, 4, 4, 0}, torch::kLong);
+    const auto sc = torch::randn({12});
+    TM_CHECK(raises_inv([&] { (void) merge_tokens(tok, sc.slice(0, 0, 8)); })); // torchaudio: must be the same length
+    TM_CHECK(raises_inv([&] { (void) merge_tokens(tok.unsqueeze(0), sc.unsqueeze(0)); })); // must be 1-D
+}
+
+// task19 -- beamforming shape checks (A3-6..A3-8) and complex128 batched goldens (A3-16).
+static auto bf_input() -> std::pair<torch::Tensor, torch::Tensor> {
+    const auto n = torch::arange(2 * 3 * 5 * 7, torch::kDouble);
+    const auto spec = torch::complex(torch::sin(n * 0.37), torch::cos(n * 0.11)).reshape({2, 3, 5, 7});
+    const auto mask = (0.5 + 0.4 * torch::sin(torch::arange(2 * 5 * 7, torch::kDouble) * 0.23)).reshape({2, 5, 7});
+    return {spec, mask};
+}
+
+static void test_p4_beamforming_goldens_and_validation() {
+    const auto [spec, mask] = bf_input();
+    const auto cclose = [](const torch::Tensor &z, double re, double im) {
+        return std::abs(torch::real(z).item<double>() - re) < 1e-12 &&
+               std::abs(torch::imag(z).item<double>() - im) < 1e-12;
+    };
+    const auto p = psd(spec, mask, /*normalize=*/false);
+    TM_CHECK(p.sizes() == torch::IntArrayRef({2, 5, 3, 3}));
+    TM_CHECK(cclose(p[1][4][2][0], 3.588256279720432, 2.540564735105338));
+    TM_CHECK(cclose(p[0][0][1][2], 3.1487050893006217, -0.9914267928317912));
+    const auto psd_n = psd(spec, 1.0 - mask);
+    const auto ws = mvdr_weights_souden(psd(spec, mask), psd_n, 1);
+    TM_CHECK(cclose(ws[1][3][2], -0.16985355138179073, -0.0402733696953217));
+    TM_CHECK(cclose(ws[0][0][0], 0.015005770558839891, 0.25326959912293007));
+    const auto wr = mvdr_weights_rtf(rtf_power(psd(spec, mask), psd_n, 2, 5), psd_n, 0);
+    TM_CHECK(cclose(wr[1][2][1], 0.9412228437191267, 0.5980290613611818));
+    TM_CHECK(cclose(wr[0][4][2], 0.365298469384894, 0.5759623617597058));
+
+    // psd: the mask must be (..., freq, time) of the specgram (torchaudio ValueError).
+    const auto s3 = spec[0].slice(0, 0, 3); // (3, 5, 7)
+    TM_CHECK(raises_inv([&] { (void) psd(spec[0], mask[0].expand({3, 5, 7})); })); // per-channel mask
+    TM_CHECK(raises_inv([&] { (void) psd(s3, torch::ones({5, 1}, torch::kDouble)); })); // broadcastable mask
+    // mvdr_weights_rtf: both overloads validate (5 checks).
+    const auto rtf = psd_n.select(-1, 0); // (2, 5, 3)
+    const auto onehot = torch::tensor({1.0, 0.0, 0.0}, torch::kDouble);
+    TM_CHECK(raises_inv([&] { (void) mvdr_weights_rtf(torch::real(rtf), torch::real(psd_n)); })); // real
+    TM_CHECK(raises_inv([&] { (void) mvdr_weights_rtf(rtf[0], psd_n); })); // rtf vs psd_n[:-1] shape
+    TM_CHECK(raises_inv([&] { (void) mvdr_weights_rtf(rtf[0][0], psd_n[0]); })); // rtf 1-D
+    TM_CHECK(raises_inv([&] { (void) mvdr_weights_rtf(rtf, psd_n.slice(-1, 0, 2)); })); // non-square
+    TM_CHECK(raises_inv([&] { (void) mvdr_weights_rtf(rtf[0], psd_n, onehot); }));
+    // apply_beamforming: weights' leading dims must equal the specgram's (torchaudio ValueError).
+    TM_CHECK(raises_inv([&] { (void) apply_beamforming(ws[0], spec); }));
+    TM_CHECK(raises_inv([&] { (void) apply_beamforming(torch::real(ws), torch::real(spec)); })); // not complex
+    TM_CHECK(apply_beamforming(ws, spec).sizes() == torch::IntArrayRef({2, 5, 7}));
+}
+
+// Crash-class red tests last: before the fixes these read out of bounds or crash the process.
+static void test_p4_rank_and_degenerate_checks() {
+    const auto c1 = torch::ones({65}, torch::kComplexFloat);
+    const auto pa = torch::linspace(0, PI, 65).unsqueeze(-1);
+    TM_CHECK(raises_inv([&] { (void) phase_vocoder(c1, 1.5, pa); })); // torchaudio: RuntimeError
+    TM_CHECK(raises_inv([&] { (void) phase_vocoder(torch::ones({}, torch::kComplexFloat), 1.5, pa); }));
+    TM_CHECK(phase_vocoder(c1, 1.0, pa).equal(c1)); // rate 1 returns early, as in torchaudio
+    TM_CHECK(raises_inv([] { (void) flanger(torch::randn({8000}), 8000); })); // torchaudio: IndexError
+    const auto w = torch::randn({1, 4000}) * 0.1;
+    TM_CHECK(raises_inv([&] { (void) phaser(w, 16000, 0.4, 0.74, 3.0, 0.4, /*mod_speed=*/40000.0); }));
+    TM_CHECK(raises_inv([&] { (void) phaser(w, 16000, 0.4, 0.74, /*delay_ms=*/0.0); }));
+    TM_CHECK(raises_inv([] { (void) pitch_shift(torch::tensor(0.5f), 11025, 2); }));
+    TM_CHECK(raises_inv([] { (void) detect_pitch_frequency(torch::tensor(0.5f), 16000); }));
+}
+
 int main() {
     test_coverage_gaps();
     test_convolve_full_length();
@@ -1593,5 +1988,19 @@ int main() {
     TM_RUN(test_r2_composite_checks);
     TM_RUN(test_r2_griffinlim_integer_input);
     TM_RUN(test_r2_inverse_spectrogram_false);
+    TM_RUN(test_p4_lfilter_compiled_loop);
+    TM_RUN(test_p4_overdrive_compiled_loop);
+    TM_RUN(test_p4_vad_dtype_device);
+    TM_RUN(test_p4_loudness_11025);
+    TM_RUN(test_p4_dither_seeded_and_intentional_differences);
+    TM_RUN(test_p4_effect_validation);
+    TM_RUN(test_p4_pitch_shift_fractional_steps);
+    TM_RUN(test_p4_mask_rng_cpu_float32);
+    TM_RUN(test_p4_detect_pitch_parity_and_validation);
+    TM_RUN(test_p4_forced_align_parity);
+    TM_RUN(test_p4_beamforming_goldens_and_validation);
+    TM_RUN(test_p4_forced_align_validation);
+    TM_RUN(test_p4_vad_validation);
+    TM_RUN(test_p4_rank_and_degenerate_checks);
     return tm_test::summary("audio_test_functional");
 }

@@ -32,6 +32,8 @@ namespace torchmedia::audio::transform {
     } // namespace detail
 
     // ---------------- FrequencyMasking ----------------
+    // API difference: the mask params (here and in time_masking_option / spec_augment_option) have defaults; torchaudio
+    // requires them. Masks are drawn like torchaudio's, so a seed gives the same masks for any dtype/device.
     typedef struct frequency_masking_option {
         int _freq_mask_param = 80;
         bool _iid_masks = false;
