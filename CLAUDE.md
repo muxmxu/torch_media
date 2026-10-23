@@ -9,7 +9,9 @@ rotate / affine / perspective ops as functional ops and transform classes, point
 (progress10), plus image I/O (torchvision.io-style uint8 decode_image). Metrics (`torchmedia::metric`, torchmetrics
 1.9 parity, develop_log/2026-10-23/progress11): detection (torchvision.ops box ops, IoU metrics, MeanAveragePrecision
 equal to pycocotools COCOeval, VOC AP), image quality and segmentation; audio (SNR family, SDR, PIT, STOI = pystoi,
-mir_eval bss_eval_sources, EER / minDCF) and text (WER family, EditDistance) (develop_log/2026-10-24/progress01).
+mir_eval bss_eval_sources, EER / minDCF) and text (WER family, EditDistance) (develop_log/2026-10-24/progress01);
+classification (torchmetrics.classification binary / multiclass / multilabel: stat scores, confusion-matrix metrics,
+curves / AUROC / AP / fixed-point metrics, calibration, hinge, ranking; develop_log/2026-10-24/progress02).
 
 ## Collaboration model (development, not research)
 
@@ -51,8 +53,8 @@ See `develop_log/README.md` for file conventions, templates, and naming.
 - **Naming**: `snake_case` for functions/variables; option structs as `xxx_option` with fluent
   setters; namespaces `torchmedia::{audio,vision}::{io,functional,transform}`, `torchmedia::audio::separation`,
   `torchmedia::audio::compliance::kaldi` (torchaudio.compliance.kaldi) and `torchmedia::metric::{detection,image,
-  segmentation,audio,text}` (torchmetrics: a functional per metric plus a class with update / compute / reset /
-  forward, progress11 D1; audio / text: develop_log/2026-10-24/progress01).
+  segmentation,audio,text,classification}` (torchmetrics: a functional per metric plus a class with update / compute /
+  reset / forward, progress11 D1; audio / text: develop_log/2026-10-24/progress01; classification: progress02).
 - **No heavy runtime deps**: prefer header-only / vendored single-header over system libraries.
 - **Seeded parity**: a random vision transform class replicates its torchvision class's parameter draws (same torch
   calls, order and dtypes, on the global generator), so `torch::manual_seed(s)` reproduces `torch.manual_seed(s)`

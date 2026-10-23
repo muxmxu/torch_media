@@ -499,6 +499,22 @@ static void test_speaker_verification() {
     TM_CHECK(throws_invalid([&] { return (d.update(t({NAN}), non), 0); }));
 }
 
+// States own their data: a caller that reuses one input buffer must not rewrite earlier updates.
+static void test_state_owns_inputs() {
+    const auto tar = torch::tensor({0.9, 0.8, 0.4, 0.7}), non = torch::tensor({0.1, 0.5, 0.3, 0.6, 0.2});
+    auto a = tar.clone(), b = non.clone();
+    EqualErrorRate e, eref;
+    MinDCF d, dref;
+    e.update(a, b);
+    d.update(a, b);
+    eref.update(tar, non);
+    dref.update(tar, non);
+    a.fill_(0.0);
+    b.fill_(1.0);
+    TM_CHECK(torch::equal(e.compute(), eref.compute()));
+    TM_CHECK(torch::equal(d.compute(), dref.compute()));
+}
+
 int main() {
     TM_RUN(test_inputs);
     TM_RUN(test_snr_family);
@@ -507,5 +523,6 @@ int main() {
     TM_RUN(test_stoi);
     TM_RUN(test_bss_eval);
     TM_RUN(test_speaker_verification);
+    TM_RUN(test_state_owns_inputs);
     return tm_test::summary("metric_test_audio");
 }

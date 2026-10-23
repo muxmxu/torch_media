@@ -374,8 +374,8 @@ namespace torchmedia::metric::detection {
                                                       : torch::eye(iou.size(0), iou.options().dtype(torch::kBool));
                         iou.masked_fill_(label_eq.logical_not(), -1.0);
                     }
-                    _gt_labels.push_back(target[i].labels);
-                    _pred_labels.push_back(preds[i].labels);
+                    _gt_labels.push_back(target[i].labels.detach().clone()); // own the data (reused buffers)
+                    _pred_labels.push_back(preds[i].labels.detach().clone());
                     _iou_matrix.push_back(iou);
                 }
             }

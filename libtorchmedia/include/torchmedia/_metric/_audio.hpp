@@ -1202,8 +1202,8 @@ namespace torchmedia::metric::audio {
             if (auto e = detail::scores_error("equal_error_rate", target_scores, nontarget_scores); !e.empty()) {
                 return detail::fail(std::move(e));
             }
-            _target.push_back(target_scores.detach());
-            _nontarget.push_back(nontarget_scores.detach());
+            _target.push_back(target_scores.detach().clone());
+            _nontarget.push_back(nontarget_scores.detach().clone());
         }
         auto compute() const -> tensor_t { return equal_error_rate(torch::cat(_target), torch::cat(_nontarget)); }
 
@@ -1224,8 +1224,8 @@ namespace torchmedia::metric::audio {
             if (auto e = detail::scores_error("min_dcf", target_scores, nontarget_scores); !e.empty()) {
                 return detail::fail(std::move(e));
             }
-            _target.push_back(target_scores.detach());
-            _nontarget.push_back(nontarget_scores.detach());
+            _target.push_back(target_scores.detach().clone());
+            _nontarget.push_back(nontarget_scores.detach().clone());
         }
         auto compute() const -> tensor_t { return min_dcf(torch::cat(_target), torch::cat(_nontarget), _opt); }
         auto options() const -> const min_dcf_option & { return _opt; }

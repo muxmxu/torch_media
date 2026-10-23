@@ -14,6 +14,7 @@ namespace torchmedia::metric::segmentation {
     namespace detail {
         using metric::detail::fail;
         using metric::detail::invalid;
+        using metric::detail::safe_divide;
         using metric::detail::shape_error;
         using metric::detail::squeeze_if_scalar;
 
@@ -62,17 +63,6 @@ namespace torchmedia::metric::segmentation {
                 dims.push_back(d);
             }
             return dims;
-        }
-
-        // torchmetrics _safe_divide (float32 for integer inputs); zero_division: the value of x / 0, NaN = plain
-        // true division.
-        inline auto safe_divide(const tensor_t &num, const tensor_t &denom, double zero_division) -> tensor_t {
-            const auto n = num.is_floating_point() ? num : num.to(torch::kFloat32);
-            const auto d = denom.is_floating_point() ? denom : denom.to(torch::kFloat32);
-            if (std::isnan(zero_division)) {
-                return torch::true_divide(n, d);
-            }
-            return torch::where(d != 0, n / d, torch::full({}, zero_division, n.options()));
         }
 
         inline auto num_classes_error(std::optional<int64_t> num_classes, bool required) -> std::string {

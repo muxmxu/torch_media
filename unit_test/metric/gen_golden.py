@@ -12,7 +12,7 @@ Audio / text: torchmetrics 1.9.0 (audio, text), pystoi 0.4.1 (through torchmetri
 bss_eval_sources, scipy linear_sum_assignment, sklearn roc_curve with the EER / minDCF formulas written out below
 (eer_np / min_dcf_np), jiwer 4.0.0 as a cross-check; speech-like inputs from speech() (mirrored in test_audio.cpp).
 Float32 values are printed with 9 significant digits and float64 values with repr (both round trip exactly).
-Generated on arm64.
+Generated on arm64. The classification goldens have their own generator, gen_golden_classification.py.
 """
 import contextlib
 import io

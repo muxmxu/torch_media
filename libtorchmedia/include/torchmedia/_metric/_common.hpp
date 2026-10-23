@@ -64,6 +64,17 @@ namespace torchmedia::metric {
                                fn, c10::str(preds.sizes()), c10::str(target.sizes()));
         }
 
+        // torchmetrics _safe_divide (float32 for integer inputs); zero_division: the value of x / 0, NaN = plain
+        // true division.
+        inline auto safe_divide(const tensor_t &num, const tensor_t &denom, double zero_division = 0.0) -> tensor_t {
+            const auto n = num.is_floating_point() ? num : num.to(torch::kFloat32);
+            const auto d = denom.is_floating_point() ? denom : denom.to(torch::kFloat32);
+            if (std::isnan(zero_division)) {
+                return torch::true_divide(n, d);
+            }
+            return torch::where(d != 0, n / d, torch::full({}, zero_division, n.options()));
+        }
+
         // Metric.compute() squeezes a one-element result to 0-d (torchmetrics _squeeze_if_scalar).
         inline auto squeeze_if_scalar(const tensor_t &x) -> tensor_t { return x.numel() == 1 ? x.squeeze() : x; }
 

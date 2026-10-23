@@ -702,11 +702,35 @@ static void test_mps() {
     TM_CHECK(same);
 }
 
+// States own their data: a caller that reuses one input buffer must not rewrite earlier updates.
+static void test_iou_state_owns_inputs() {
+    const auto ref_items = iou_items(40);
+    auto items = iou_items(40);
+    for (auto &x: items.preds)
+        x.labels = x.labels.clone(); // iou_items shares DA's tensors: never mutate those
+    for (auto &x: items.target)
+        x.labels = x.labels.clone();
+    const auto opt = intersection_over_union_option().class_metrics(true);
+    IntersectionOverUnion m(opt), ref(opt);
+    m.update(items.preds, items.target);
+    ref.update(ref_items.preds, ref_items.target);
+    for (auto &x: items.preds)
+        x.labels.fill_(0);
+    for (auto &x: items.target)
+        x.labels.fill_(1);
+    const auto got = m.compute(), want = ref.compute();
+    TM_CHECK(got.size() == want.size());
+    for (const auto &[k, v]: want) {
+        TM_CHECK(got.contains(k) && torch::allclose(got.at(k), v, 0.0, 0.0, /*equal_nan=*/true));
+    }
+}
+
 int main() {
     TM_RUN(test_box_ops);
     TM_RUN(test_box_convert);
     TM_RUN(test_iou_functional);
     TM_RUN(test_iou_classes);
+    TM_RUN(test_iou_state_owns_inputs);
     TM_RUN(test_map_bbox);
     TM_RUN(test_map_edges);
     TM_RUN(test_map_boundaries);
