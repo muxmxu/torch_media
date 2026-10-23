@@ -26,3 +26,6 @@ __pycache__/
 *.jpg
 *.pt
 *.pdf
+
+# agent process records (agent-workspace skill; not project deliverables)
+agent_workspace/
