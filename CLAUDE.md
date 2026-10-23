@@ -3,7 +3,9 @@
 torch_media (a.k.a. **TorchMedia / libtorchmedia**) is a **header-only C++ library** that
 reimplements **torchaudio / torchvision** functionality on top of **native libtorch
 (`torch::Tensor`) operators**. MIT licensed. Audio covers torchaudio.functional and torchaudio.transforms
-(see develop_log/2026-06-01); vision has initial functional ops and image I/O.
+(see develop_log/2026-06-01); vision covers the core torchvision.transforms.v2 resize / crop / pad / dtype / color
+ops as functional ops and transform classes, point-wise identical to torchvision (develop_log/2026-10-23/progress07),
+plus image I/O.
 
 ## Collaboration model (development, not research)
 
@@ -70,10 +72,10 @@ See `develop_log/README.md` for file conventions, templates, and naming.
   assertion-based tests using `unit_test/test_util.hpp` (`TM_CHECK`, `TM_CHECK_TENSOR_CLOSE`) and
   registered with ctest. No eyeball / print-only tests.
 - A new or changed function is not "done" until covered; target **100% line coverage** for
-  every `_audio/*.hpp` header (vendored `_vendor/` is excluded), measured as the union over the audio test
-  binaries (develop_log/2026-10-23/progress02 D11).
+  every `_audio/*.hpp` and `_vision/*.hpp` header (vendored `_vendor/` is excluded), measured as the union over the
+  audio / vision test binaries (develop_log/2026-10-23/progress02 D11).
 - Golden reference values: prefer closed-form truths and libtorch self-reference (portable, no deps).
-  Use the local `.venv` (torch/torchaudio 2.5.1) as a development-time point-wise cross-check.
+  Use the local `.venv` (torch/torchaudio 2.5.1, torchvision 0.20.1) as a development-time point-wise cross-check.
 - `ctest --test-dir build` must be green before a task is marked done.
 - Coverage run: `cmake -S . -B build -DTORCHMEDIA_COVERAGE=ON`, then `llvm-profdata merge` +
   `xcrun llvm-cov` (with `--ignore-filename-regex='_vendor/.*'`).

@@ -1,0 +1,3 @@
+add_executable(vision_test_transform main.cpp)
+target_link_libraries(vision_test_transform PRIVATE torch_media)
+add_test(NAME vision_test_transform COMMAND vision_test_transform)
