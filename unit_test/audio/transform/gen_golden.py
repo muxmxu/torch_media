@@ -130,3 +130,85 @@ show("specaugment_f64_seed0 sum/zeros", [repr(float(_ys.sum())), int((_ys == 0).
 # PitchShift with fractional n_steps (the functional value is pinned in the functional gen_golden.py).
 _pp = T.PitchShift(1000, 0.5)(torch.sin(torch.arange(3001.0) * 0.05).unsqueeze(0))
 show("pitch_shift_frac [0,1500]", repr(float(_pp[0, 1500])))
+
+# ======================= progress08 -- audio parity follow-ups (2026-10-23, task53 / task54) =======================
+import warnings
+
+import torchaudio.functional as F
+
+
+def _p8(n):
+    t = torch.arange(n, dtype=torch.float64)
+    return torch.stack([0.4 * torch.sin(t * 0.013) + 0.3 * torch.sin(t * 0.71),
+                        0.3 * torch.cos(t * 0.0021) - 0.2 * torch.sin(t * 1.9 + 0.3)])
+
+
+def _pts(y, idx):  # values at idx (repr), then the float64 sum of the whole output
+    return [repr(float(y[i])) for i in idx] + [repr(float(y.double().sum()))]
+
+
+# task53 -- InverseMelScale, LFCC, SpeedPerturbation (seeded factor draw).
+_f = torch.arange(40, dtype=torch.float64).reshape(40, 1)
+_t = torch.arange(30, dtype=torch.float64)
+_mel = (1.0 + torch.sin(0.3 * _f + 0.17 * _t) ** 2 * (1 + _f / 10)).float()
+_y = T.InverseMelScale(n_stft=201, n_mels=40, sample_rate=16000)(_mel)
+show("p8 InverseMelScale shape / points+sum / zeros", [list(_y.shape), _pts(_y, ((0, 0), (37, 12), (120, 29))),
+                                                       int((_y == 0).sum())])
+_x = _p8(8000).float()
+_y = T.LFCC(sample_rate=16000, n_filter=40, n_lfcc=20, speckwargs=dict(n_fft=400, hop_length=160))(_x)
+show("p8 LFCC", [list(_y.shape), _pts(_y, ((0, 0, 0), (1, 19, 50), (0, 7, 23)))])
+_y = T.LFCC(sample_rate=16000, n_filter=40, n_lfcc=13, log_lf=True, speckwargs=dict(n_fft=256))(_x)
+show("p8 LFCC log_lf", [list(_y.shape), _pts(_y, ((0, 0, 0), (1, 12, 50), (0, 7, 23)))])
+_x1 = _p8(4000)[:1].float()
+_sp = T.SpeedPerturbation(16000, [0.9, 1.0, 1.1])
+for _seed in (7, 2024):
+    torch.manual_seed(_seed)
+    _y, _l = _sp(_x1, torch.tensor([4000.0]))
+    show(f"p8 SpeedPerturbation seed {_seed}", [list(_y.shape), float(_l[0]),
+                                                _pts(_y, ((0, 0), (0, 1000), (0, _y.shape[-1] - 1)))])
+
+
+# task53 / task54 -- SoudenMVDR, RTFMVDR (int and one-hot Tensor reference_channel), MVDR offline / online / cfloat.
+def _bf(k):
+    n = torch.arange(3 * 33 * 20, dtype=torch.float64)
+    spec = torch.complex(torch.sin(n * (0.37 + 0.01 * k)), torch.cos(n * (0.11 + 0.02 * k))).reshape(3, 33, 20)
+    m = torch.arange(33 * 20, dtype=torch.float64)
+    return spec, (0.5 + 0.4 * torch.sin(m * (0.23 + 0.05 * k))).reshape(33, 20)
+
+
+def _bfp(y):
+    return [[repr(float(y[i].real)), repr(float(y[i].imag))] for i in ((0, 0), (17, 9), (32, 19))] + \
+        [repr(float(y.abs().sum()))]
+
+
+warnings.filterwarnings("ignore")  # MVDR warns when mask_n is not given
+_spec, _ms = _bf(0)
+_ps, _pn = T.PSD()(_spec, _ms), T.PSD()(_spec, 1 - _ms)
+_hot = torch.tensor([0.0, 1.0, 0.0], dtype=torch.float64)
+show("p8 SoudenMVDR ref 1 / one-hot", [_bfp(T.SoudenMVDR()(_spec, _ps, _pn, 1)), _bfp(T.SoudenMVDR()(_spec, _ps, _pn, _hot))])
+_rtf = F.rtf_evd(_ps)
+show("p8 RTFMVDR ref 1 / one-hot", [_bfp(T.RTFMVDR()(_spec, _rtf, _pn, 1)), _bfp(T.RTFMVDR()(_spec, _rtf, _pn, _hot))])
+for _sol in ("ref_channel", "stv_evd", "stv_power"):
+    show(f"p8 MVDR ref 2 {_sol}", _bfp(T.MVDR(ref_channel=2, solution=_sol)(_spec, _ms, 1 - _ms)))
+show("p8 MVDR default mask_n", _bfp(T.MVDR()(_spec, _ms)))
+_y = T.MVDR(ref_channel=1)(_spec.to(torch.complex64), _ms.float(), (1 - _ms).float())
+show("p8 MVDR cfloat", [str(_y.dtype), _bfp(_y)])
+_spec2, _ms2 = _bf(1)
+for _sol in ("ref_channel", "stv_power"):
+    _mv = T.MVDR(ref_channel=1, solution=_sol, online=True)
+    show(f"p8 MVDR online {_sol} call 1 / call 2", [_bfp(_mv(_spec, _ms, 1 - _ms)), _bfp(_mv(_spec2, _ms2, 1 - _ms2))])
+_mm1, _mm2 = torch.stack([_ms, _ms.flip(-1), 0.5 * _ms]), torch.stack([_ms2, 1 - _ms2, _ms2.flip(0)])
+_mv = T.MVDR(solution="stv_evd", multi_mask=True, online=True)
+_mv(_spec, _mm1, 1 - _mm1)
+show("p8 MVDR online multi_mask call 2", _bfp(_mv(_spec2, _mm2, 1 - _mm2)))
+
+# progress08 review fixes (R5 / R6). Inputs where the rounding order shows: a 1-D LFCC input (another matmul kernel than
+# the batched one above), PitchShift at 1.5 steps (phase_vocoder's phase wrap rounds differently in ~300 samples).
+_x = _p8(6000)[0].float()
+_y = T.LFCC(sample_rate=8000, n_filter=32, n_lfcc=13, log_lf=True, speckwargs=dict(n_fft=256, hop_length=100))(_x)
+show("p8r LFCC 8k log_lf 1-D", [list(_y.shape), _pts(_y, ((0, 0), (12, 60), (7, 23), (3, 41)))])
+_y = T.PitchShift(8000, 1.5, n_fft=512)(_p8(4000).float())
+show("p8r PitchShift f32", [list(_y.shape), _pts(_y, ((0, 100), (1, 2000), (0, 3999)))])
+# float64: torchaudio's module takes float64 only after .double(), which casts its float32 window buffer up.
+_y = T.PitchShift(8000, 1.5, n_fft=512).double()(_p8(4000))
+show("p8r PitchShift f64 .double()", [list(_y.shape), _pts(_y, ((0, 100), (1, 2000), (0, 3999)))])

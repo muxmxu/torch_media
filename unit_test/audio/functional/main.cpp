@@ -725,11 +725,7 @@ static void test_stft_domain() {
     auto spec = torch::complex(A, A * 0.5);
     auto pa = torch::linspace(0, PI, 3).unsqueeze(-1);
     auto pv = phase_vocoder(spec, 1.5, pa);
-    TM_CHECK(pv.size(0) == 1 && pv.size(1) == 3 && pv.size(2) == 3);
-    auto pv_real_exp = torch::tensor({1.0f, 2.5f, 4.0f, 5.0f, 6.5f, 8.0f, 8.999999f, 10.5f, 12.0f}).reshape({1, 3, 3});
-    auto pv_imag_exp = torch::tensor({0.5f, 1.25f, 2.0f, 2.5f, 3.25f, 4.0f, 4.5f, 5.25f, 6.0f}).reshape({1, 3, 3});
-    TM_CHECK_TENSOR_CLOSE(torch::real(pv), pv_real_exp, 1e-4, 1e-4);
-    TM_CHECK_TENSOR_CLOSE(torch::imag(pv), pv_imag_exp, 1e-4, 1e-4);
+    TM_CHECK(pv.size(0) == 1 && pv.size(1) == 3 && pv.size(2) == 3); // values: test_p8_phase_vocoder_goldens
     TM_CHECK(phase_vocoder(spec, 1.0, pa).equal(spec)); // rate==1.0 short-circuit
 
     // inverse_spectrogram round-trip on a sine.
@@ -908,11 +904,7 @@ static void test_sequential_feature_ops() {
                     {{-1.f, -1.f}, {1.f, 1.f}, {1.224745f, 1.224745f}, {1.341641f, 1.341641f}, {1.414214f, 1.414214f}}),
             1e-4, 1e-4);
 
-    auto t = torch::arange(8000.0) / 8000.0;
-    auto sine = torch::sin(2.0 * PI * 220.0 * t).reshape({1, 8000});
-    auto pf = detect_pitch_frequency(sine, 8000, 0.01, 30, 85, 3400);
-    TM_CHECK(pf.size(0) == 1 && pf.size(1) == 85);
-    TM_CHECK_CLOSE(pf.median().item<float>(), 222.222f, 1.0f); // ~220 Hz (+1 calibration lag)
+    // detect_pitch_frequency: test_p8_detect_pitch_golden
 }
 
 // ---------------- VAD (task05) ----------------
@@ -1573,10 +1565,9 @@ static void test_p4_lfilter_compiled_loop() {
     TM_CHECK_TENSOR_CLOSE(yg.detach(), y64, 1e-9, 1e-9);
     yg.sum().backward();
     TM_CHECK(xg.grad().defined() && xg.grad().sizes() == x64.sizes());
-    if (const auto mps = mps_or_skip()) { // non-CPU devices take the generic loop too
+    if (const auto mps = mps_or_skip()) { // other devices run the scalar loop on a host copy (task51)
         const auto xs = x32.index({torch::indexing::Ellipsis, torch::indexing::Slice(0, 200)});
-        TM_CHECK_TENSOR_CLOSE(lfilter(xs.to(*mps), a32.to(*mps), b32.to(*mps), false).cpu(),
-                              lfilter(xs, a32, b32, false), 5e-3, 1e-4); // MPS float32 matmul vs the scalar loop
+        TM_CHECK(lfilter(xs.to(*mps), a32.to(*mps), b32.to(*mps), false).cpu().equal(lfilter(xs, a32, b32, false)));
     }
     // 10 s at 16 kHz: the per-sample tensor-op loop took ~800 ms, the compiled-style loop ~1 ms.
     torch::manual_seed(0);
@@ -1618,7 +1609,7 @@ static void test_p4_overdrive_compiled_loop() {
     TM_CHECK_TENSOR_CLOSE(overdrive(og, 30.0, 40.0).detach(), y64, 1e-12, 1e-12);
     if (const auto mps = mps_or_skip()) {
         const auto xs = ox.to(torch::kFloat).index({torch::indexing::Ellipsis, torch::indexing::Slice(0, 200)});
-        TM_CHECK_TENSOR_CLOSE(overdrive(xs.to(*mps), 30.0, 40.0).cpu(), overdrive(xs, 30.0, 40.0), 1e-5, 1e-5);
+        TM_CHECK(overdrive(xs.to(*mps), 30.0, 40.0).cpu().equal(overdrive(xs, 30.0, 40.0))); // host loop (task51)
     }
     torch::manual_seed(0);
     const auto x10 = torch::randn({1, 160000}) * 0.1;
@@ -1926,6 +1917,298 @@ static void test_p4_rank_and_degenerate_checks() {
     TM_CHECK(raises_inv([] { (void) detect_pitch_frequency(torch::tensor(0.5f), 16000); }));
 }
 
+// ======================= progress08 -- audio parity follow-ups (task50-task55) =======================
+// Goldens: gen_golden.py "progress08" section (torchaudio 2.5.1).
+static auto p8_signal(int64_t n) -> torch::Tensor {
+    const auto t = torch::arange(n, torch::kDouble);
+    return torch::stack({0.4 * torch::sin(t * 0.013) + 0.3 * torch::sin(t * 0.71),
+                         0.3 * torch::cos(t * 0.0021) - 0.2 * torch::sin(t * 1.9 + 0.3)});
+}
+
+// task50 -- the biquad designers build their coefficients as tensors in the waveform's dtype, in torchaudio's op
+// order (A1-10). Each index is where the old double-precision coefficients were furthest off; all bit-exact now.
+static void test_p8_biquad_designers_in_dtype() {
+    const auto x = p8_signal(4000).to(torch::kFloat);
+    const auto at = [](const torch::Tensor &y, int64_t r, int64_t c) { return y[r][c].item<double>(); };
+    auto y = lowpass_biquad(x, 16000, 20.0, 0.707); // the audit's 8.6e-4-of-peak case
+    TM_CHECK_CLOSE(at(y, 1, 3178), 0.2992813289165497, 0.0);
+    TM_CHECK_CLOSE(at(y, 1, 3999), -0.04670260101556778, 0.0);
+    y = lowpass_biquad(x, 44100, 1000.0, 0.707);
+    TM_CHECK_CLOSE(at(y, 0, 3517), 0.39725446701049805, 0.0);
+    y = highpass_biquad(x, 16000, 20.0, 2.0);
+    TM_CHECK_CLOSE(at(y, 0, 1253), -0.623308002948761, 0.0);
+    TM_CHECK_CLOSE(at(allpass_biquad(x, 16000, 1000.0, 0.707), 1, 3999), -0.28139370679855347, 0.0);
+    TM_CHECK_CLOSE(at(bandpass_biquad(x, 16000, 55.0, 3.0, true), 0, 3433), 0.3314923942089081, 0.0);
+    TM_CHECK_CLOSE(at(bandpass_biquad(x, 44100, 1000.0, 0.707, false), 0, 2178), -0.09597954154014587, 0.0);
+    TM_CHECK_CLOSE(at(bandreject_biquad(x, 16000, 20.0, 1.0), 1, 3999), -0.2541670799255371, 0.0);
+    TM_CHECK_CLOSE(at(equalizer_biquad(x, 16000, 1000.0, 6.0, 0.707), 0, 868), -0.29854267835617065, 0.0);
+    TM_CHECK_CLOSE(at(band_biquad(x, 44100, 30.0, 0.5, true), 1, 829), 0.9959783554077148, 0.0); // was 7e-3 off
+    TM_CHECK_CLOSE(at(band_biquad(x, 16000, 1000.0, 0.707, false), 0, 119), 0.5266629457473755, 0.0);
+    TM_CHECK_CLOSE(at(bass_biquad(x, 44100, -9.0, 20.0, 0.707), 1, 3505), 0.05219773203134537, 0.0);
+    TM_CHECK_CLOSE(at(treble_biquad(x, 16000, 12.0, 20.0, 0.6), 1, 3215), -0.5730679631233215, 0.0);
+    // Through treble + highpass: loudness float32 (was 1.4e-4 / 1.2e-5 relative off at 48 / 22.05 kHz).
+    const auto xl = p8_signal(24000).to(torch::kFloat);
+    TM_CHECK_CLOSE(loudness(xl, 48000).item<double>(), -7.17556619644165, 0.0);
+    TM_CHECK_CLOSE(loudness(xl, 22050).item<double>(), -8.128705024719238, 0.0);
+    // deemph / riaa design in Python double math: no fused multiply-add (clang contracted a * b + c here).
+    const auto x64 = p8_signal(4000) * 0.05;
+    y = riaa_biquad(x64, 44100);
+    TM_CHECK_CLOSE(at(y, 0, 3999), 0.06723170594705326, 0.0);
+    TM_CHECK_CLOSE(at(y, 1, 1234), -0.10075849643046793, 0.0);
+    TM_CHECK_CLOSE(at(y, 0, 2000), -0.009753847049266068, 0.0);
+    y = riaa_biquad(x64, 96000);
+    TM_CHECK_CLOSE(at(y, 0, 3999), 0.030217638731590724, 0.0);
+    TM_CHECK_CLOSE(at(y, 1, 1234), -0.06225275091098827, 0.0);
+    y = deemph_biquad(x64 * 20, 48000);
+    TM_CHECK_CLOSE(at(y, 0, 3999), 0.23526643863952285, 0.0);
+    TM_CHECK_CLOSE(at(y, 1, 1234), -0.31558647284056895, 0.0);
+    TM_CHECK(lowpass_biquad(x64, 16000, 20.0).scalar_type() == torch::kDouble);
+    if (const auto mps = mps_or_skip()) {
+        const auto xs = x.slice(-1, 0, 300);
+        TM_CHECK_TENSOR_CLOSE(lowpass_biquad(xs.to(*mps), 16000, 1000.0).cpu(), lowpass_biquad(xs, 16000, 1000.0), 1e-5,
+                              1e-5);
+    }
+}
+
+// task51 -- phaser / flanger run torchaudio's per-sample loops as scalar CPU loops (float32/float64, no autograd);
+// otherwise the tensor-op loop. Three output samples bit-exact plus the float64 sum of the whole output (1e-9).
+static void check_p8_points(const torch::Tensor &y, const std::vector<std::vector<int64_t>> &idx,
+                            const std::vector<double> &golden) {
+    for (size_t i = 0; i < idx.size(); ++i) {
+        auto v = y;
+        for (const auto j: idx[i]) {
+            v = v[j];
+        }
+        TM_CHECK_CLOSE(v.item<double>(), golden[i], 0.0);
+    }
+    TM_CHECK_CLOSE(y.to(torch::kDouble).sum().item<double>(), golden.back(), 1e-9);
+}
+
+// task51 -- float32/float64 input on another device runs the scalar loops on a host copy (torchaudio's CPU values). On
+// MPS the tensor-op loops cost 0.1-1 ms per sample, libtorch 2.5.1 returns garbage past ~64k queued index_put_ writes
+// and its conv1d raises past 65536 samples. Phaser/flanger also used to fail on their float64 wave table there.
+static void test_p8_device_input_runs_host_loops() {
+    const auto mps = mps_or_skip();
+    if (!mps) {
+        return;
+    }
+    const auto x = p8_signal(70000).to(torch::kFloat);
+    const auto xm = x.to(*mps);
+    TM_CHECK(lowpass_biquad(xm, 16000, 1000.0).cpu().equal(lowpass_biquad(x, 16000, 1000.0)));
+    TM_CHECK(overdrive(xm, 30.0, 40.0).cpu().equal(overdrive(x, 30.0, 40.0)));
+    TM_CHECK(phaser(xm, 16000).cpu().equal(phaser(x, 16000)));
+    // The designers compute their coefficients on the host too: MPS sin / cos / exp differ at low corners (review R1).
+    const auto x2 = p8_signal(70000).mul(1.5).to(torch::kFloat), x2m = x2.to(*mps);
+    TM_CHECK(highpass_biquad(x2m, 22050, 15.0).cpu().equal(highpass_biquad(x2, 22050, 15.0)));
+    TM_CHECK(allpass_biquad(x2m, 22050, 37.5).cpu().equal(allpass_biquad(x2, 22050, 37.5)));
+    TM_CHECK(band_biquad(x2m, 22050, 60.0, 0.707, true).cpu().equal(band_biquad(x2, 22050, 60.0, 0.707, true)));
+    const auto pm = flanger(xm.unsqueeze(0), 16000, 5.0, 8.0, 50.0, 80.0, 2.0, 60.0, "triangular", "quadratic");
+    TM_CHECK(pm.device().is_mps());
+    TM_CHECK(
+            pm.cpu().equal(flanger(x.unsqueeze(0), 16000, 5.0, 8.0, 50.0, 80.0, 2.0, 60.0, "triangular", "quadratic")));
+    TM_CHECK(wall_ms([&] { return flanger(xm.unsqueeze(0), 16000); }) < 100.0);
+    // Autograd keeps the tensor-op loop on the device, synchronised every 8192 steps.
+    const auto xs = x.slice(-1, 0, 8200);
+    const auto xg = xs.to(*mps).requires_grad_(true);
+    TM_CHECK_TENSOR_CLOSE(lowpass_biquad(xg, 16000, 1000.0).detach().cpu(), lowpass_biquad(xs, 16000, 1000.0), 5e-3,
+                          1e-4);
+}
+
+static void test_p8_phaser_flanger_loops() {
+    const auto x = p8_signal(16000);
+    const std::vector<std::vector<int64_t>> pi = {{0, 15999}, {1, 8000}, {0, 12345}};
+    check_p8_points(phaser(x.to(torch::kFloat), 16000), pi,
+                    {0.0018242388032376766, -0.11484887450933456, 0.030116721987724304, 63.32949634072486});
+    check_p8_points(phaser(x.to(torch::kFloat), 16000, 0.5, 1.0, 5.0, 0.8, 2.0, false), pi,
+                    {0.3262704908847809, -0.39656710624694824, -0.03265342116355896, 396.38830902357586});
+    check_p8_points(phaser(x, 44100, 0.4, 0.74, 1.0, 0.7, 0.3), pi,
+                    {0.15660417125049172, -0.17563877305051062, -0.06723799479320253, 122.49597611370025});
+    const auto x8 = p8_signal(8000);
+    const auto xf = torch::stack({x8, -0.5 * x8, x8.flip(-1)}, 1); // (2, 3, 8000)
+    const std::vector<std::vector<int64_t>> fi = {{0, 0, 7999}, {1, 2, 4000}, {0, 1, 6543}};
+    check_p8_points(flanger(xf.to(torch::kFloat), 16000), fi,
+                    {-0.1447390615940094, -0.245361790060997, -0.0011509917676448822, -102.29147987545002});
+    check_p8_points(flanger(xf.to(torch::kFloat), 16000, 5.0, 8.0, 50.0, 80.0, 2.0, 60.0, "triangular", "quadratic"),
+                    fi, {-0.1275671422481537, -0.25444185733795166, -0.06719933450222015, -154.4722678306698});
+    check_p8_points(flanger(xf, 22050, 1.0, 3.0, -95.0, 40.0, 0.7, 33.0, "sinusoidal", "quadratic"), fi,
+                    {-0.2375483354413953, -0.2373901577339364, -0.05110520718833795, -72.10538168001594});
+    // Negative LFO values / channel phase: torchaudio's indices are Python-style remainders.
+    const auto xs = (torch::sin(torch::arange(800, torch::kFloat) * 0.1) * 0.5).reshape({1, 2, 400});
+    check_p8_points(flanger(xs, 16000, -0.1, 0.0), {{0, 1, 399}}, {-0.4889516830444336, 5.795768024632707});
+    check_p8_points(flanger(xs, 16000, 0.0, 2.0, 0.0, 71.0, 0.5, -30.0), {{0, 1, 399}},
+                    {-0.16655611991882324, 7.208633572387043});
+    // torchaudio computes the channel phase offset in float32: 14332 here, where float64 gives 14333.
+    check_p8_points(flanger(xs, 22050, 0.0, 2.0, 0.0, 71.0, 0.1, 6.5), {{0, 1, 399}},
+                    {-0.47694236040115356, 6.178274919395335});
+
+    // Autograd and other dtypes keep the tensor-op loop, which agrees with the scalar one.
+    const auto xg = xf.slice(-1, 0, 500).clone().requires_grad_(true);
+    const auto fg = flanger(xg, 16000, 5.0, 8.0, 50.0, 80.0, 2.0, 60.0, "triangular", "quadratic");
+    TM_CHECK_TENSOR_CLOSE(
+            fg.detach(),
+            flanger(xf.slice(-1, 0, 500), 16000, 5.0, 8.0, 50.0, 80.0, 2.0, 60.0, "triangular", "quadratic"), 1e-12,
+            1e-12);
+    const auto pg = phaser(xg, 16000, 0.5, 1.0, 5.0, 0.8, 2.0, false);
+    TM_CHECK_TENSOR_CLOSE(pg.detach(), phaser(xf.slice(-1, 0, 500), 16000, 0.5, 1.0, 5.0, 0.8, 2.0, false), 1e-12,
+                          1e-12);
+    (fg.sum() + pg.sum()).backward();
+    TM_CHECK(xg.grad().defined() && xg.grad().sizes() == xg.sizes());
+    const auto xh = xf.slice(-1, 0, 300).to(torch::kHalf);
+    TM_CHECK_TENSOR_CLOSE(flanger(xh, 16000), flanger(xh.to(torch::kFloat), 16000), 2e-3, 0.0);
+    TM_CHECK_TENSOR_CLOSE(phaser(xh, 16000), phaser(xh.to(torch::kFloat), 16000), 2e-3, 0.0);
+    // 4 s at 16 kHz: the tensor-op loops took ~200 ms (phaser) and ~1.1 s (flanger).
+    const auto x4 = p8_signal(64000).slice(0, 0, 1).to(torch::kFloat);
+    TM_CHECK(wall_ms([&] { return phaser(x4, 16000); }) < 50.0);
+    TM_CHECK(wall_ms([&] { return flanger(x4, 16000); }) < 50.0);
+    // torchaudio raises: an empty LFO (ZeroDivisionError) or delay buffer (negative dimension).
+    TM_CHECK(raises_inv([&] { (void) flanger(xs, 16000, 0.0, 2.0, 0.0, 71.0, /*speed=*/20000.0); }));
+    TM_CHECK(raises_inv([&] { (void) flanger(xs, 16000, 0.0, 2.0, 0.0, 71.0, /*speed=*/0.0); }));
+    TM_CHECK(raises_inv([&] { (void) flanger(xs, 16000, /*delay=*/-10.0); }));
+}
+
+// task53 -- torchaudio goldens in place of loose or self-referential pins (A2-12, progress04 vad notes).
+static auto p8_cspec(int64_t nf, int64_t nt) -> torch::Tensor { // deterministic complex64 (2, nf, nt)
+    const auto f = torch::arange(nf, torch::kDouble).reshape({nf, 1});
+    const auto t = torch::arange(nt, torch::kDouble);
+    const auto re = torch::sin(0.37 * f + 0.11 * t) * (1.0 + 0.5 * torch::cos(0.05 * t));
+    const auto im = 0.8 * torch::cos(0.23 * f - 0.07 * t);
+    return torch::stack({torch::complex(re, im), torch::complex(im, -0.5 * re)}).to(torch::kComplexFloat);
+}
+
+static void check_p8_complex(const torch::Tensor &y, const std::vector<std::array<int64_t, 3>> &idx,
+                             const std::vector<std::array<double, 2>> &golden, double abs_sum, double sum_tol) {
+    for (size_t i = 0; i < idx.size(); ++i) {
+        const auto v = y[idx[i][0]][idx[i][1]][idx[i][2]];
+        TM_CHECK_CLOSE(torch::real(v).item<double>(), golden[i][0], 0.0);
+        TM_CHECK_CLOSE(torch::imag(v).item<double>(), golden[i][1], 0.0);
+    }
+    TM_CHECK_CLOSE(y.abs().to(torch::kDouble).sum().item<double>(), abs_sum, sum_tol);
+}
+
+static void test_p8_phase_vocoder_goldens() {
+    const auto s = p8_cspec(65, 40);
+    const auto pa = torch::linspace(0, PI * 32, 65).unsqueeze(-1);
+    const auto y13 = phase_vocoder(s, 1.3, pa);
+    TM_CHECK(y13.sizes() == torch::IntArrayRef({2, 65, 31}));
+    check_p8_complex(y13, {{0, 10, 5}, {1, 64, 30}, {0, 33, 17}},
+                     {{{-1.387778401374817, -0.317635715007782}},
+                      {{0.6465211510658264, 0.21640904247760773}},
+                      {{0.8102168440818787, 1.047012209892273}}},
+                     3389.1342094819993, 1e-9);
+    const auto y077 = phase_vocoder(s, 0.77, pa);
+    TM_CHECK(y077.sizes() == torch::IntArrayRef({2, 65, 52}));
+    check_p8_complex(y077, {{0, 10, 5}, {1, 64, 51}, {0, 33, 17}},
+                     {{{-1.2712041139602661, -0.21173274517059326}},
+                      {{0.30477988719940186, -0.39346256852149963}},
+                      {{1.400020956993103, -0.3290657699108124}}},
+                     5657.198138790205, 1e-9);
+}
+
+static void test_p8_inverse_spectrogram_options() {
+    const auto s = p8_cspec(65, 40);
+    const auto hann = torch::hann_window(128);
+    const auto check = [](const torch::Tensor &y, int64_t len, const std::array<double, 4> &g) {
+        TM_CHECK(y.sizes() == torch::IntArrayRef({2, len}));
+        TM_CHECK_CLOSE(y[0][5].item<double>(), g[0], 0.0);
+        TM_CHECK_CLOSE(y[1][600].item<double>(), g[1], 0.0);
+        TM_CHECK_CLOSE(y[0][len - 1].item<double>(), g[2], 0.0);
+        TM_CHECK_CLOSE(y.to(torch::kDouble).sum().item<double>(), g[3], 1e-9);
+    };
+    check(inverse_spectrogram(s, c10::nullopt, 0, hann, 128, 32, 128, "window"), 1248,
+          {-0.039458777755498886, -0.050769511610269547, 0.01831790618598461, -2.2778365851518174});
+    check(inverse_spectrogram(s, 1200, 0, hann, 128, 32, 128, "frame_length"), 1200,
+          {-0.06443595141172409, -0.08290623128414154, 0.06573780626058578, -3.7468793071420805});
+    check(inverse_spectrogram(s, c10::nullopt, 0, torch::hamming_window(128), 128, 32, 128, "false",
+                              /*center=*/false),
+          1376, {-0.6631940007209778, -0.020195050165057182, -0.5746607184410095, 3.721060728334578});
+    check(inverse_spectrogram(s, 1000, 37, hann, 128, 32, 128, "true"), 1000,
+          {-0.03510703518986702, 0.0006020553992129862, 0.014691109769046307, -2.1516111083437863});
+    check(inverse_spectrogram(p8_cspec(128, 40), c10::nullopt, 0, hann, 128, 32, 128, "none", true, "reflect",
+                              /*onesided=*/false),
+          1248, {-0.005695386789739132, -0.007327944505959749, 0.002643963322043419, -0.3287779987902013});
+}
+
+static void test_p8_detect_pitch_golden() {
+    // was: median within 1 Hz of 222.222
+    const auto sine = torch::sin(2.0 * PI * 220.0 * (torch::arange(8000.0) / 8000.0)).reshape({1, 8000});
+    const auto pf = detect_pitch_frequency(sine, 8000, 0.01, 30, 85, 3400);
+    TM_CHECK(pf.sizes() == torch::IntArrayRef({1, 85}));
+    TM_CHECK_CLOSE(pf.median().item<double>(), 222.22222900390625, 0.0);
+    TM_CHECK_CLOSE(pf.to(torch::kDouble).sum().item<double>(), 18888.88946533203, 1e-9);
+}
+
+// vad's float32 details, at trigger levels where they decide: T_a lies just above the float32 peak of torchaudio's
+// running mean (same float32 value), T_b one float32 ulp above it. A float64 mean update or a double trigger
+// comparison never triggers at T_a (torchaudio keeps 17600 samples); a float64 first FFT triggers at T_b (torchaudio
+// keeps none).
+static auto p8_vad_input(int k) -> torch::Tensor {
+    const auto t = torch::arange(16000, torch::kDouble) / 16000;
+    auto x = torch::zeros({24000}, torch::kDouble);
+    x.slice(0, 8000).copy_((0.5 + 0.03 * k) * torch::sin(2.0 * PI * (300 + 37 * k) * t) *
+                           (1.0 + 0.3 * torch::sin(2.0 * PI * 3.0 * t)));
+    return x + 1e-3 * torch::sin(torch::arange(24000, torch::kDouble) * 1.7);
+}
+
+static void test_p8_vad_float32_details() {
+    const auto x0 = p8_vad_input(0), x9 = p8_vad_input(9);
+    TM_CHECK(vad(x0, 16000, 6.55185329914093).size(-1) == 17600);
+    TM_CHECK(vad(x0, 16000, 6.551853656768799).size(-1) == 0);
+    TM_CHECK(vad(x9, 16000, 9.180870294570923).size(-1) == 17600);
+    TM_CHECK(vad(x9, 16000, 9.18087100982666).size(-1) == 0);
+}
+
+// progress08 review (R4 / R5): goldens for the contraction guards and rounding orders the checks above miss. A
+// non-dyadic flanger regen makes `buf[pos] = x[i] + last * fb` round its product; the two vad inputs move the running
+// mean's peak by one float32 ulp under a fused update (k = 2: down, torchaudio triggers; k = 3: up, it does not).
+static void test_p8r_contraction_rounding_goldens() {
+    const auto x8 = p8_signal(8000);
+    const auto xf = torch::stack({x8, -0.5 * x8, x8.flip(-1)}, 1).to(torch::kFloat); // (2, 3, 8000)
+    const std::vector<std::vector<int64_t>> fi = {{0, 0, 7999}, {1, 2, 4000}, {0, 1, 6543}};
+    check_p8_points(flanger(xf, 11025, 0.0, 2.0, 33.0), fi,
+                    {-0.27083340287208557, -0.28166210651397705, -0.043642912060022354, -100.26127612142591});
+    check_p8_points(flanger(xf, 16000, 2.0, 4.0, -60.0, 50.0, 1.3, 40.0, "triangular", "quadratic"), fi,
+                    {-0.17469710111618042, -0.22092105448246002, -0.03242168575525284, -75.89798872673418});
+    TM_CHECK(vad(p8_vad_input(2), 16000, 7.336863994598389).size(-1) == 17600);
+    TM_CHECK(vad(p8_vad_input(3), 16000, 7.673338413238525).size(-1) == 0);
+    // complex128 with window normalization (float64 throughout) and a 256-sample Hamming window, whose
+    // pow(2).sum().sqrt() and norm() differ by an ulp: the points pin torchaudio's order.
+    const auto y = inverse_spectrogram(p8_cspec(129, 30).to(torch::kComplexDouble), c10::nullopt, 0,
+                                       torch::hamming_window(256, torch::kDouble), 256, 64, 256, "window");
+    TM_CHECK(y.sizes() == torch::IntArrayRef({2, 1856}));
+    check_p8_points(y, {{0, 5}, {1, 600}, {0, 1855}, {1, 77}},
+                    {0.0010541268814275378, 0.014017398690561495, -0.011586462619845498, -0.01831374261231815,
+                     11.206352656362483});
+}
+
+// task54 -- rtf_power takes a one-hot Tensor reference_channel, as torchaudio's Union[int, Tensor] (A3-12).
+static void test_p8_rtf_power_onehot() {
+    const auto n = torch::arange(3 * 33 * 20, torch::kDouble);
+    const auto spec = torch::complex(torch::sin(n * 0.37), torch::cos(n * 0.11)).reshape({3, 33, 20});
+    const auto ms = (0.5 + 0.4 * torch::sin(torch::arange(33 * 20, torch::kDouble) * 0.23)).reshape({33, 20});
+    const auto psd_s = psd(spec, ms, true, 1e-15), psd_n = psd(spec, 1 - ms, true, 1e-15);
+    const auto check = [](const torch::Tensor &y, const std::vector<std::array<double, 2>> &g, double abs_sum) {
+        const int64_t idx[3][2] = {{0, 0}, {17, 2}, {32, 1}};
+        for (int i = 0; i < 3; ++i) {
+            TM_CHECK_CLOSE(torch::real(y[idx[i][0]][idx[i][1]]).item<double>(), g[i][0], 0.0);
+            TM_CHECK_CLOSE(torch::imag(y[idx[i][0]][idx[i][1]]).item<double>(), g[i][1], 0.0);
+        }
+        TM_CHECK_CLOSE(y.abs().sum().item<double>(), abs_sum, 1e-9);
+    };
+    const auto hot2 = torch::tensor({0.0, 0.0, 1.0}, torch::kDouble);
+    const std::vector<std::array<double, 2>> g4 = {{{-0.296236574230628, -0.21745892165267397}},
+                                                   {{4.479208589444909, 4.3021142204224816e-16}},
+                                                   {{-4.879832617959297, -1.1780757276937464}}};
+    check(rtf_power(psd_s, psd_n, hot2, 4), g4, 1888.8048663866557);
+    check(rtf_power(psd_s, psd_n, int64_t{2}, 4), g4, 1888.8048663866557);
+    check(rtf_power(psd_s, psd_n, torch::tensor({0.0, 1.0, 0.0}, torch::kDouble), 1),
+          {{{-0.042710191615246154, 0.4814843957076464}},
+           {{-0.04729701977633162, 0.12110025342143324}},
+           {{1.038341374264266, -1.3877787807814457e-17}}},
+          57.57918642408866);
+    TM_CHECK(raises_inv([&] { (void) rtf_power(psd_s, psd_n, hot2, 0); }));
+    TM_CHECK(raises_inv([&] { (void) rtf_power(psd_s, psd_n.slice(-1, 0, 2), hot2); }));
+}
+
 int main() {
     test_coverage_gaps();
     test_convolve_full_length();
@@ -1999,6 +2282,16 @@ int main() {
     TM_RUN(test_p4_detect_pitch_parity_and_validation);
     TM_RUN(test_p4_forced_align_parity);
     TM_RUN(test_p4_beamforming_goldens_and_validation);
+    TM_RUN(test_p8_biquad_designers_in_dtype);
+    TM_RUN(test_p8_phaser_flanger_loops);
+    TM_RUN(test_p8_device_input_runs_host_loops);
+    TM_RUN(test_p8_phase_vocoder_goldens);
+    TM_RUN(test_p8_inverse_spectrogram_options);
+    TM_RUN(test_p8_detect_pitch_golden);
+    TM_RUN(test_p8_vad_float32_details);
+    TM_RUN(test_p8_rtf_power_onehot);
+    TM_RUN(test_p8r_contraction_rounding_goldens);
+    // crash-class tests last (red runs keep the counts before them)
     TM_RUN(test_p4_forced_align_validation);
     TM_RUN(test_p4_vad_validation);
     TM_RUN(test_p4_rank_and_degenerate_checks);

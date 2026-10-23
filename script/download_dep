@@ -125,12 +125,13 @@ def _extract(archive_path, dest_dir):
 
 def _move_extracted(temp_dir, final_dest_dir):
     entries = os.listdir(temp_dir)
-    _ensure_clean_dir(final_dest_dir)
     if len(entries) == 1 and os.path.isdir(os.path.join(temp_dir, entries[0])):
-        shutil.move(os.path.join(temp_dir, entries[0]), final_dest_dir)
-    else:
-        for entry in entries:
-            shutil.move(os.path.join(temp_dir, entry), os.path.join(final_dest_dir, entry))
+        # unwrap the archive's top-level folder (libtorch/): CMake expects dependence/libtorch/share/cmake/Torch
+        temp_dir = os.path.join(temp_dir, entries[0])
+        entries = os.listdir(temp_dir)
+    _ensure_clean_dir(final_dest_dir)
+    for entry in entries:
+        shutil.move(os.path.join(temp_dir, entry), os.path.join(final_dest_dir, entry))
 
 
 # ---------------------------------------------------------------------------

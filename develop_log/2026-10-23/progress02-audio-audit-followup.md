@@ -248,3 +248,5 @@ D11 and the per-item choices under D10 are the implementer's; the orchestrator a
 - 2026-10-23 [ai] Orchestrator: accepted D2-D11, rebased onto ab03326 (AuxIVA) without conflicts; full build,
   ctest 7/7 (incl. audio_test_separation and the new audio_test_noexcept). CLAUDE.md coverage policy now covers every
   `_audio/*.hpp` (union, D11).
+- 2026-10-23 [ai] The PitchShift per-call kernel (D12 shortcut) and the stale readme: handled in
+  [progress08](progress08-audio-parity-followups.md) (D4, D8).

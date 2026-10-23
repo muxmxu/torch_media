@@ -8,6 +8,26 @@
 #include "../globel_include.hpp"
 
 namespace torchmedia::audio::functional {
+    namespace detail {
+        // float32/float64 input without autograd on another device (MPS, CUDA): the per-sample loops below run their
+        // CPU scalar loop on a host copy (torchaudio's CPU values). Their tensor-op form costs 0.1-1 ms per sample on
+        // MPS, and libtorch 2.5.1's MPS conv1d raises past 65536 samples (task51).
+        inline auto loop_on_host(const_tensor_lref_t t) -> bool {
+            return !t.is_cpu() && (t.scalar_type() == torch::kFloat || t.scalar_type() == torch::kDouble) &&
+                   !t.requires_grad();
+        }
+
+        // shortcut: libtorch 2.5.1's MPS backend (the PyTorch wheel and torchaudio too) returns garbage once ~64k
+        // index_put_ writes are queued without a sync; the per-sample tensor loops below flush every 8192 steps.
+        // That fixes the forward pass only: a backward pass through these loops on MPS exhausts GPU memory beyond
+        // about 20k samples (NaN / garbage, or an abort; torchaudio raises). Drop it once upstream MPS is fixed.
+        inline void mps_flush(const_tensor_lref_t t, int64_t step) {
+            if (t.is_mps() && step % 8192 == 8191) {
+                torch::mps::synchronize();
+            }
+        }
+    } // namespace detail
+
     // Core IIR difference-equation evaluator (mirrors torchaudio's compiled _lfilter op: FIR with b/a0 as a grouped
     // conv1d, then the recurrence with a/a0). `waveform` is (n_batch, n_channel, n_sample); coeffs are
     // (n_channel, n_order) ordered [a0, a1, ...] (lower delay first). The recurrence runs as torchaudio's scalar CPU
@@ -32,6 +52,9 @@ namespace torchmedia::audio::functional {
         if (n_order <= 0) {
             return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
                                                                       "Expected n_order to be positive.");
+        }
+        if (detail::loop_on_host(waveform) && !a_coeffs.requires_grad() && !b_coeffs.requires_grad()) {
+            return _lfilter_core(waveform.cpu(), a_coeffs.cpu(), b_coeffs.cpu()).to(waveform.device());
         }
 
         // FIR part (b/a0) * x for all samples at once: a depthwise conv1d over the left-padded input.
@@ -77,6 +100,7 @@ namespace torchmedia::audio::functional {
                 const auto corr = torch::matmul(windowed.transpose(0, 1), a_flipped_3).squeeze(-1).t(); // (nb, nc)
                 padded_output.index_put_({Slice(), Slice(), i + n_order - 1},
                                          input_signal_windows.index({Slice(), Slice(), i}) - corr);
+                detail::mps_flush(padded_output, i);
             }
         }
         return padded_output.index({Slice(), Slice(), Slice(n_order - 1, None)});
@@ -133,6 +157,15 @@ namespace torchmedia::audio::functional {
         return lfilter(waveform, a_coeffs, b_coeffs);
     }
 
+    // biquad with 0-D (or 1-element) coefficient tensors, as torchaudio's designers pass them.
+    inline auto biquad(const_tensor_lref_t waveform, const_tensor_lref_t b0, const_tensor_lref_t b1,
+                       const_tensor_lref_t b2, const_tensor_lref_t a0, const_tensor_lref_t a1, const_tensor_lref_t a2)
+            -> tensor_t {
+        const auto o = waveform.options();
+        return lfilter(waveform, torch::cat({a0.to(o).view(1), a1.to(o).view(1), a2.to(o).view(1)}),
+                       torch::cat({b0.to(o).view(1), b1.to(o).view(1), b2.to(o).view(1)}));
+    }
+
     // Zero-phase forward-backward IIR filtering (mirrors torchaudio.functional.filtfilt).
     inline auto filtfilt(const_tensor_lref_t waveform, const_tensor_lref_t a_coeffs, const_tensor_lref_t b_coeffs,
                          bool clamp = true) -> tensor_t {
@@ -143,113 +176,124 @@ namespace torchmedia::audio::functional {
     }
 
     // ---- biquad filter designers (Audio EQ Cookbook / SoX) — all delegate to biquad (task02) ----
+    // Like torchaudio, the frequency / Q / gain designers compute their coefficients as 0-D tensors in the waveform's
+    // dtype and device, op for op (float32 input: float32 coefficients, bit-exact with torchaudio; task50).
     namespace detail {
         inline constexpr double pi = 3.14159265358979323846;
-    }
+
+        // torch.as_tensor(value, dtype=waveform.dtype, device=waveform.device); on the host when the filter loop runs
+        // there (loop_on_host), so the result is torchaudio's CPU one (MPS sin / cos / exp round differently).
+        inline auto as_coeff(double value, const_tensor_lref_t waveform) -> tensor_t {
+            return torch::scalar_tensor(value, loop_on_host(waveform) ? waveform.options().device(torch::kCPU)
+                                                                      : waveform.options());
+        }
+    } // namespace detail
 
     // Two-pole all-pass filter (EQ Cookbook APF).
     inline auto allpass_biquad(const_tensor_lref_t waveform, int sample_rate, double central_freq, double Q = 0.707)
             -> tensor_t {
-        const double w0 = 2.0 * detail::pi * central_freq / sample_rate;
-        const double alpha = std::sin(w0) / 2.0 / Q;
-        return biquad(waveform, 1.0 - alpha, -2.0 * std::cos(w0), 1.0 + alpha, 1.0 + alpha, -2.0 * std::cos(w0),
-                      1.0 - alpha);
+        const auto w0 = 2 * detail::pi * detail::as_coeff(central_freq, waveform) / sample_rate;
+        const auto alpha = torch::sin(w0) / 2 / detail::as_coeff(Q, waveform);
+        return biquad(waveform, 1 - alpha, -2 * torch::cos(w0), 1 + alpha, 1 + alpha, -2 * torch::cos(w0), 1 - alpha);
     }
 
     // Biquad low-pass filter (EQ Cookbook LPF).
     inline auto lowpass_biquad(const_tensor_lref_t waveform, int sample_rate, double cutoff_freq, double Q = 0.707)
             -> tensor_t {
-        const double w0 = 2.0 * detail::pi * cutoff_freq / sample_rate;
-        const double alpha = std::sin(w0) / 2.0 / Q;
-        const double b0 = (1.0 - std::cos(w0)) / 2.0;
-        return biquad(waveform, b0, 1.0 - std::cos(w0), b0, 1.0 + alpha, -2.0 * std::cos(w0), 1.0 - alpha);
+        const auto w0 = 2 * detail::pi * detail::as_coeff(cutoff_freq, waveform) / sample_rate;
+        const auto alpha = torch::sin(w0) / 2 / detail::as_coeff(Q, waveform);
+        const auto b0 = (1 - torch::cos(w0)) / 2;
+        return biquad(waveform, b0, 1 - torch::cos(w0), b0, 1 + alpha, -2 * torch::cos(w0), 1 - alpha);
     }
 
     // Biquad high-pass filter (EQ Cookbook HPF).
     inline auto highpass_biquad(const_tensor_lref_t waveform, int sample_rate, double cutoff_freq, double Q = 0.707)
             -> tensor_t {
-        const double w0 = 2.0 * detail::pi * cutoff_freq / sample_rate;
-        const double alpha = std::sin(w0) / 2.0 / Q;
-        const double b0 = (1.0 + std::cos(w0)) / 2.0;
-        return biquad(waveform, b0, -1.0 - std::cos(w0), b0, 1.0 + alpha, -2.0 * std::cos(w0), 1.0 - alpha);
+        const auto w0 = 2 * detail::pi * detail::as_coeff(cutoff_freq, waveform) / sample_rate;
+        const auto alpha = torch::sin(w0) / 2.0 / detail::as_coeff(Q, waveform);
+        const auto b0 = (1 + torch::cos(w0)) / 2;
+        return biquad(waveform, b0, -1 - torch::cos(w0), b0, 1 + alpha, -2 * torch::cos(w0), 1 - alpha);
     }
 
     // Two-pole band-pass filter (EQ Cookbook BPF). const_skirt_gain=true -> constant skirt gain (peak gain Q).
     inline auto bandpass_biquad(const_tensor_lref_t waveform, int sample_rate, double central_freq, double Q = 0.707,
                                 bool const_skirt_gain = false) -> tensor_t {
-        const double w0 = 2.0 * detail::pi * central_freq / sample_rate;
-        const double alpha = std::sin(w0) / 2.0 / Q;
-        const double temp = const_skirt_gain ? std::sin(w0) / 2.0 : alpha;
-        return biquad(waveform, temp, 0.0, -temp, 1.0 + alpha, -2.0 * std::cos(w0), 1.0 - alpha);
+        const auto w0 = 2 * detail::pi * detail::as_coeff(central_freq, waveform) / sample_rate;
+        const auto alpha = torch::sin(w0) / 2 / detail::as_coeff(Q, waveform);
+        const auto temp = const_skirt_gain ? torch::sin(w0) / 2 : alpha;
+        return biquad(waveform, temp, detail::as_coeff(0.0, waveform), -temp, 1 + alpha, -2 * torch::cos(w0),
+                      1 - alpha);
     }
 
     // Two-pole band-reject (notch) filter (EQ Cookbook notch).
     inline auto bandreject_biquad(const_tensor_lref_t waveform, int sample_rate, double central_freq, double Q = 0.707)
             -> tensor_t {
-        const double w0 = 2.0 * detail::pi * central_freq / sample_rate;
-        const double alpha = std::sin(w0) / 2.0 / Q;
-        return biquad(waveform, 1.0, -2.0 * std::cos(w0), 1.0, 1.0 + alpha, -2.0 * std::cos(w0), 1.0 - alpha);
+        const auto w0 = 2 * detail::pi * detail::as_coeff(central_freq, waveform) / sample_rate;
+        const auto alpha = torch::sin(w0) / 2 / detail::as_coeff(Q, waveform);
+        const auto one = detail::as_coeff(1.0, waveform);
+        return biquad(waveform, one, -2 * torch::cos(w0), one, 1 + alpha, -2 * torch::cos(w0), 1 - alpha);
     }
 
     // Peaking-EQ biquad (EQ Cookbook peakingEQ).
     inline auto equalizer_biquad(const_tensor_lref_t waveform, int sample_rate, double center_freq, double gain,
                                  double Q = 0.707) -> tensor_t {
-        const double w0 = 2.0 * detail::pi * center_freq / sample_rate;
-        const double A = std::exp(gain / 40.0 * std::log(10.0));
-        const double alpha = std::sin(w0) / 2.0 / Q;
-        return biquad(waveform, 1.0 + alpha * A, -2.0 * std::cos(w0), 1.0 - alpha * A, 1.0 + alpha / A,
-                      -2.0 * std::cos(w0), 1.0 - alpha / A);
+        const auto w0 = 2 * detail::pi * detail::as_coeff(center_freq, waveform) / sample_rate;
+        const auto A = torch::exp(detail::as_coeff(gain, waveform) / 40.0 * std::log(10.0));
+        const auto alpha = torch::sin(w0) / 2 / detail::as_coeff(Q, waveform);
+        return biquad(waveform, 1 + alpha * A, -2 * torch::cos(w0), 1 - alpha * A, 1 + alpha / A, -2 * torch::cos(w0),
+                      1 - alpha / A);
     }
 
     // Two-pole band filter mimicking SoX 'band' (exponential bandwidth, not the cookbook BPF).
     inline auto band_biquad(const_tensor_lref_t waveform, int sample_rate, double central_freq, double Q = 0.707,
                             bool noise = false) -> tensor_t {
-        const double w0 = 2.0 * detail::pi * central_freq / sample_rate;
-        const double bw_Hz = central_freq / Q;
-        const double a0 = 1.0;
-        const double a2 = std::exp(-2.0 * detail::pi * bw_Hz / sample_rate);
-        const double a1 = -4.0 * a2 / (1.0 + a2) * std::cos(w0);
-        double b0 = std::sqrt(1.0 - a1 * a1 / (4.0 * a2)) * (1.0 - a2);
+        const auto f = detail::as_coeff(central_freq, waveform);
+        const auto w0 = 2 * detail::pi * f / sample_rate;
+        const auto bw_Hz = f / detail::as_coeff(Q, waveform);
+        const auto a2 = torch::exp(-2 * detail::pi * bw_Hz / sample_rate);
+        const auto a1 = -4 * a2 / (1 + a2) * torch::cos(w0);
+        auto b0 = torch::sqrt(1 - a1 * a1 / (4 * a2)) * (1 - a2);
         if (noise) {
-            const double mult = std::sqrt(((1.0 + a2) * (1.0 + a2) - a1 * a1) * (1.0 - a2) / (1.0 + a2)) / b0;
-            b0 *= mult;
+            const auto mult = torch::sqrt(((1 + a2) * (1 + a2) - a1 * a1) * (1 - a2) / (1 + a2)) / b0;
+            b0 = mult * b0;
         }
-        return biquad(waveform, b0, 0.0, 0.0, a0, a1, a2);
+        const auto zero = detail::as_coeff(0.0, waveform);
+        return biquad(waveform, b0, zero, zero, detail::as_coeff(1.0, waveform), a1, a2);
     }
 
     // Low-shelf (bass tone-control) biquad (EQ Cookbook lowShelf).
     inline auto bass_biquad(const_tensor_lref_t waveform, int sample_rate, double gain, double central_freq = 100.0,
                             double Q = 0.707) -> tensor_t {
-        const double w0 = 2.0 * detail::pi * central_freq / sample_rate;
-        const double alpha = std::sin(w0) / 2.0 / Q;
-        const double A = std::exp(gain / 40.0 * std::log(10.0));
-        const double temp1 = 2.0 * std::sqrt(A) * alpha;
-        const double temp2 = (A - 1.0) * std::cos(w0);
-        const double temp3 = (A + 1.0) * std::cos(w0);
-        const double b0 = A * ((A + 1.0) - temp2 + temp1);
-        const double b1 = 2.0 * A * ((A - 1.0) - temp3);
-        const double b2 = A * ((A + 1.0) - temp2 - temp1);
-        const double a0 = (A + 1.0) + temp2 + temp1;
-        const double a1 = -2.0 * ((A - 1.0) + temp3);
-        const double a2 = (A + 1.0) + temp2 - temp1;
+        const auto w0 = 2 * detail::pi * detail::as_coeff(central_freq, waveform) / sample_rate;
+        const auto alpha = torch::sin(w0) / 2 / detail::as_coeff(Q, waveform);
+        const auto A = torch::exp(detail::as_coeff(gain, waveform) / 40 * std::log(10.0));
+        const auto temp1 = 2 * torch::sqrt(A) * alpha;
+        const auto temp2 = (A - 1) * torch::cos(w0);
+        const auto temp3 = (A + 1) * torch::cos(w0);
+        const auto b0 = A * ((A + 1) - temp2 + temp1);
+        const auto b1 = 2 * A * ((A - 1) - temp3);
+        const auto b2 = A * ((A + 1) - temp2 - temp1);
+        const auto a0 = (A + 1) + temp2 + temp1;
+        const auto a1 = -2 * ((A - 1) + temp3);
+        const auto a2 = (A + 1) + temp2 - temp1;
         return biquad(waveform, b0 / a0, b1 / a0, b2 / a0, a0 / a0, a1 / a0, a2 / a0);
     }
 
     // High-shelf (treble tone-control) biquad (EQ Cookbook highShelf).
     inline auto treble_biquad(const_tensor_lref_t waveform, int sample_rate, double gain, double central_freq = 3000.0,
                               double Q = 0.707) -> tensor_t {
-        const double w0 = 2.0 * detail::pi * central_freq / sample_rate;
-        const double alpha = std::sin(w0) / 2.0 / Q;
-        const double A = std::exp(gain / 40.0 * std::log(10.0));
-        const double temp1 = 2.0 * std::sqrt(A) * alpha;
-        const double temp2 = (A - 1.0) * std::cos(w0);
-        const double temp3 = (A + 1.0) * std::cos(w0);
-        const double b0 = A * ((A + 1.0) + temp2 + temp1);
-        const double b1 = -2.0 * A * ((A - 1.0) + temp3);
-        const double b2 = A * ((A + 1.0) + temp2 - temp1);
-        const double a0 = (A + 1.0) - temp2 + temp1;
-        const double a1 = 2.0 * ((A - 1.0) - temp3);
-        const double a2 = (A + 1.0) - temp2 - temp1;
+        const auto w0 = 2 * detail::pi * detail::as_coeff(central_freq, waveform) / sample_rate;
+        const auto alpha = torch::sin(w0) / 2 / detail::as_coeff(Q, waveform);
+        const auto A = torch::exp(detail::as_coeff(gain, waveform) / 40 * std::log(10.0));
+        const auto temp1 = 2 * torch::sqrt(A) * alpha;
+        const auto temp2 = (A - 1) * torch::cos(w0);
+        const auto temp3 = (A + 1) * torch::cos(w0);
+        const auto b0 = A * ((A + 1) + temp2 + temp1);
+        const auto b1 = -2 * A * ((A - 1) + temp3);
+        const auto b2 = A * ((A + 1) + temp2 - temp1);
+        const auto a0 = (A + 1) - temp2 + temp1;
+        const auto a1 = 2 * ((A - 1) - temp3);
+        const auto a2 = (A + 1) - temp2 - temp1;
         return biquad(waveform, b0, b1, b2, a0, a1, a2);
     }
 
@@ -270,7 +314,10 @@ namespace torchmedia::audio::functional {
         }
         const double w0 = 2.0 * detail::pi * central_freq / sample_rate;
         const double A = std::exp(gain / 40.0 * std::log(10.0));
-        const double alpha = std::sin(w0) / 2.0 * std::sqrt((A + 1.0 / A) * (1.0 / width_slope - 1.0) + 2.0);
+        // torchaudio designs these two in Python double math: one product per statement, so that no a * b + c is
+        // contracted into a fused multiply-add (clang's default -ffp-contract=on works within an expression).
+        const double slope = (A + 1.0 / A) * (1.0 / width_slope - 1.0);
+        const double alpha = std::sin(w0) / 2.0 * std::sqrt(slope + 2.0);
         const double temp1 = 2.0 * std::sqrt(A) * alpha;
         const double temp2 = (A - 1.0) * std::cos(w0);
         const double temp3 = (A + 1.0) * std::cos(w0);
@@ -314,11 +361,13 @@ namespace torchmedia::audio::functional {
         const double a0 = 1.0, a1 = -(poles[0] + poles[1]), a2 = poles[0] * poles[1];
         // Normalise to 0 dB at 1 kHz.
         const double y = 2.0 * detail::pi * 1000.0 / sample_rate;
-        const double b_re = b0 + b1 * std::cos(-y) + b2 * std::cos(-2.0 * y);
-        const double a_re = a0 + a1 * std::cos(-y) + a2 * std::cos(-2.0 * y);
-        const double b_im = b1 * std::sin(-y) + b2 * std::sin(-2.0 * y);
-        const double a_im = a1 * std::sin(-y) + a2 * std::sin(-2.0 * y);
-        const double g = 1.0 / std::sqrt((b_re * b_re + b_im * b_im) / (a_re * a_re + a_im * a_im));
+        // One product per statement (see deemph_biquad).
+        const double c1 = std::cos(-y), c2 = std::cos(-2.0 * y), s1 = std::sin(-y), s2 = std::sin(-2.0 * y);
+        const double b1c = b1 * c1, b2c = b2 * c2, a1c = a1 * c1, a2c = a2 * c2;
+        const double b1s = b1 * s1, b2s = b2 * s2, a1s = a1 * s1, a2s = a2 * s2;
+        const double b_re = b0 + b1c + b2c, a_re = a0 + a1c + a2c, b_im = b1s + b2s, a_im = a1s + a2s;
+        const double b_re2 = b_re * b_re, b_im2 = b_im * b_im, a_re2 = a_re * a_re, a_im2 = a_im * a_im;
+        const double g = 1.0 / std::sqrt((b_re2 + b_im2) / (a_re2 + a_im2));
         b0 *= g;
         b1 *= g;
         b2 *= g;
@@ -453,14 +502,15 @@ namespace torchmedia::audio::functional {
 
     inline auto _db2linear(double x) -> double { return std::exp(x * std::log(10.0) / 20.0); }
 
-    // Wave-table generator for phaser/flanger LFOs (mirrors _generate_wave_table).
+    // Wave-table generator for phaser/flanger LFOs (mirrors _generate_wave_table). The float64 math runs on the CPU
+    // (MPS has no float64) and the int32 / float32 table is moved to `dev`'s device.
     inline auto _generate_wave_table(const std::string &wave_type, const std::string &data_type, int64_t table_size,
                                      double mn, double mx, double phase, const tensor_options_t &dev) -> tensor_t {
         using namespace torch::indexing;
         const int64_t phase_offset = static_cast<int64_t>(phase / detail::pi / 2.0 * table_size + 0.5);
-        const auto t = torch::arange(table_size, tensor_options_t(dev).dtype(torch::kInt32));
+        const auto t = torch::arange(table_size, torch::kInt32);
         const auto point = (t + phase_offset).remainder(table_size);
-        auto d = torch::zeros_like(point, tensor_options_t(dev).dtype(torch::kFloat64));
+        auto d = torch::zeros_like(point, torch::kFloat64);
         if (wave_type == "SINE") {
             d = (torch::sin(point.to(torch::kFloat64) / table_size * 2.0 * detail::pi) + 1.0) / 2.0;
         } else { // TRIANGLE
@@ -477,12 +527,15 @@ namespace torchmedia::audio::functional {
         } else {
             d = d.to(torch::kFloat32);
         }
-        return d;
+        return d.to(dev.device());
     }
 
     // Overdrive (SoX): waveshaper + a leaky-integrator recursion.
     inline auto overdrive(const_tensor_lref_t waveform_in, double gain = 20.0, double colour = 20.0) -> tensor_t {
         using namespace torch::indexing;
+        if (detail::loop_on_host(waveform_in)) {
+            return overdrive(waveform_in.cpu(), gain, colour).to(waveform_in.device());
+        }
         const auto actual_shape = waveform_in.sizes().vec();
         const auto waveform = waveform_in.reshape({-1, actual_shape.back()});
         const double g = _db2linear(gain);
@@ -524,12 +577,14 @@ namespace torchmedia::audio::functional {
                 last_out = ti - last_in + 0.995 * last_out;
                 last_in = ti;
                 output.index_put_({Slice(), i}, waveform.index({Slice(), i}) * 0.5 + last_out * 0.75);
+                detail::mps_flush(output, i);
             }
         }
         return torch::clamp(output, -1.0, 1.0).reshape(actual_shape);
     }
 
-    // Phaser (SoX): modulated feedback delay line.
+    // Phaser (SoX): modulated feedback delay line. float32/float64 CPU input without autograd runs torchaudio's
+    // per-sample loop as a scalar loop per row (same float ops, bit-exact); anything else runs it as tensor ops.
     inline auto phaser(const_tensor_lref_t waveform_in, int sample_rate, double gain_in = 0.4, double gain_out = 0.74,
                        double delay_ms = 3.0, double decay = 0.4, double mod_speed = 0.5, bool sinusoidal = true)
             -> tensor_t {
@@ -544,28 +599,62 @@ namespace torchmedia::audio::functional {
                     torch::empty({1}),
                     "phaser: delay_ms and mod_speed must give delay and LFO buffers of >= 1 sample.");
         }
+        if (detail::loop_on_host(waveform_in)) {
+            return phaser(waveform_in.cpu(), sample_rate, gain_in, gain_out, delay_ms, decay, mod_speed, sinusoidal)
+                    .to(waveform_in.device());
+        }
         const auto delay_buf_len = static_cast<int64_t>(delay_len);
-        auto delay_buf = torch::zeros({waveform.size(0), delay_buf_len}, waveform.options());
         const auto mod_buf_len = static_cast<int64_t>(mod_len);
-        const auto mod_buf =
-                _generate_wave_table(sinusoidal ? "SINE" : "TRIANGLE", "INT", mod_buf_len, 1.0,
-                                     static_cast<double>(delay_buf_len), detail::pi / 2.0, waveform.options());
-        const auto mod_acc = mod_buf.accessor<int32_t, 1>();
-        int64_t delay_pos = 0, mod_pos = 0;
+        const auto mod_buf = _generate_wave_table(sinusoidal ? "SINE" : "TRIANGLE", "INT", mod_buf_len, 1.0,
+                                                  static_cast<double>(delay_buf_len), detail::pi / 2.0,
+                                                  tensor_options_t()); // on the CPU: read element-wise below
+        const int32_t *mod = mod_buf.const_data_ptr<int32_t>(); // values in [1, delay_buf_len]
         waveform = waveform * gain_in;
         const int64_t T = waveform.size(1);
-        std::vector<tensor_t> out_cols;
-        out_cols.reserve(T);
-        for (int64_t i = 0; i < T; ++i) {
-            const int64_t idx = (delay_pos + mod_acc[mod_pos]) % delay_buf_len;
-            mod_pos = (mod_pos + 1) % mod_buf_len;
-            delay_pos = (delay_pos + 1) % delay_buf_len;
-            const auto temp = waveform.index({Slice(), i}) + delay_buf.index({Slice(), idx});
-            delay_buf.index_put_({Slice(), delay_pos}, temp * decay);
-            out_cols.push_back(temp);
+        const auto dtype = waveform.scalar_type();
+        tensor_t output;
+        if (waveform.is_cpu() && (dtype == torch::kFloat || dtype == torch::kDouble) && !waveform.requires_grad()) {
+            const auto in = waveform.contiguous();
+            output = torch::empty_like(in);
+            AT_DISPATCH_FLOATING_TYPES(dtype, "phaser_loop", [&] {
+                const auto dec = static_cast<scalar_t>(decay);
+                const scalar_t *src = in.const_data_ptr<scalar_t>();
+                scalar_t *dst = output.mutable_data_ptr<scalar_t>();
+                at::parallel_for(0, in.size(0), 1, [&](int64_t begin, int64_t end) {
+                    std::vector<scalar_t> buf(delay_buf_len);
+                    for (int64_t row = begin; row < end; ++row) {
+                        std::fill(buf.begin(), buf.end(), scalar_t(0) * dec); // torchaudio: delay_buf * decay
+                        const scalar_t *x = src + row * T;
+                        scalar_t *y = dst + row * T;
+                        int64_t delay_pos = 0, mod_pos = 0;
+                        for (int64_t i = 0; i < T; ++i) {
+                            const int64_t idx = (delay_pos + mod[mod_pos]) % delay_buf_len;
+                            mod_pos = (mod_pos + 1) % mod_buf_len;
+                            delay_pos = (delay_pos + 1) % delay_buf_len;
+                            const scalar_t temp = x[i] + buf[idx];
+                            buf[delay_pos] = temp * dec;
+                            y[i] = temp;
+                        }
+                    }
+                });
+            });
+        } else { // other devices, autograd, other dtypes: torchaudio's loop as tensor ops
+            auto delay_buf = torch::zeros({waveform.size(0), delay_buf_len}, waveform.options()) * decay;
+            int64_t delay_pos = 0, mod_pos = 0;
+            std::vector<tensor_t> out_cols;
+            out_cols.reserve(T);
+            for (int64_t i = 0; i < T; ++i) {
+                const int64_t idx = (delay_pos + mod[mod_pos]) % delay_buf_len;
+                mod_pos = (mod_pos + 1) % mod_buf_len;
+                delay_pos = (delay_pos + 1) % delay_buf_len;
+                const auto temp = waveform.index({Slice(), i}) + delay_buf.index({Slice(), idx});
+                delay_buf.index_put_({Slice(), delay_pos}, temp * decay);
+                out_cols.push_back(temp);
+                detail::mps_flush(delay_buf, i);
+            }
+            output = torch::stack(out_cols, 1);
         }
-        auto output = torch::stack(out_cols, 1) * gain_out;
-        return torch::clamp(output, -1.0, 1.0).reshape(actual_shape);
+        return torch::clamp(output * gain_out, -1.0, 1.0).reshape(actual_shape);
     }
 
     // Flanger (SoX): modulated circular delay line with feedback and linear/quadratic interpolation.
@@ -600,23 +689,98 @@ namespace torchmedia::audio::functional {
         const double in_gain = 1.0 / (1.0 + delay_gain);
         delay_gain = delay_gain / (1.0 + delay_gain);
         delay_gain = delay_gain * (1.0 - std::abs(feedback_gain));
-        int64_t delay_buf_length = static_cast<int64_t>((delay_min + delay_depth) * sample_rate + 0.5) + 2;
-        auto delay_bufs = torch::zeros({waveform.size(0), n_channels, delay_buf_length}, waveform.options());
-        auto delay_last = torch::zeros({waveform.size(0), n_channels}, waveform.options());
-        const int64_t lfo_length = static_cast<int64_t>(sample_rate / speed);
+        // torchaudio raises on an empty LFO (ZeroDivisionError) or a delay buffer < 1 sample (negative dimension);
+        // the bounds also keep every int cast below defined.
+        const double buf_len = (delay_min + delay_depth) * sample_rate + 0.5, lfo_len = sample_rate / speed;
+        if (!(buf_len > -2.0 && buf_len < 1e15 && std::abs(delay_min * sample_rate) < 1e15 && lfo_len >= 1.0 &&
+              lfo_len < 1e15 && std::abs(channel_phase * lfo_len * n_channels) < 1e15)) {
+            return handle_exceptions<tensor_t, std::invalid_argument>(
+                    torch::empty({1}), "flanger: delay, depth, speed and phase must give finite delay and LFO buffers "
+                                       "of >= 1 sample.");
+        }
+        if (detail::loop_on_host(waveform_in)) {
+            return flanger(waveform_in.cpu(), sample_rate, delay, depth, regen, width, speed, phase, modulation,
+                           interpolation)
+                    .to(waveform_in.device());
+        }
+        const int64_t delay_buf_length = static_cast<int64_t>(buf_len) + 2;
+        const auto lfo_length = static_cast<int64_t>(lfo_len);
         const double table_min = std::floor(delay_min * sample_rate + 0.5);
         const double table_max = delay_buf_length - 2.0;
         const auto lfo = _generate_wave_table(modulation == "sinusoidal" ? "SINE" : "TRIANGLE", "FLOAT", lfo_length,
                                               table_min, table_max, 3.0 * detail::pi / 2.0, waveform.options());
+        const int64_t T = waveform.size(-1);
+        const auto dtype = waveform.scalar_type();
+        if (waveform.is_cpu() && (dtype == torch::kFloat || dtype == torch::kDouble) && !waveform.requires_grad()) {
+            // torchaudio's per-sample loop as a scalar loop per (batch, channel) row: one rounding per torchaudio
+            // tensor op (separate statements, so -ffp-contract=on fuses nothing); indices are Python-style remainders.
+            const auto in = waveform.contiguous();
+            auto output = torch::empty_like(in);
+            const float *lf = lfo.const_data_ptr<float>();
+            const bool linear = interpolation == "linear";
+            const auto pymod = [](int64_t a, int64_t n) { return ((a % n) + n) % n; };
+            AT_DISPATCH_FLOATING_TYPES(dtype, "flanger_loop", [&] {
+                const auto fb = static_cast<scalar_t>(feedback_gain), ig = static_cast<scalar_t>(in_gain),
+                           dg = static_cast<scalar_t>(delay_gain);
+                const scalar_t *src = in.const_data_ptr<scalar_t>();
+                scalar_t *dst = output.mutable_data_ptr<scalar_t>();
+                at::parallel_for(0, in.size(0) * n_channels, 1, [&](int64_t begin, int64_t end) {
+                    std::vector<scalar_t> buf(delay_buf_length);
+                    for (int64_t row = begin; row < end; ++row) {
+                        // (channel_idxs * lfo_length * channel_phase + 0.5).to(int64): float32 tensor arithmetic
+                        const float ph =
+                                static_cast<float>((row % n_channels) * lfo_length) * static_cast<float>(channel_phase);
+                        const int64_t ch_phase = pymod(static_cast<int64_t>(ph + 0.5f), lfo_length);
+                        std::fill(buf.begin(), buf.end(), scalar_t(0));
+                        const scalar_t *x = src + row * T;
+                        scalar_t *y = dst + row * T;
+                        scalar_t last = 0;
+                        int64_t pos = 0;
+                        for (int64_t i = 0; i < T; ++i) {
+                            pos = (pos + delay_buf_length - 1) % delay_buf_length;
+                            const float d = lf[(i % lfo_length + ch_phase) % lfo_length];
+                            const auto frac = static_cast<scalar_t>(d - std::trunc(d)); // torch.frac on float32
+                            const auto k = static_cast<int64_t>(std::floor(d));
+                            const scalar_t fed = last * fb;
+                            buf[pos] = x[i] + fed;
+                            const scalar_t d0 = buf[pymod(pos + k, delay_buf_length)];
+                            const scalar_t d1 = buf[pymod(pos + k + 1, delay_buf_length)];
+                            scalar_t delayed;
+                            if (linear) {
+                                const scalar_t step = (d1 - d0) * frac;
+                                delayed = d0 + step;
+                            } else {
+                                const scalar_t e2 = buf[pymod(pos + k + 2, delay_buf_length)] - d0;
+                                const scalar_t e1 = d1 - d0;
+                                const scalar_t half_e2 = e2 * scalar_t(0.5);
+                                const scalar_t two_e1 = e1 * scalar_t(2);
+                                const scalar_t a = half_e2 - e1;
+                                const scalar_t b = two_e1 - half_e2;
+                                const scalar_t afrac = a * frac;
+                                const scalar_t inner = afrac + b;
+                                const scalar_t step = inner * frac;
+                                delayed = d0 + step;
+                            }
+                            last = delayed;
+                            const scalar_t dry = x[i] * ig;
+                            const scalar_t wet = delayed * dg;
+                            y[i] = dry + wet;
+                        }
+                    }
+                });
+            });
+            return torch::clamp(output, -1.0, 1.0).reshape(actual_shape);
+        }
+        // Other devices, autograd, other dtypes: torchaudio's loop as tensor ops.
+        auto delay_bufs = torch::zeros({waveform.size(0), n_channels, delay_buf_length}, waveform.options());
+        auto delay_last = torch::zeros({waveform.size(0), n_channels}, waveform.options());
         auto output = torch::zeros_like(waveform);
         int64_t delay_buf_pos = 0, lfo_pos = 0;
         const auto channel_idxs =
                 torch::arange(0, n_channels, tensor_options_t().dtype(torch::kLong).device(waveform.device()));
-        const int64_t T = waveform.size(-1);
+        const auto cur_channel_phase = (channel_idxs * lfo_length * channel_phase + 0.5).to(torch::kLong); // (C,)
         for (int64_t i = 0; i < T; ++i) {
             delay_buf_pos = (delay_buf_pos + delay_buf_length - 1) % delay_buf_length;
-            const auto cur_channel_phase =
-                    (channel_idxs * lfo_length * channel_phase + 0.5).to(torch::kLong); // (channels,)
             const auto delay_tensor0 = lfo.index({(lfo_pos + cur_channel_phase).remainder(lfo_length)});
             const auto frac_delay = torch::frac(delay_tensor0);
             auto int_delay = torch::floor(delay_tensor0).to(torch::kLong); // (channels,)
@@ -643,6 +807,7 @@ namespace torchmedia::audio::functional {
             delay_last = delayed;
             output.index_put_({Slice(), Slice(), i}, temp * in_gain + delayed * delay_gain);
             lfo_pos = (lfo_pos + 1) % lfo_length;
+            detail::mps_flush(output, i);
         }
         return torch::clamp(output, -1.0, 1.0).reshape(actual_shape);
     }

@@ -4,6 +4,8 @@
 // PitchShift, TimeStretch. The headline state is the cached sinc resample kernel (Resample) and the
 // cached phase-advance vector (TimeStretch); Speed/SpeedPerturbation/PitchShift reuse the resampling
 // machinery. See develop_log 2026-06-01/progress02 (G1 kernel split, D8 eager kernel) and task21.
+#include <memory>
+#include <mutex>
 #include <numeric>
 #include <utility>
 #include <vector>
@@ -178,8 +180,8 @@ namespace torchmedia::audio::transform {
     };
 
     // ---------------- PitchShift (stft -> phase_vocoder -> istft -> resample, eager float32 kernel) ----------------
-    // API differences: always a Hann window (torchaudio: window_fn/wkwargs); float64 input works directly (torchaudio
-    // needs .double() on the module).
+    // API differences: always a Hann window (torchaudio: window_fn/wkwargs); float64 input works directly and gives
+    // torchaudio's module after .double() (torchaudio needs that call; its float32 window buffer is cast up, as here).
     typedef struct pitch_shift_option {
         int _sample_rate = 16000;
         double _n_steps = 0; // fractional steps allowed (torchaudio: "(fractional) steps to shift")
@@ -233,7 +235,7 @@ namespace torchmedia::audio::transform {
                 auto kw = functional::_sinc_resample_kernel(_orig_freq, _opt._sample_rate, _gcd,
                                                             functional::resample_option(),
                                                             tensor_options_t().dtype(torch::kFloat));
-                _kernel = kw.first;
+                _kernels->list.push_back(kw.first);
                 _width = kw.second;
             }
         }
@@ -245,20 +247,11 @@ namespace torchmedia::audio::transform {
             }
             const auto stretched = functional::_stretch_waveform(
                     waveform, _opt._n_steps, _opt._bins_per_octave, _opt._n_fft, c10::optional<int>(_win_length),
-                    c10::optional<int>(_hop_length), c10::optional<tensor_t>(_window.to(waveform.device())));
+                    c10::optional<int>(_hop_length), c10::optional<tensor_t>(_window.to(waveform.options())));
             tensor_t shifted = stretched;
             if (_orig_freq != _opt._sample_rate) {
-                // torchaudio builds the kernel lazily in the input's dtype; the cached one is float32 (the common
-                // case). shortcut: a non-float32 input rebuilds the kernel per call (functional::pitch_shift's cost),
-                // cache one per dtype if float64 PitchShift gets hot.
-                const auto kernel =
-                        waveform.scalar_type() == _kernel.scalar_type()
-                                ? _kernel
-                                : functional::_sinc_resample_kernel(_orig_freq, _opt._sample_rate, _gcd,
-                                                                    functional::resample_option(), waveform.options())
-                                          .first;
                 shifted = functional::_apply_sinc_resample_kernel(stretched, _orig_freq, _opt._sample_rate, _gcd,
-                                                                  kernel, _width);
+                                                                  kernel_for(waveform), _width);
             }
             return functional::_fix_waveform_shape(shifted, waveform.sizes().vec());
         }
@@ -266,6 +259,28 @@ namespace torchmedia::audio::transform {
         auto forward(const_tensor_lref_t waveform) const -> tensor_t { return (*this)(waveform); }
 
     private:
+        // One kernel per (dtype, device): the eager float32 CPU one (the common case), any other built on first use
+        // in the input's dtype and device, as torchaudio's lazy kernel init does. Shared by copies; the mutex keeps a
+        // const call thread-safe.
+        struct kernel_cache {
+            std::mutex mutex;
+            std::vector<tensor_t> list;
+        };
+
+        auto kernel_for(const_tensor_lref_t waveform) const -> tensor_t {
+            const std::lock_guard<std::mutex> lock(_kernels->mutex);
+            for (const auto &k: _kernels->list) {
+                if (k.scalar_type() == waveform.scalar_type() && k.device() == waveform.device()) {
+                    return k;
+                }
+            }
+            _kernels->list.push_back(functional::_sinc_resample_kernel(_orig_freq, _opt._sample_rate, _gcd,
+                                                                       functional::resample_option(),
+                                                                       waveform.options())
+                                             .first);
+            return _kernels->list.back();
+        }
+
         pitch_shift_option _opt;
         int _win_length = 0;
         int _hop_length = 0;
@@ -273,7 +288,7 @@ namespace torchmedia::audio::transform {
         int _gcd = 1;
         int _width = 0;
         tensor_t _window;
-        tensor_t _kernel;
+        std::shared_ptr<kernel_cache> _kernels = std::make_shared<kernel_cache>();
     };
 
     // ---------------- TimeStretch (phase vocoder, cached phase-advance) ----------------

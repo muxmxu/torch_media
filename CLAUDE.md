@@ -50,7 +50,9 @@ See `develop_log/README.md` for file conventions, templates, and naming.
 - **No heavy runtime deps**: prefer header-only / vendored single-header over system libraries.
 - **Python-order scalar math**: a function that reproduces Python float arithmetic (e.g. torchvision's affine matrix)
   starts with `TORCHMEDIA_FP_CONTRACT_OFF` (clang otherwise fuses `a * b + c` into FMAs and breaks bit-exactness);
-  `-ffast-math` / `-ffp-contract=fast` builds are not bit-exact (develop_log/2026-10-23/progress09 D4).
+  `-ffast-math` / `-ffp-contract=fast` builds are not bit-exact (develop_log/2026-10-23/progress09 D4). The
+  `torch_media` CMake target adds `-ffp-contract=on` for consumers so GCC never fuses across statements; the audio
+  scalar loops (lfilter / phaser / flanger / vad) rely on that (progress08) — keep both mechanisms.
 
 ## Dependencies & build
 

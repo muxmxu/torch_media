@@ -423,3 +423,150 @@ _ws = F.mvdr_weights_souden(F.psd(_spec, _mask), _psdn, 1)
 show("souden128 [1,3,2]/[0,0,0]", [[repr(float(_ws[i].real)), repr(float(_ws[i].imag))] for i in ((1, 3, 2), (0, 0, 0))])
 _wr = F.mvdr_weights_rtf(F.rtf_power(F.psd(_spec, _mask), _psdn, 2, n_iter=5), _psdn, 0)
 show("rtf_power5+mvdr_rtf128 [1,2,1]/[0,4,2]", [[repr(float(_wr[i].real)), repr(float(_wr[i].imag))] for i in ((1, 2, 1), (0, 4, 2))])
+
+# ======================= progress08 -- audio parity follow-ups (2026-10-23, task50-task54) =======================
+def _p8(n):
+    t = torch.arange(n, dtype=torch.float64)
+    return torch.stack([0.4 * torch.sin(t * 0.013) + 0.3 * torch.sin(t * 0.71),
+                        0.3 * torch.cos(t * 0.0021) - 0.2 * torch.sin(t * 1.9 + 0.3)])
+
+
+def _pts(y, idx):  # values at idx (repr), then the float64 sum of the whole output
+    return [repr(float(y[i])) for i in idx] + [repr(float(y.double().sum()))]
+
+
+# task50 -- biquad designers: float32 coefficients as torchaudio computes them (each index is where the old
+# double-precision coefficients were furthest off; see the progress08 probe).
+_x = _p8(4000).float()
+for _name, _y, _i in (
+        ("lowpass 16k 20 Hz", F.lowpass_biquad(_x, 16000, 20.0, 0.707), ((1, 3178), (1, 3999))),
+        ("lowpass 44.1k 1 kHz", F.lowpass_biquad(_x, 44100, 1000.0, 0.707), ((0, 3517),)),
+        ("highpass 16k 20 Hz Q2", F.highpass_biquad(_x, 16000, 20.0, 2.0), ((0, 1253),)),
+        ("allpass", F.allpass_biquad(_x, 16000, 1000.0, 0.707), ((1, 3999),)),
+        ("bandpass skirt", F.bandpass_biquad(_x, 16000, 55.0, 3.0, True), ((0, 3433),)),
+        ("bandpass", F.bandpass_biquad(_x, 44100, 1000.0, 0.707, False), ((0, 2178),)),
+        ("bandreject", F.bandreject_biquad(_x, 16000, 20.0, 1.0), ((1, 3999),)),
+        ("equalizer", F.equalizer_biquad(_x, 16000, 1000.0, 6.0, 0.707), ((0, 868),)),
+        ("band noise", F.band_biquad(_x, 44100, 30.0, 0.5, True), ((1, 829),)),
+        ("band", F.band_biquad(_x, 16000, 1000.0, 0.707, False), ((0, 119),)),
+        ("bass", F.bass_biquad(_x, 44100, -9.0, 20.0, 0.707), ((1, 3505),)),
+        ("treble", F.treble_biquad(_x, 16000, 12.0, 20.0, 0.6), ((1, 3215),))):
+    show(f"p8 {_name}", [repr(float(_y[i])) for i in _i])
+_xl = _p8(24000).float()
+show("p8 loudness 48k / 22.05k", [repr(float(F.loudness(_xl, 48000))), repr(float(F.loudness(_xl, 22050)))])
+_x64 = _p8(4000) * 0.05
+show("p8 riaa64 44.1k", [repr(float(F.riaa_biquad(_x64, 44100)[i])) for i in ((0, 3999), (1, 1234), (0, 2000))])
+show("p8 riaa64 96k", [repr(float(F.riaa_biquad(_x64, 96000)[i])) for i in ((0, 3999), (1, 1234))])
+show("p8 deemph64 48k", [repr(float(F.deemph_biquad(_x64 * 20, 48000)[i])) for i in ((0, 3999), (1, 1234))])
+
+# task51 -- phaser / flanger (torchaudio's per-sample Python loops).
+_x = _p8(16000)
+_pi = ((0, 15999), (1, 8000), (0, 12345))
+show("p8 phaser", _pts(F.phaser(_x.float(), 16000), _pi))
+show("p8 phaser tri", _pts(F.phaser(_x.float(), 16000, 0.5, 1.0, 5.0, 0.8, 2.0, False), _pi))
+show("p8 phaser f64", _pts(F.phaser(_x, 44100, 0.4, 0.74, 1.0, 0.7, 0.3), _pi))
+_x8 = _p8(8000)
+_xf = torch.stack([_x8, -0.5 * _x8, _x8.flip(-1)], 1)  # (2, 3, 8000)
+_fi = ((0, 0, 7999), (1, 2, 4000), (0, 1, 6543))
+show("p8 flanger", _pts(F.flanger(_xf.float(), 16000), _fi))
+show("p8 flanger tri quad", _pts(F.flanger(_xf.float(), 16000, 5.0, 8.0, 50.0, 80.0, 2.0, 60.0, "triangular",
+                                           "quadratic"), _fi))
+show("p8 flanger f64", _pts(F.flanger(_xf, 22050, 1.0, 3.0, -95.0, 40.0, 0.7, 33.0, "sinusoidal", "quadratic"), _fi))
+_xs = (torch.sin(torch.arange(800, dtype=torch.float32) * 0.1) * 0.5).reshape(1, 2, 400)
+show("p8 flanger delay -0.1 / phase -30", [_pts(F.flanger(_xs, 16000, -0.1, 0.0), ((0, 1, 399),)),
+                                           _pts(F.flanger(_xs, 16000, phase=-30.0), ((0, 1, 399),))])
+# float32 channel phase: (channel * lfo_length * phase + 0.5) truncates to 14332 for channel 1 (float64: 14333).
+show("p8 flanger 22.05k speed 0.1 phase 6.5", _pts(F.flanger(_xs, 22050, 0.0, 2.0, 0.0, 71.0, 0.1, 6.5), ((0, 1, 399),)))
+
+
+# task53 -- phase_vocoder, inverse_spectrogram options, detect_pitch, vad float32 details.
+def _cspec(nf, nt):  # deterministic complex64 (2, nf, nt)
+    f = torch.arange(nf, dtype=torch.float64).reshape(nf, 1)
+    t = torch.arange(nt, dtype=torch.float64)
+    re = torch.sin(0.37 * f + 0.11 * t) * (1 + 0.5 * torch.cos(0.05 * t))
+    im = 0.8 * torch.cos(0.23 * f - 0.07 * t)
+    return torch.stack([torch.complex(re, im), torch.complex(im, -0.5 * re)]).to(torch.complex64)
+
+
+def _cpts(y, idx):
+    return [(repr(float(y[i].real)), repr(float(y[i].imag))) for i in idx] + [repr(float(y.abs().double().sum()))]
+
+
+_s = _cspec(65, 40)
+_pa = torch.linspace(0, math.pi * 32, 65)[..., None]
+for _r in (1.3, 0.77):
+    _y = F.phase_vocoder(_s, _r, _pa)
+    show(f"p8 phase_vocoder {_r}", [list(_y.shape), _cpts(_y, ((0, 10, 5), (1, 64, _y.shape[-1] - 1), (0, 33, 17)))])
+_hann = torch.hann_window(128)
+for _n, _c, _l, _p in (("window", True, None, 0), ("frame_length", True, 1200, 0), (False, False, None, 0),
+                       (True, True, 1000, 37)):
+    _y = F.inverse_spectrogram(_s, _l, _p, _hann if _c else torch.hamming_window(128), 128, 32, 128, _n, center=_c)
+    show(f"p8 inverse_spectrogram {_n} center={_c} length={_l} pad={_p}",
+         [list(_y.shape), _pts(_y, ((0, 5), (1, 600), (0, _y.shape[-1] - 1)))])
+_y = F.inverse_spectrogram(_cspec(128, 40), None, 0, _hann, 128, 32, 128, False, onesided=False)
+show("p8 inverse_spectrogram two-sided", [list(_y.shape), _pts(_y, ((0, 5), (1, 600), (0, _y.shape[-1] - 1)))])
+_pf = F.detect_pitch_frequency(torch.sin(2 * math.pi * 220 * torch.arange(8000.0) / 8000.0).reshape(1, 8000), 8000)
+show("p8 detect_pitch median / sum", [repr(float(_pf.median())), repr(float(_pf.double().sum()))])
+
+
+# vad: trigger levels at the float32 peak of torchaudio's running mean (T_a: same float32 value, larger double;
+# T_b: the next float32). The mean is replayed with torchaudio's own _measure, in vad's float32 tensor arithmetic.
+def _vad_input(k):
+    t = torch.arange(16000, dtype=torch.float64) / 16000
+    x = torch.zeros(24000, dtype=torch.float64)
+    x[8000:] = (0.5 + 0.03 * k) * torch.sin(2 * math.pi * (300 + 37 * k) * t) * (1 + 0.3 * torch.sin(2 * math.pi * 3 * t))
+    return x + 1e-3 * torch.sin(torch.arange(24000, dtype=torch.float64) * 1.7)
+
+
+def _vad_peak(x, sr=16000, mf=20.0):  # vad's defaults
+    import numpy as np
+    mlen = int(sr * (2.0 / mf) + 0.5)
+    dft = 16
+    while dft < mlen:
+        dft *= 2
+    sw = torch.full((mlen,), 2.0 / math.sqrt(float(mlen))) * torch.hann_window(mlen, dtype=torch.float)
+    ss, se = max(int(50.0 / sr * dft + 0.5), 1), min(int(6000.0 / sr * dft + 0.5), dft // 2)
+    cw = torch.full((se - ss,), 2.0 / math.sqrt(float(se) - ss)) * torch.hann_window(se - ss, dtype=torch.float)
+    cs, ce = math.ceil(sr * 0.5 / 2000.0), min(math.floor(sr * 0.5 / 150.0), dft // 4)
+    nup, ndown = torch.tensor(math.exp(-1.0 / (0.1 * mf))), torch.tensor(math.exp(-1.0 / (0.01 * mf)))
+    smult, tmult, bmax = math.exp(-1.0 / (0.4 * mf)), math.exp(-1.0 / (0.25 * mf)), int(0.35 * mf - 0.5)
+    spec, nspec, mean, boot, peak = torch.zeros(dft), torch.zeros(dft), torch.zeros(1), 0, -1.0
+    for pos in range(mlen, x.numel(), int(sr / mf + 0.5)):
+        meas = _FF._measure(mlen, x[pos - mlen:pos], spec, nspec, sw, ss, se, cw, cs, ce, 1.35, smult, nup, ndown, boot)
+        mean[0] = mean[0] * tmult + meas * (1.0 - tmult)
+        peak = max(peak, float(mean[0]))
+        if boot >= 0:
+            boot = -1 if boot == bmax else boot + 1
+    f = np.float32(peak)
+    return float(np.nextafter(f, np.float32(np.inf))) * 0.25 + peak * 0.75, float(np.nextafter(f, np.float32(np.inf)))
+
+
+for _k in (0, 9):
+    _x = _vad_input(_k)
+    show(f"p8 vad k={_k} (T_a, length) (T_b, length)",
+         [(repr(_T), F.vad(_x, 16000, trigger_level=_T).shape[-1]) for _T in _vad_peak(_x)])
+
+# task54 -- rtf_power with a one-hot Tensor reference_channel (torchaudio: Union[int, Tensor]).
+_n = torch.arange(3 * 33 * 20, dtype=torch.float64)
+_spec = torch.complex(torch.sin(_n * 0.37), torch.cos(_n * 0.11)).reshape(3, 33, 20)
+_m = (0.5 + 0.4 * torch.sin(torch.arange(33 * 20, dtype=torch.float64) * 0.23)).reshape(33, 20)
+_ps, _pn = F.psd(_spec, _m, True, 1e-15), F.psd(_spec, 1 - _m, True, 1e-15)
+_ri = ((0, 0), (17, 2), (32, 1))
+show("p8 rtf_power one-hot [0,0,1] n_iter 4", _cpts(F.rtf_power(_ps, _pn, torch.tensor([0, 0, 1.0], dtype=torch.float64),
+                                                                 n_iter=4), _ri))
+show("p8 rtf_power one-hot [0,1,0] n_iter 1", _cpts(F.rtf_power(_ps, _pn, torch.tensor([0, 1.0, 0], dtype=torch.float64),
+                                                                 n_iter=1), _ri))
+
+# progress08 review fixes (R4 / R5): goldens that pin the contraction guards and rounding orders the ones above miss.
+_xf = torch.stack([_p8(8000), -0.5 * _p8(8000), _p8(8000).flip(-1)], 1).float()  # (2, 3, 8000)
+show("p8r flanger f32 regen 33", _pts(F.flanger(_xf, 11025, 0.0, 2.0, 33.0), _fi))
+show("p8r flanger f32 regen -60 tri quad", _pts(F.flanger(_xf, 16000, 2.0, 4.0, -60.0, 50.0, 1.3, 40.0, "triangular",
+                                                          "quadratic"), _fi))
+# vad: inputs whose running-mean peak an fma update moves by one float32 ulp (k = 2 down, k = 3 up); the level is
+# the larger of the two peaks.
+for _k, _T in ((2, 7.336863994598389), (3, 7.673338413238525)):
+    show(f"p8r vad k={_k} level {_T!r} length", F.vad(_vad_input(_k), 16000, trigger_level=_T).shape[-1])
+# complex128 with window normalization; a 256-sample Hamming window, whose pow(2).sum().sqrt() and norm() differ.
+_y = F.inverse_spectrogram(_cspec(129, 30).to(torch.complex128), None, 0,
+                           torch.hamming_window(256, dtype=torch.float64), 256, 64, 256, "window")
+show("p8r inverse_spectrogram complex128 window", [list(_y.shape), _pts(_y, ((0, 5), (1, 600), (0, 1855), (1, 77)))])

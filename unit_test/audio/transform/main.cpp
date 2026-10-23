@@ -8,6 +8,7 @@
 // treble_biquad without including _functional_filtering.hpp, so this line did not compile).
 #include <torchmedia/_audio/_transform_effects.hpp>
 // clang-format off
+#include <chrono>
 #include <stdexcept>
 #include <torch/torch.h>
 #include <torchmedia.hpp>
@@ -341,11 +342,7 @@ static void test_lfcc() {
     const auto ref = torch::matmul(s.transpose(-2, -1), dct).transpose(-2, -1);
     TM_CHECK_TENSOR_CLOSE(lfcc, ref, 1e-5, 1e-5);
 
-    const std::vector<float> g = {-2.7019000f, 4.8032293f,  10.1434975f, 13.5267248f, 23.5368443f,
-                                  0.0f,        27.1399155f, 32.0837936f, 35.2117462f, 27.7589417f,
-                                  -9.0872974f, -3.6556177f, -3.6290169f, -3.6230688f, -1.5788774f,
-                                  0.0000026f,  -2.2019062f, -4.2209806f, -5.5101891f, -4.6593971f};
-    TM_CHECK_TENSOR_CLOSE(lfcc, torch::tensor(g).reshape({4, 5}), 1e-2, 1e-2);
+    // torchaudio goldens: test_p8_feature_time_goldens (this ramp golden was pinned at 1e-2)
 }
 
 static void test_inverse_mel_scale() {
@@ -357,15 +354,7 @@ static void test_inverse_mel_scale() {
 
     TM_CHECK(inv.dim() == 2 && inv.size(0) == 9 && inv.size(1) == 5);
     TM_CHECK(inv.min().item<double>() >= 0.0); // relu non-negativity
-    const std::vector<float> g = {0.0f,          0.0f,          0.0f,          0.0f,           0.0f,        8.1963634f,
-                                  1257.5067139f, 4329.5068359f, 9449.5068359f, 14458.1894531f, 54.4421539f, 11.4990921f,
-                                  11.4992542f,   11.4986076f,   51.3251343f,   2.6294749f,     0.6707515f,  0.6706300f,
-                                  0.6711465f,    2.5926456f,    1.3575928f,    0.2156847f,     0.2156659f,  0.2157466f,
-                                  1.2904152f,    0.5668065f,    0.0f,          0.0f,           0.0f,        0.4936028f,
-                                  0.3778709f,    0.0f,          0.0f,          0.0f,           0.3290685f,  0.1889354f,
-                                  0.0f,          0.0f,          0.0f,          0.1645342f,     0.0f,        0.0f,
-                                  0.0f,          0.0f,          0.0f};
-    TM_CHECK_TENSOR_CLOSE(inv, torch::tensor(g).reshape({9, 5}), 1e-1, 1e-3);
+    // torchaudio goldens: test_p8_feature_time_goldens (this ramp golden was pinned at 1e-1)
 }
 
 static void test_feature_validation() {
@@ -847,22 +836,6 @@ static void test_convolution_noise() {
 
 // ======================== task25: beamforming ========================
 static auto cdouble_opts() -> tensor_options_t { return tensor_options_t().dtype(torch::kComplexDouble); }
-static auto make_u(int channels, int ref) -> tensor_t {
-    auto u = torch::zeros({channels}, cdouble_opts());
-    u.select(-1, ref).fill_(1);
-    return u;
-}
-// Reference MVDR weight via the same functional ops the transform dispatches to (exact, not just
-// phase-invariant, since both run the identical deterministic computation).
-static auto ref_mvdr_weight(tf::mvdr_solution sol, const tensor_t &psd_s, const tensor_t &psd_n, const tensor_t &u,
-                            int ref) -> tensor_t {
-    if (sol == tf::mvdr_solution::ref_channel)
-        return fn::mvdr_weights_souden(psd_s, psd_n, u, true, 1e-7, 1e-8);
-    tensor_t stv =
-            sol == tf::mvdr_solution::stv_evd ? fn::rtf_evd(psd_s) : fn::rtf_power(psd_s, psd_n, ref, 3, true, 1e-7);
-    return fn::mvdr_weights_rtf(stv, psd_n, u, true, 1e-7, 1e-8);
-}
-
 static void test_psd() {
     const auto spec = torch::randn({3, 4, 5}, cdouble_opts());
     const auto mask = torch::rand({4, 5}, tensor_options_t().dtype(torch::kDouble));
@@ -876,94 +849,168 @@ static void test_psd() {
                           fn::psd(spec, mmask.mean(-3), true, 1e-15), 1e-9, 1e-9);
 }
 
-static void test_souden_rtf_mvdr() {
-    const auto spec = torch::randn({3, 4, 5}, cdouble_opts());
-    const auto mask_s = torch::rand({4, 5}, tensor_options_t().dtype(torch::kDouble));
-    const auto mask_n = 1.0 - mask_s;
-    const auto psd_s = fn::psd(spec, mask_s, true, 1e-15);
-    const auto psd_n = fn::psd(spec, mask_n, true, 1e-15);
-
-    const auto souden = tf::SoudenMVDR()(spec, psd_s, psd_n, 0);
-    TM_CHECK_TENSOR_CLOSE(
-            souden, fn::apply_beamforming(fn::mvdr_weights_souden(psd_s, psd_n, (int64_t) 0, true, 1e-7, 1e-8), spec),
-            1e-9, 1e-9);
-    TM_CHECK_TENSOR_CLOSE(tf::SoudenMVDR().forward(spec, psd_s, psd_n, 0), souden, 0.0, 0.0);
-
-    const auto rtf = fn::rtf_evd(psd_s);
-    const auto rtfmvdr = tf::RTFMVDR().forward(spec, rtf, psd_n, 0);
-    TM_CHECK_TENSOR_CLOSE(rtfmvdr,
-                          fn::apply_beamforming(fn::mvdr_weights_rtf(rtf, psd_n, (int64_t) 0, true, 1e-7, 1e-8), spec),
-                          1e-9, 1e-9);
+// task53 -- InverseMelScale, LFCC and SpeedPerturbation against torchaudio 2.5.1 goldens (A2-12: these were pinned at
+// 1e-1 / 1e-2, or only reproduced themselves under a seed).
+static auto p8_signal(int64_t n) -> tensor_t {
+    const auto t = torch::arange(n, torch::kDouble);
+    return torch::stack({0.4 * torch::sin(t * 0.013) + 0.3 * torch::sin(t * 0.71),
+                         0.3 * torch::cos(t * 0.0021) - 0.2 * torch::sin(t * 1.9 + 0.3)});
 }
 
-static void test_mvdr_offline() {
-    const auto spec = torch::randn({3, 4, 5}, cdouble_opts());
-    const auto mask_s = torch::rand({4, 5}, tensor_options_t().dtype(torch::kDouble));
-    const auto mask_n = 1.0 - mask_s;
-    const auto psd_s = fn::psd(spec, mask_s, true, 1e-15);
-    const auto psd_n = fn::psd(spec, mask_n, true, 1e-15);
-    const auto u = make_u(3, 0);
-
-    for (const auto sol: {tf::mvdr_solution::ref_channel, tf::mvdr_solution::stv_evd, tf::mvdr_solution::stv_power}) {
-        tf::MVDR mvdr(tf::mvdr_option().solution(sol).ref_channel(0).online(false));
-        const auto out = mvdr(spec, mask_s, mask_n);
-        const auto ref = fn::apply_beamforming(ref_mvdr_weight(sol, psd_s, psd_n, u, 0), spec);
-        TM_CHECK_TENSOR_CLOSE(out, ref, 1e-9, 1e-9);
+static void check_p8_points(const tensor_t &y, const std::vector<std::vector<int64_t>> &idx,
+                            const std::vector<double> &golden, double sum_tol = 1e-9) {
+    for (size_t i = 0; i < idx.size(); ++i) {
+        auto v = y;
+        for (const auto j: idx[i]) {
+            v = v[j];
+        }
+        TM_CHECK_CLOSE(v.item<double>(), golden[i], 0.0);
     }
-
-    // mask_n defaults to 1 - mask_s.
-    tf::MVDR mvdr_def(tf::mvdr_option().solution(tf::mvdr_solution::ref_channel));
-    TM_CHECK_TENSOR_CLOSE(
-            mvdr_def(spec, mask_s),
-            fn::apply_beamforming(ref_mvdr_weight(tf::mvdr_solution::ref_channel, psd_s, psd_n, u, 0), spec), 1e-9,
-            1e-9);
-
-    // cfloat input is promoted internally and the output is cast back to cfloat.
-    const auto spec_f = spec.to(torch::kComplexFloat);
-    const auto out_f = tf::MVDR(tf::mvdr_option())(spec_f, mask_s);
-    TM_CHECK(out_f.scalar_type() == torch::kComplexFloat);
+    TM_CHECK_CLOSE(y.to(torch::kDouble).sum().item<double>(), golden.back(), sum_tol);
 }
 
-static void test_mvdr_online() {
-    const auto spec1 = torch::randn({3, 4, 5}, cdouble_opts());
-    const auto spec2 = torch::randn({3, 4, 5}, cdouble_opts());
-    const auto ms1 = torch::rand({4, 5}, tensor_options_t().dtype(torch::kDouble));
-    const auto ms2 = torch::rand({4, 5}, tensor_options_t().dtype(torch::kDouble));
-    const auto mn1 = 1.0 - ms1;
-    const auto mn2 = 1.0 - ms2;
-    const auto u = make_u(3, 0);
-    const auto sol = tf::mvdr_solution::ref_channel;
+static void test_p8_feature_time_goldens() {
+    const auto f = torch::arange(40, torch::kDouble).reshape({40, 1});
+    const auto t = torch::arange(30, torch::kDouble);
+    const auto mel = (1.0 + torch::sin(0.3 * f + 0.17 * t).pow(2) * (1.0 + f / 10)).to(torch::kFloat);
+    const auto ims = tf::InverseMelScale(tf::inverse_mel_scale_option().n_stft(201).n_mels(40).sample_rate(16000))(mel);
+    TM_CHECK(ims.sizes() == torch::IntArrayRef({201, 30}));
+    check_p8_points(ims, {{0, 0}, {37, 12}, {120, 29}},
+                    {0.0, 0.879518985748291, 0.4854063391685486, 2989.0452372268774});
+    TM_CHECK((ims == 0).sum().item<int64_t>() == 59);
 
-    tf::MVDR mvdr(tf::mvdr_option().solution(sol).ref_channel(0).online(true));
-    const auto o1 = mvdr(spec1, ms1, mn1);
-    const auto o2 = mvdr(spec2, ms2, mn2);
+    const auto x = p8_signal(8000).to(torch::kFloat);
+    const auto lf = tf::LFCC(tf::lfcc_option().sample_rate(16000).n_filter(40).n_lfcc(20).spec(
+            tf::spectrogram_option().n_fft(400).hop_length(160)))(x);
+    TM_CHECK(lf.sizes() == torch::IntArrayRef({2, 20, 51}));
+    check_p8_points(lf, {{0, 0, 0}, {1, 19, 50}, {0, 7, 23}},
+                    {-4.968632221221924, 3.9135851860046387, 26.235172271728516, 1422.5626203473657});
+    const auto ll = tf::LFCC(tf::lfcc_option().sample_rate(16000).n_filter(40).n_lfcc(13).log_lf(true).spec(
+            tf::spectrogram_option().n_fft(256)))(x);
+    TM_CHECK(ll.sizes() == torch::IntArrayRef({2, 13, 63}));
+    check_p8_points(ll, {{0, 0, 0}, {1, 12, 50}, {0, 7, 23}},
+                    {-4.24013090133667, -0.2990034222602844, 5.4435811042785645, -1608.512420186773});
 
-    // frame 1: the first online call equals the offline computation.
-    const auto psd_s1 = fn::psd(spec1, ms1, true, 1e-15);
-    const auto psd_n1 = fn::psd(spec1, mn1, true, 1e-15);
-    TM_CHECK_TENSOR_CLOSE(o1, fn::apply_beamforming(ref_mvdr_weight(sol, psd_s1, psd_n1, u, 0), spec1), 1e-9, 1e-9);
+    // SpeedPerturbation: torchaudio's factor draw under a seed (seed 7 -> 0.9, seed 2024 -> 1.1).
+    const tf::SpeedPerturbation sp(tf::speed_perturbation_option().orig_freq(16000).factors({0.9, 1.0, 1.1}));
+    const auto x1 = p8_signal(4000).slice(0, 0, 1).to(torch::kFloat);
+    torch::manual_seed(7);
+    auto [y7, l7] = sp(x1, torch::tensor({4000.0f}));
+    TM_CHECK(y7.sizes() == torch::IntArrayRef({1, 4445}) && l7.value().item<double>() == 4445.0);
+    check_p8_points(y7, {{0, 0}, {0, 1000}, {0, 4444}},
+                    {0.0005773734883405268, -0.5901594758033752, 0.08821673691272736, 39.5830073135221});
+    torch::manual_seed(2024);
+    auto [y24, l24] = sp(x1, torch::tensor({4000.0f}));
+    TM_CHECK(y24.sizes() == torch::IntArrayRef({1, 3637}) && l24.value().item<double>() == 3637.0);
+    check_p8_points(y24, {{0, 0}, {0, 1000}, {0, 3636}},
+                    {0.005819018464535475, 0.6802586317062378, 0.09144581854343414, 32.384942137723556});
+}
 
-    // frame 2: replicate the recursive PSD blend.
-    const auto psd_s2 = fn::psd(spec2, ms2, true, 1e-15);
-    const auto psd_n2 = fn::psd(spec2, mn2, true, 1e-15);
-    const auto msum_s = ms1.sum(-1);
-    const auto msum_n = mn1.sum(-1);
-    auto blend = [](const tensor_t &old_psd, const tensor_t &msum, const tensor_t &new_psd, const tensor_t &mask) {
-        const auto denom = msum + mask.sum(-1);
-        return old_psd * (msum / denom).unsqueeze(-1).unsqueeze(-1) +
-               new_psd * (1.0 / denom).unsqueeze(-1).unsqueeze(-1);
-    };
-    const auto up_s = blend(psd_s1, msum_s, psd_s2, ms2);
-    const auto up_n = blend(psd_n1, msum_n, psd_n2, mn2);
-    TM_CHECK_TENSOR_CLOSE(o2, fn::apply_beamforming(ref_mvdr_weight(sol, up_s, up_n, u, 0), spec2), 1e-9, 1e-9);
+// task53 / task54 -- SoudenMVDR, RTFMVDR and MVDR (offline, online, multi-mask, cfloat) against torchaudio 2.5.1
+// goldens (A3-16; these compared against this library's functional ops before), and the one-hot Tensor
+// reference_channel of SoudenMVDR / RTFMVDR (A3-12). Goldens: gen_golden.py "progress08" section.
+static auto p8_bf_input(int k) -> std::pair<tensor_t, tensor_t> { // spec (3, 33, 20) complex128, mask (33, 20)
+    const auto n = torch::arange(3 * 33 * 20, torch::kDouble);
+    const auto spec = torch::complex(torch::sin(n * (0.37 + 0.01 * k)), torch::cos(n * (0.11 + 0.02 * k)));
+    const auto m = torch::arange(33 * 20, torch::kDouble);
+    return {spec.reshape({3, 33, 20}), (0.5 + 0.4 * torch::sin(m * (0.23 + 0.05 * k))).reshape({33, 20})};
+}
 
-    // online + multi_mask: exercises the per-channel mask averaging in the recursion.
-    tf::MVDR mvdr_mm(tf::mvdr_option().solution(sol).multi_mask(true).online(true));
-    const auto mms1 = torch::rand({3, 4, 5}, tensor_options_t().dtype(torch::kDouble));
-    const auto mms2 = torch::rand({3, 4, 5}, tensor_options_t().dtype(torch::kDouble));
-    (void) mvdr_mm(spec1, mms1, 1.0 - mms1);
-    const auto mm2 = mvdr_mm(spec2, mms2, 1.0 - mms2);
-    TM_CHECK(mm2.size(-2) == 4 && mm2.size(-1) == 5);
+static void check_p8_bf(const tensor_t &y, const std::vector<std::array<double, 2>> &g, double abs_sum) {
+    const int64_t idx[3][2] = {{0, 0}, {17, 9}, {32, 19}};
+    TM_CHECK(y.sizes() == torch::IntArrayRef({33, 20}));
+    for (int i = 0; i < 3; ++i) {
+        TM_CHECK_CLOSE(torch::real(y[idx[i][0]][idx[i][1]]).item<double>(), g[i][0], 0.0);
+        TM_CHECK_CLOSE(torch::imag(y[idx[i][0]][idx[i][1]]).item<double>(), g[i][1], 0.0);
+    }
+    TM_CHECK_CLOSE(y.abs().sum().item<double>(), abs_sum, y.scalar_type() == torch::kComplexDouble ? 1e-9 : 1e-4);
+}
+
+static void test_p8_souden_rtf_mvdr_goldens() {
+    const auto [spec, ms] = p8_bf_input(0);
+    const auto psd_s = tf::PSD()(spec, ms), psd_n = tf::PSD()(spec, 1 - ms);
+    const auto onehot = torch::tensor({0.0, 1.0, 0.0}, torch::kDouble);
+    const std::vector<std::array<double, 2>> gs = {{{-0.26527414888337875, -0.30042970531477436}},
+                                                   {{0.043912527945901725, -0.1194022202160603}},
+                                                   {{-0.5182278653275196, 0.5097227197202746}}};
+    check_p8_bf(tf::SoudenMVDR()(spec, psd_s, psd_n, 1), gs, 247.61184796748316);
+    check_p8_bf(tf::SoudenMVDR().forward(spec, psd_s, psd_n, onehot), gs, 247.61184796748316);
+    const auto rtf = fn::rtf_evd(psd_s);
+    const std::vector<std::array<double, 2>> gr = {{{0.10426483982967258, -0.29506423130990994}},
+                                                   {{-0.13232458010911405, -0.08231883533186611}},
+                                                   {{-0.4415241151516869, 0.8052689668971607}}};
+    check_p8_bf(tf::RTFMVDR()(spec, rtf, psd_n, 1), gr, 350.62492009584986);
+    check_p8_bf(tf::RTFMVDR().forward(spec, rtf, psd_n, onehot), gr, 350.62492009584986);
+}
+
+static void test_p8_mvdr_goldens() {
+    const auto [spec, ms] = p8_bf_input(0);
+    const auto mn = 1 - ms;
+    check_p8_bf(tf::MVDR(tf::mvdr_option().ref_channel(2).solution(tf::mvdr_solution::ref_channel))(spec, ms, mn),
+                {{{-0.40578141427111414, 0.16796342900919062}},
+                 {{0.34011922334087996, 0.015892619267467906}},
+                 {{0.14731983893440964, -0.4407058287627034}}},
+                227.43639410199856);
+    check_p8_bf(tf::MVDR(tf::mvdr_option().ref_channel(2).solution(tf::mvdr_solution::stv_evd))(spec, ms, mn),
+                {{{0.0922820333067905, 0.09162541280330974}},
+                 {{0.35877595889295544, 0.08847141722077871}},
+                 {{0.41074485614829104, -1.0215153046184717}}},
+                345.82588156331593);
+    check_p8_bf(tf::MVDR(tf::mvdr_option().ref_channel(2).solution(tf::mvdr_solution::stv_power))(spec, ms, mn),
+                {{{-1.5128696336454346, 0.424743981072668}},
+                 {{0.4661617282793422, -0.005441826693650648}},
+                 {{0.4231719258310972, -0.7913914757216081}}},
+                353.3235870500175);
+    check_p8_bf(tf::MVDR()(spec, ms), // mask_n defaults to 1 - mask_s
+                {{{0.19359544500197512, 0.21859501954581573}},
+                 {{-0.08885606105765928, 0.09001122192100118}},
+                 {{-0.5909945143634712, -0.6349409034266909}}},
+                231.25255838409967);
+    // cfloat input: computed in cdouble, returned as cfloat.
+    const auto yf = tf::MVDR(tf::mvdr_option().ref_channel(1))(spec.to(torch::kComplexFloat), ms.to(torch::kFloat),
+                                                               mn.to(torch::kFloat));
+    TM_CHECK(yf.scalar_type() == torch::kComplexFloat);
+    check_p8_bf(yf,
+                {{{-0.26527413725852966, -0.30042973160743713}},
+                 {{0.04391252622008324, -0.119402214884758}},
+                 {{-0.5182278752326965, 0.5097227096557617}}},
+                247.61184692382812);
+}
+
+static void test_p8_mvdr_online_goldens() {
+    const auto [spec, ms] = p8_bf_input(0);
+    const auto [spec2, ms2] = p8_bf_input(1);
+    tf::MVDR ref(tf::mvdr_option().ref_channel(1).online(true));
+    check_p8_bf(ref(spec, ms, 1 - ms), // the first online call is the offline one
+                {{{-0.26527414888337875, -0.30042970531477436}},
+                 {{0.043912527945901725, -0.1194022202160603}},
+                 {{-0.5182278653275196, 0.5097227197202746}}},
+                247.61184796748316);
+    check_p8_bf(ref.forward(spec2, ms2, 1 - ms2),
+                {{{-0.020965359619965145, -0.24866720530558728}},
+                 {{0.05438135858062496, 0.2981041448089082}},
+                 {{-0.5703006640592854, 0.050794922168260793}}},
+                257.87550576778096);
+    tf::MVDR pow(tf::mvdr_option().ref_channel(1).solution(tf::mvdr_solution::stv_power).online(true));
+    check_p8_bf(pow(spec, ms, 1 - ms),
+                {{{-0.24484381354319334, -0.4696716946714795}},
+                 {{-0.10157669702884364, 0.011660094274681787}},
+                 {{-0.7476872878643396, 0.8013241594994257}}},
+                366.89554716507996);
+    check_p8_bf(pow(spec2, ms2, 1 - ms2),
+                {{{0.18200491323560053, -0.42147534161077527}},
+                 {{0.231766107317877, 0.8826485299077841}},
+                 {{-0.8216004078821, 0.1133757304283875}}},
+                419.8649635672004);
+    // multi_mask: (channel, freq, time) masks averaged over channels before the recursion.
+    const auto mm1 = torch::stack({ms, ms.flip(-1), 0.5 * ms}), mm2 = torch::stack({ms2, 1 - ms2, ms2.flip(0)});
+    tf::MVDR mm(tf::mvdr_option().solution(tf::mvdr_solution::stv_evd).multi_mask(true).online(true));
+    (void) mm(spec, mm1, 1 - mm1);
+    check_p8_bf(mm(spec2, mm2, 1 - mm2),
+                {{{-0.07639850678241489, 0.024865797419787547}},
+                 {{-0.5164445083093638, -0.22875253885934207}},
+                 {{-0.12850323327181531, -0.653319059986573}}},
+                381.51229360486894);
 }
 
 static void test_mvdr_validation_and_setters() {
@@ -1174,17 +1221,17 @@ static void test_buffers_follow_input() {
 // task11 -- review round 2 (progress02 D12). Goldens: gen_golden.py "task11" section (torchaudio 2.5.1).
 static void test_r2_pitch_shift_float64() {
     // P1/R1: PitchShift builds the kernel in a non-float32 input's dtype, as torchaudio's lazy init does
-    // (the float32 kernel cast up was 6.4e-5 off here). torchaudio T.PitchShift(11025, 3, n_fft=400).double();
-    // the ~8e-8 left is its float64-cast window buffer, the same gap torchaudio has between its own F and T.
+    // (the float32 kernel cast up was 6.4e-5 off here). torchaudio T.PitchShift(11025, 3, n_fft=400).double(),
+    // whose float64-cast window buffer PitchShift uses too (progress08 review R6: it kept F's float32 window, ~8e-8).
     const auto t = torch::arange(3001, torch::kDouble);
     const auto x = torch::stack({torch::sin(t * 0.05), 0.5 * torch::cos(t * 0.031)});
     const tf::PitchShift ps(tf::pitch_shift_option().sample_rate(11025).n_steps(3).n_fft(400));
     const auto y = ps(x);
     TM_CHECK(y.scalar_type() == torch::kDouble);
-    TM_CHECK_TENSOR_CLOSE(y, fn::pitch_shift(x, 11025, 3, 12, 400), 0.0, 0.0);
-    TM_CHECK_CLOSE(y[0][2964].item<double>(), -0.804910047985357, 1e-6);
-    TM_CHECK_CLOSE(y[0][2954].item<double>(), -0.5985449840155338, 1e-6);
-    TM_CHECK_CLOSE(y[0][2977].item<double>(), -0.6640172823143292, 1e-6);
+    TM_CHECK_TENSOR_CLOSE(y, fn::pitch_shift(x, 11025, 3, 12, 400), 1e-6, 0.0);
+    TM_CHECK_CLOSE(y[0][2964].item<double>(), -0.804910047985357, 0.0);
+    TM_CHECK_CLOSE(y[0][2954].item<double>(), -0.5985449840155338, 0.0);
+    TM_CHECK_CLOSE(y[0][2977].item<double>(), -0.6640172823143292, 0.0);
     const auto xf = x.to(torch::kFloat); // float32 input keeps the cached float32 kernel
     TM_CHECK_TENSOR_CLOSE(ps(xf), fn::pitch_shift(xf, 11025, 3, 12, 400), 0.0, 0.0);
 }
@@ -1279,6 +1326,46 @@ static void test_p4_rank_checks() {
     TM_CHECK(raises_inv([&] { (void) ps(torch::tensor(0.5f)); }));
 }
 
+// ======================= progress08 -- audio parity follow-ups (task52-task55) =======================
+// task52 -- PitchShift caches one resample kernel per (dtype, device), built on first use like torchaudio's lazy init
+// (A2-11). 8 kHz / 0.5 step: a 4000 x 4131 kernel, ~60 ms to build in float64, ~4 ms to apply.
+static void test_p8_pitch_shift_kernel_cache() {
+    const tf::PitchShift ps(tf::pitch_shift_option().sample_rate(8000).n_steps(0.5).n_fft(256));
+    const auto x = torch::sin(torch::arange(8000, torch::kDouble) * 0.05).unsqueeze(0);
+    const auto ms = [&](const tensor_t &in) {
+        const auto t0 = std::chrono::steady_clock::now();
+        (void) ps(in);
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    };
+    const double first = ms(x);
+    const double second = ms(x);
+    TM_CHECK(second * 4 < first); // the old path rebuilt the kernel on every non-float32 call
+    TM_CHECK(ps(x).equal(tf::PitchShift(tf::pitch_shift_option().sample_rate(8000).n_steps(0.5).n_fft(256))(x)));
+    TM_CHECK(ps(x.to(torch::kFloat)).equal(fn::pitch_shift(x.to(torch::kFloat), 8000, 0.5, 12, 256)));
+    const tf::PitchShift copy = ps; // copies share the cache
+    TM_CHECK(copy(x).equal(ps(x)));
+}
+
+// progress08 review (R5 / R6): inputs where a rounding order shows. LFCC on 1-D input (another matmul kernel than the
+// batched goldens above) pins its filter matmul order; PitchShift float32 at 1.5 steps pins phase_vocoder's phase wrap
+// (~300 samples move by an ulp otherwise); float64 matches torchaudio's module after .double() (float64-cast window).
+static void test_p8r_lfcc_pitch_shift_goldens() {
+    const auto x = p8_signal(6000)[0].to(torch::kFloat);
+    const auto lf = tf::LFCC(tf::lfcc_option().sample_rate(8000).n_filter(32).n_lfcc(13).log_lf(true).spec(
+            tf::spectrogram_option().n_fft(256).hop_length(100)))(x);
+    TM_CHECK(lf.sizes() == torch::IntArrayRef({13, 61}));
+    check_p8_points(lf, {{0, 0}, {12, 60}, {7, 23}, {3, 41}},
+                    {-2.3555498123168945, 0.35400390625, 6.023802280426025, 1.620169997215271, 144.65309511404485});
+    const tf::PitchShift ps(tf::pitch_shift_option().sample_rate(8000).n_steps(1.5).n_fft(512));
+    const auto x4 = p8_signal(4000);
+    const auto y32 = ps(x4.to(torch::kFloat));
+    TM_CHECK(y32.sizes() == torch::IntArrayRef({2, 4000}));
+    check_p8_points(y32, {{0, 100}, {1, 2000}, {0, 3999}},
+                    {0.6596112251281738, -0.254048615694046, 0.008963646367192268, 183.90325332601242});
+    check_p8_points(ps(x4), {{0, 100}, {1, 2000}, {0, 3999}},
+                    {0.6596111588369094, -0.2540716791287802, 0.00915044373069807, 183.90350205536083});
+}
+
 int main() {
     test_spectrogram();
     test_spectral_centroid();
@@ -1310,9 +1397,6 @@ int main() {
     test_effects_option_setters();
     test_convolution_noise();
     test_psd();
-    test_souden_rtf_mvdr();
-    test_mvdr_offline();
-    test_mvdr_online();
     test_mvdr_validation_and_setters();
     TM_RUN(test_amplitude_to_db_parity);
     TM_RUN(test_spectral_parity);
@@ -1324,6 +1408,12 @@ int main() {
     TM_RUN(test_p4_effects_transforms);
     TM_RUN(test_p4_time_transforms);
     TM_RUN(test_p4_specaugment_f64_seeded);
+    TM_RUN(test_p8_pitch_shift_kernel_cache);
+    TM_RUN(test_p8_feature_time_goldens);
+    TM_RUN(test_p8_souden_rtf_mvdr_goldens);
+    TM_RUN(test_p8_mvdr_goldens);
+    TM_RUN(test_p8_mvdr_online_goldens);
+    TM_RUN(test_p8r_lfcc_pitch_shift_goldens);
     TM_RUN(test_p4_rank_checks);
     return tm_test::summary("audio_test_transform");
 }

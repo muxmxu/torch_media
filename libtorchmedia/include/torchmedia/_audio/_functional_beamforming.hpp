@@ -171,31 +171,55 @@ namespace torchmedia::audio::functional {
         return v.index({Ellipsis, -1}); // principal eigenvector (max eigenvalue)
     }
 
-    // RTF/steering vector by the power method (mirrors rtf_power). reference_channel as int.
-    inline auto rtf_power(const_tensor_lref_t psd_s, tensor_t psd_n, int64_t reference_channel, int n_iter = 3,
-                          bool diagonal_loading = true, double diag_eps = 1e-7) -> tensor_t {
-        using namespace torch::indexing;
-        if (const auto err = detail::psd_matrices_error(psd_s, psd_n); !err.empty()) {
-            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}), err);
-        }
-        if (n_iter <= 0) {
-            return handle_exceptions<tensor_t, std::invalid_argument>(
-                    torch::empty({1}), "The number of iterations must be greater than 0.");
-        }
-        if (diagonal_loading) {
-            psd_n = _tik_reg(psd_n, diag_eps);
-        }
-        const auto phi = torch::linalg::solve(psd_n, psd_s, /*left=*/true);
-        auto rtf = phi.index({Ellipsis, reference_channel}).unsqueeze(-1); // (..., freq, channel, 1)
-        if (n_iter >= 2) {
-            for (int k = 0; k < n_iter - 2; ++k) {
-                rtf = torch::matmul(phi, rtf);
+    namespace detail {
+        // rtf_power for either reference_channel form: `column` takes phi's reference column (..., freq, channel).
+        template<class Column>
+        inline auto rtf_power(const_tensor_lref_t psd_s, tensor_t psd_n, const Column &column, int n_iter,
+                              bool diagonal_loading, double diag_eps) -> tensor_t {
+            if (const auto err = psd_matrices_error(psd_s, psd_n); !err.empty()) {
+                return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}), err);
             }
-            rtf = torch::matmul(psd_s, rtf);
-        } else {
-            rtf = torch::matmul(psd_n, rtf);
+            if (n_iter <= 0) {
+                return handle_exceptions<tensor_t, std::invalid_argument>(
+                        torch::empty({1}), "The number of iterations must be greater than 0.");
+            }
+            if (diagonal_loading) {
+                psd_n = _tik_reg(psd_n, diag_eps);
+            }
+            const auto phi = torch::linalg::solve(psd_n, psd_s, /*left=*/true);
+            auto rtf = column(phi).unsqueeze(-1); // (..., freq, channel, 1)
+            if (n_iter >= 2) {
+                for (int k = 0; k < n_iter - 2; ++k) {
+                    rtf = torch::matmul(phi, rtf);
+                }
+                rtf = torch::matmul(psd_s, rtf);
+            } else {
+                rtf = torch::matmul(psd_n, rtf);
+            }
+            return rtf.squeeze(-1);
         }
-        return rtf.squeeze(-1);
+    } // namespace detail
+
+    // RTF/steering vector by the power method (mirrors rtf_power). reference_channel as int.
+    inline auto rtf_power(const_tensor_lref_t psd_s, const_tensor_lref_t psd_n, int64_t reference_channel,
+                          int n_iter = 3, bool diagonal_loading = true, double diag_eps = 1e-7) -> tensor_t {
+        return detail::rtf_power(
+                psd_s, psd_n,
+                [&](const tensor_t &phi) { return phi.index({torch::indexing::Ellipsis, reference_channel}); }, n_iter,
+                diagonal_loading, diag_eps);
+    }
+
+    // RTF/steering vector by the power method, reference_channel as a one-hot Tensor (..., channel).
+    inline auto rtf_power(const_tensor_lref_t psd_s, const_tensor_lref_t psd_n, const_tensor_lref_t reference_channel,
+                          int n_iter = 3, bool diagonal_loading = true, double diag_eps = 1e-7) -> tensor_t {
+        using namespace torch::indexing;
+        return detail::rtf_power(
+                psd_s, psd_n,
+                [&](const tensor_t &phi) {
+                    const auto ref = reference_channel.to(phi.scalar_type());
+                    return torch::einsum("...c,...c->...", {phi, ref.index({Ellipsis, None, None, Slice()})});
+                },
+                n_iter, diagonal_loading, diag_eps);
     }
 
     // Apply precomputed beamforming weights (mirrors apply_beamforming).

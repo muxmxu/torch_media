@@ -289,3 +289,5 @@ constructor, and A1-12's "outputs are bit-exact" does not hold for GPDF (see D6)
     3.4e-5 on the float16 one).
   - Union line coverage re-measured from a fresh coverage build (lcov export of the five audio binaries, comment and
     blank lines excluded): 0 missed lines in every `_audio/*.hpp`. Every audio header compiles on its own.
+- 2026-10-23 [ai] Open items A1-10, A1-11 (kept, D7), A2-11, A2-12, A3-12, A3-16, the vad notes and the phaser / flanger
+  loops: handled in [progress08](progress08-audio-parity-followups.md).

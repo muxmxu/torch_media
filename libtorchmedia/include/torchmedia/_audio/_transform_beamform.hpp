@@ -54,15 +54,18 @@ namespace torchmedia::audio::transform {
     class SoudenMVDR {
     public:
         SoudenMVDR() = default;
+        // reference_channel: an int64_t index or a one-hot Tensor (..., channel), as torchaudio's Union[int, Tensor].
+        template<class Ref>
         auto operator()(const_tensor_lref_t specgram, const_tensor_lref_t psd_s, const_tensor_lref_t psd_n,
-                        int64_t reference_channel, bool diagonal_loading = true, double diag_eps = 1e-7,
+                        const Ref &reference_channel, bool diagonal_loading = true, double diag_eps = 1e-7,
                         double eps = 1e-8) const -> tensor_t {
             const auto w =
                     functional::mvdr_weights_souden(psd_s, psd_n, reference_channel, diagonal_loading, diag_eps, eps);
             return functional::apply_beamforming(w, specgram);
         }
+        template<class Ref>
         auto forward(const_tensor_lref_t specgram, const_tensor_lref_t psd_s, const_tensor_lref_t psd_n,
-                     int64_t reference_channel, bool diagonal_loading = true, double diag_eps = 1e-7,
+                     const Ref &reference_channel, bool diagonal_loading = true, double diag_eps = 1e-7,
                      double eps = 1e-8) const -> tensor_t {
             return (*this)(specgram, psd_s, psd_n, reference_channel, diagonal_loading, diag_eps, eps);
         }
@@ -72,14 +75,17 @@ namespace torchmedia::audio::transform {
     class RTFMVDR {
     public:
         RTFMVDR() = default;
+        // reference_channel: an int64_t index or a one-hot Tensor (..., channel), as torchaudio's Union[int, Tensor].
+        template<class Ref>
         auto operator()(const_tensor_lref_t specgram, const_tensor_lref_t rtf, const_tensor_lref_t psd_n,
-                        int64_t reference_channel, bool diagonal_loading = true, double diag_eps = 1e-7,
+                        const Ref &reference_channel, bool diagonal_loading = true, double diag_eps = 1e-7,
                         double eps = 1e-8) const -> tensor_t {
             const auto w = functional::mvdr_weights_rtf(rtf, psd_n, reference_channel, diagonal_loading, diag_eps, eps);
             return functional::apply_beamforming(w, specgram);
         }
+        template<class Ref>
         auto forward(const_tensor_lref_t specgram, const_tensor_lref_t rtf, const_tensor_lref_t psd_n,
-                     int64_t reference_channel, bool diagonal_loading = true, double diag_eps = 1e-7,
+                     const Ref &reference_channel, bool diagonal_loading = true, double diag_eps = 1e-7,
                      double eps = 1e-8) const -> tensor_t {
             return (*this)(specgram, rtf, psd_n, reference_channel, diagonal_loading, diag_eps, eps);
         }
@@ -173,7 +179,7 @@ namespace torchmedia::audio::transform {
             if (_opt._solution == mvdr_solution::stv_evd) {
                 stv = functional::rtf_evd(psd_s);
             } else { // stv_power
-                stv = functional::rtf_power(psd_s, psd_n, _opt._ref_channel, 3, _opt._diag_loading, _opt._diag_eps);
+                stv = functional::rtf_power(psd_s, psd_n, u, 3, _opt._diag_loading, _opt._diag_eps); // torchaudio: u
             }
             return functional::mvdr_weights_rtf(stv, psd_n, u, _opt._diag_loading, _opt._diag_eps, eps);
         }

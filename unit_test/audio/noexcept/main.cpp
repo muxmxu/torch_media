@@ -200,6 +200,18 @@ static void test_kaldi_sites() {
     TM_CHECK(returns_default([&] { return kd::vtln_warp_mel_freq(10, 7500, 20, 8000, 0.9, f); }));
 }
 
+// progress08 (task51, task54): flanger buffer lengths, rtf_power with a one-hot Tensor reference_channel.
+static void test_p8_sites() {
+    const auto w = torch::randn({1, 2, 400}) * 0.1;
+    TM_CHECK(returns_default([&] { return fn::flanger(w, 16000, 0.0, 2.0, 0.0, 71.0, /*speed=*/20000.0); }));
+    TM_CHECK(returns_default([&] { return fn::flanger(w, 16000, 0.0, 2.0, 0.0, 71.0, /*speed=*/0.0); }));
+    TM_CHECK(returns_default([&] { return fn::flanger(w, 16000, /*delay=*/-10.0); }));
+    const auto c3 = torch::complex(torch::randn({3, 2, 2}), torch::randn({3, 2, 2}));
+    const auto hot = torch::tensor({1.0f, 0.0f});
+    TM_CHECK(returns_default([&] { return fn::rtf_power(c3, c3, hot, 0); }));
+    TM_CHECK(returns_default([&] { return fn::rtf_power(c3, c3.slice(0, 0, 2), hot); }));
+}
+
 int main() {
     TM_RUN(test_convolve_resample_deltas);
     TM_RUN(test_spectral);
@@ -207,5 +219,6 @@ int main() {
     TM_RUN(test_filtering_beamforming_alignment);
     TM_RUN(test_p4_surface_sites);
     TM_RUN(test_kaldi_sites);
+    TM_RUN(test_p8_sites);
     return tm_test::summary("audio_test_noexcept");
 }
