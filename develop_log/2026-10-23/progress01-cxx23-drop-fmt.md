@@ -48,6 +48,11 @@ features (`fmt::join`, styles, ostream adapters). One fewer bundled dependency f
 - libtorch's `c10/util/strong_type.h` trips `-Winvalid-specialization` (an error) unless included as a system
   header; CMake's imported-target `-isystem` handles this — keep it that way in hand-written compile lines.
 
+- Rebasing onto origin/master (the 2026-06-01 functional/transform commits, never pulled on this machine)
+  surfaced 7 test literals `torch::tensor({1L, ...})` that do not compile on macOS (C++20 or 23 alike):
+  `long` is not `int64_t` there (`long long`), so the TensorDataContainer conversion is ambiguous. Fixed as
+  `torch::tensor({1, ...}, torch::kLong)`, portable across LP64 platforms; `LL` would break Linux instead.
+
 ## Open / TODO (carry-over)
 - readme.md example and dependency list are stale beyond fmt (SOX, `torchmedia::basic::to_string`,
   `spectrogram_options_t{}.windows(...)`) — out of scope here.
@@ -57,3 +62,5 @@ features (`fmt::join`, styles, ostream adapters). One fewer bundled dependency f
   Implemented task01 in an isolated worktree (the audio audit workflow was compiling probes against the
   C++20 headers at the time). Fresh configure+build: `-std=c++23`, zero fmt flags, ctest 4/4 green;
   `-DTORCHMEDIA_WITH_PLOT=ON` build ctest 5/5 green. Awaiting Mux review.
+- 2026-10-23 [ai] Rebased onto origin/master (8208b49, 96e924f). Fixed the 7 non-portable `L` literals;
+  full build -std=c++23 green, ctest 5/5 (functional 206/206, transform 151/151).

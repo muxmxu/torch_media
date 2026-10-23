@@ -535,7 +535,7 @@ static void test_companding_emphasis() {
     auto w = filt_wav();
     auto enc = mu_law_encoding(w, 256);
     TM_CHECK(enc.dtype() == torch::kInt64);
-    auto enc_exp = torch::tensor({203L, 37L, 228L, 21L, 239L, 12L, 247L, 5L});
+    auto enc_exp = torch::tensor({203, 37, 228, 21, 239, 12, 247, 5}, torch::kLong);
     TM_CHECK(enc.equal(enc_exp));
     auto dec = mu_law_decoding(enc, 256);
     TM_CHECK_TENSOR_CLOSE(dec,
@@ -844,9 +844,9 @@ static void test_forced_align() {
             torch::tensor({2.f, 0.f, 0.f, 0.f, 3.f, 0.f, 0.f, 2.f, 0.f, 2.f, 0.f, 0.f, 0.f, 0.f, 3.f, 2.f, 0.f, 0.f})
                     .reshape({1, 6, 3});
     auto logp = torch::log_softmax(logits, -1);
-    auto targets = torch::tensor({{1L, 2L}});
+    auto targets = torch::tensor({{1, 2}}, torch::kLong);
     auto [paths, scores] = forced_align(logp, targets, c10::nullopt, c10::nullopt, 0);
-    TM_CHECK(paths.equal(torch::tensor({{0L, 1L, 1L, 0L, 2L, 0L}})));
+    TM_CHECK(paths.equal(torch::tensor({{0, 1, 1, 0, 2, 0}}, torch::kLong)));
     TM_CHECK_TENSOR_CLOSE(scores.flatten(),
                           torch::tensor({-0.23954f, -0.09492f, -0.23954f, -0.23954f, -0.09492f, -0.23954f}), 1e-4,
                           1e-4);
@@ -861,7 +861,7 @@ static void test_forced_align() {
     // targets containing the blank index raises.
     bool threw = false;
     try {
-        forced_align(logp, torch::tensor({{0L, 1L}}), c10::nullopt, c10::nullopt, 0);
+        forced_align(logp, torch::tensor({{0, 1}}, torch::kLong), c10::nullopt, c10::nullopt, 0);
     } catch (const std::invalid_argument &) {
         threw = true;
     }
@@ -954,7 +954,7 @@ static void test_coverage_gaps() {
     auto wav = torch::randn({2, 10});
     auto noise = torch::randn({2, 10});
     auto snr = torch::tensor({10.0f, 10.0f});
-    auto lengths = torch::tensor({8L, 10L});
+    auto lengths = torch::tensor({8, 10}, torch::kLong);
     TM_CHECK(add_noise(wav, noise, snr, lengths).sizes() == wav.sizes());
 
     // frechet_distance: both validation raise paths.

@@ -481,7 +481,7 @@ static void test_speed() {
     TM_CHECK(!out.second.has_value()); // no lengths passed
 
     // lengths path: out_lengths == ceil(lengths * target / source).
-    const auto lengths = torch::tensor({64L});
+    const auto lengths = torch::tensor({64}, torch::kLong);
     const auto out_l = s(x, lengths);
     TM_CHECK(out_l.second.has_value());
     const auto ref_l = fn::speed(x, 16000, 1.5, lengths);
@@ -835,7 +835,7 @@ static void test_convolution_noise() {
     const auto snr = torch::tensor({10.0f, 5.0f});
     const tf::AddNoise add_noise;
     TM_CHECK_TENSOR_CLOSE(add_noise(wav, noise, snr), fn::add_noise(wav, noise, snr), 1e-5, 1e-5);
-    const auto lengths = torch::tensor({8L, 10L});
+    const auto lengths = torch::tensor({8, 10}, torch::kLong);
     TM_CHECK_TENSOR_CLOSE(add_noise.forward(wav, noise, snr, lengths), fn::add_noise(wav, noise, snr, lengths), 1e-5,
                           1e-5);
 }
