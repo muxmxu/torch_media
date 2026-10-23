@@ -11,7 +11,10 @@ rotate / affine / perspective ops as functional ops and transform classes, point
 equal to pycocotools COCOeval, VOC AP), image quality and segmentation; audio (SNR family, SDR, PIT, STOI = pystoi,
 mir_eval bss_eval_sources, EER / minDCF) and text (WER family, EditDistance) (develop_log/2026-10-24/progress01);
 classification (torchmetrics.classification binary / multiclass / multilabel: stat scores, confusion-matrix metrics,
-curves / AUROC / AP / fixed-point metrics, calibration, hinge, ranking; develop_log/2026-10-24/progress02).
+curves / AUROC / AP / fixed-point metrics, calibration, hinge, ranking; develop_log/2026-10-24/progress02). Data
+(`torchmedia::data`, develop_log/2026-10-24/progress03): torch::data datasets — DatasetFolder / ImageFolder
+(torchvision order and errors), AudioFolder, ManifestDataset, PadCollate, Subset / ConcatDataset / random_split (torch
+seeded parity).
 
 ## Collaboration model (development, not research)
 
@@ -54,7 +57,10 @@ See `develop_log/README.md` for file conventions, templates, and naming.
   setters; namespaces `torchmedia::{audio,vision}::{io,functional,transform}`, `torchmedia::audio::separation`,
   `torchmedia::audio::compliance::kaldi` (torchaudio.compliance.kaldi) and `torchmedia::metric::{detection,image,
   segmentation,audio,text,classification}` (torchmetrics: a functional per metric plus a class with update / compute /
-  reset / forward, progress11 D1; audio / text: develop_log/2026-10-24/progress01; classification: progress02).
+  reset / forward, progress11 D1; audio / text: develop_log/2026-10-24/progress01; classification: progress02) and
+  `torchmedia::data` (datasets deriving from libtorch's `torch::data::datasets::Dataset`, used with its
+  `make_data_loader` / samplers / Stack; read-only after construction, so safe for loader workers;
+  develop_log/2026-10-24/progress03).
 - **No heavy runtime deps**: prefer header-only / vendored single-header over system libraries.
 - **Seeded parity**: a random vision transform class replicates its torchvision class's parameter draws (same torch
   calls, order and dtypes, on the global generator), so `torch::manual_seed(s)` reproduces `torch.manual_seed(s)`
@@ -95,10 +101,10 @@ See `develop_log/README.md` for file conventions, templates, and naming.
   assertion-based tests using `unit_test/test_util.hpp` (`TM_CHECK`, `TM_CHECK_TENSOR_CLOSE`) and
   registered with ctest. No eyeball / print-only tests.
 - A new or changed function is not "done" until covered; target **100% line coverage** for
-  every `_audio/*.hpp`, `_vision/*.hpp` and `_metric/*.hpp` header (vendored `_vendor/` is excluded), measured as the
-  union over the audio / vision / metric test binaries (develop_log/2026-10-23/progress02 D11): each header with the
-  binary that owns it, a shared header per line over the binaries (llvm-cov's multi-object merge drops inline header
-  functions whose hashes differ per binary; progress11 D9).
+  every `_audio/*.hpp`, `_vision/*.hpp`, `_metric/*.hpp` and `_data/*.hpp` header (vendored `_vendor/` is excluded),
+  measured as the union over the audio / vision / metric / data test binaries (develop_log/2026-10-23/progress02 D11):
+  each header with the binary that owns it, a shared header per line over the binaries (llvm-cov's multi-object merge
+  drops inline header functions whose hashes differ per binary; progress11 D9).
 - Golden reference values: prefer closed-form truths and libtorch self-reference (portable, no deps).
   Use the local `.venv` (torch/torchaudio 2.5.1, torchvision 0.20.1, torchmetrics 1.9.0, pycocotools 2.0.11, pystoi
   0.4.1, mir_eval 0.8.2, jiwer 4.0.0, scipy, scikit-learn) as a development-time point-wise cross-check; pin
