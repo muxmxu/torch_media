@@ -6,6 +6,11 @@ preprocessing that has to compute what torchaudio / torchvision computed at trai
 point-wise against the Python library, and on the CPU most are bit-exact in float32 and float64. `develop_log/`
 records the measurements and every intentional difference.
 
+> **Status: personal hobby project.** It is provided "as is", without warranty of any kind, and without any
+> obligation to support, maintain, or fix it. APIs and behaviour may change without notice. Verify its outputs for
+> your own use case before relying on them; it is not intended for safety-critical use. The author accepts no
+> liability for any damage or loss arising from its use — see [LICENSE](LICENSE).
+
 ## What is included
 
 | Namespace | Python counterpart | Contents |
