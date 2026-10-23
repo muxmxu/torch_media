@@ -45,7 +45,8 @@ See `develop_log/README.md` for file conventions, templates, and naming.
 - **Style**: `.clang-format` (LLVM base, IndentWidth 4, ColumnLimit 120, namespaces indented).
   Run clang-format before committing.
 - **Naming**: `snake_case` for functions/variables; option structs as `xxx_option` with fluent
-  setters; namespaces `torchmedia::{audio,vision}::{io,functional,transform}` and `torchmedia::audio::separation`.
+  setters; namespaces `torchmedia::{audio,vision}::{io,functional,transform}`, `torchmedia::audio::separation` and
+  `torchmedia::audio::compliance::kaldi` (torchaudio.compliance.kaldi).
 - **No heavy runtime deps**: prefer header-only / vendored single-header over system libraries.
 
 ## Dependencies & build

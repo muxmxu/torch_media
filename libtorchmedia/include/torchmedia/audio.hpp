@@ -9,6 +9,7 @@
 #include "_audio/_functional_alignment.hpp"
 #include "_audio/_io.hpp"
 #include "_audio/_separation.hpp"
+#include "_audio/_compliance_kaldi.hpp"
 #include "_audio/_transform.hpp"
 // clang-format on
 #endif // LIBTORCHMEDIA_AUDIO

@@ -183,11 +183,29 @@ static void test_p4_surface_sites() {
     }));
 }
 
+// progress06: compliance::kaldi. mfcc returns fbank's default instead of computing on it.
+static void test_kaldi_sites() {
+    namespace kd = torchmedia::audio::compliance::kaldi;
+    const auto w = torch::randn({1, 4000});
+    TM_CHECK(returns_default([&] { return kd::spectrogram(w[0]); }));
+    TM_CHECK(returns_default([&] { return kd::fbank(w, kd::fbank_option().energy_floor(-1.0)); }));
+    TM_CHECK(returns_default([&] { return kd::fbank(w, kd::fbank_option().num_mel_bins(3)); }));
+    TM_CHECK(returns_default([&] { return kd::mfcc(w, kd::mfcc_option().num_ceps(24)); }));
+    TM_CHECK(returns_default([&] { return kd::mfcc(w, kd::mfcc_option().num_ceps(-1)); }));
+    TM_CHECK(returns_default([&] { return kd::mfcc(w, kd::mfcc_option().num_ceps(0).htk_compat(true)); }));
+    TM_CHECK(returns_default([&] { return kd::mfcc(w, kd::mfcc_option().num_mel_bins(3).num_ceps(2)); }));
+    TM_CHECK(!std::get<0>(kd::get_mel_banks(23, 511, 16000, 20, 0, 100, -500, 1)).defined());
+    const auto f = torch::linspace(0, 8000, 9);
+    TM_CHECK(returns_default([&] { return kd::vtln_warp_freq(100, 7500, 20, 8000, 0.0, f); }));
+    TM_CHECK(returns_default([&] { return kd::vtln_warp_mel_freq(10, 7500, 20, 8000, 0.9, f); }));
+}
+
 int main() {
     TM_RUN(test_convolve_resample_deltas);
     TM_RUN(test_spectral);
     TM_RUN(test_masking_metrics_loudness);
     TM_RUN(test_filtering_beamforming_alignment);
     TM_RUN(test_p4_surface_sites);
+    TM_RUN(test_kaldi_sites);
     return tm_test::summary("audio_test_noexcept");
 }
