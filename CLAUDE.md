@@ -56,8 +56,9 @@ See `develop_log/README.md` for file conventions, templates, and naming.
   - `cmake --build build --target audio_test_io && ./build/unit_test/audio/io/audio_test_io` — build & run the I/O test.
   - `ctest --test-dir build` — run registered tests.
 - C++ standard: **C++23** (headers use `<print>`; see develop_log/2026-10-23/progress01).
-- Audio I/O: WAV via vendored header-only `dr_wav`; the implementation block is emitted in the one TU
-  that defines `TORCHMEDIA_IO_IMPLEMENTATION` (each test's `main.cpp` does this).
+- Audio I/O: WAV (dr_wav), FLAC (dr_flac), MP3 (dr_mp3) and Ogg Vorbis (stb_vorbis), vendored single-header and
+  pinned in THIRD_PARTY_LICENSES; the implementation blocks are emitted in the one TU that defines
+  `TORCHMEDIA_IO_IMPLEMENTATION` (each test's `main.cpp` does this). Saving is WAV only.
 - Unit tests live in `unit_test/` and double as usage examples.
 - Optional plotting: `torchmedia::plot` (matplot++ / gnuplot) is **opt-in** via `-DTORCHMEDIA_WITH_PLOT=ON`
   (needs gnuplot at runtime + `dependence/matplotplusplus`). The core audio/vision stays header-only and
@@ -80,7 +81,15 @@ See `develop_log/README.md` for file conventions, templates, and naming.
 ## Audio I/O direction (decided 2026-05-30 — see develop_log/2026-05-30/progress01)
 
 - Drop the FFmpeg-from-source dependency. Use **vendored single-header** decoders:
-  `dr_wav` (+write), `dr_flac`, `dr_mp3`, `stb_vorbis`. WAV first.
+  `dr_wav` (+write), `dr_flac`, `dr_mp3`, `stb_vorbis` — all landed (develop_log/2026-10-23/progress05).
+- `load_audio` / `info` detect the container from the leading bytes (never the extension) and mirror torchaudio.load /
+  torchaudio.info (frame_offset / num_frames, memory input); `save_audio` mirrors torchaudio.save for WAV, PCM
+  bit-exact. Documented deviations (float WAV kept exact, MP3 gapless lengths): progress05 D4-D8.
+- Decode trusted input only (stb_vorbis has the largest CVE record); its short macros are saved / restored by
+  `_audio/_io_stb_vorbis_impl.hpp` — keep that list in sync when re-vendoring. `stb_vorbis.c` carries two local
+  `torchmedia patch` fixes (5.1 residue length, comment-header bounds; THIRD_PARTY_LICENSES): re-apply them when
+  re-vendoring. A consumer that compiles a codec itself opts out with
+  `TORCHMEDIA_NO_{DR_WAV,DR_FLAC,DR_MP3,STB_VORBIS}_IMPLEMENTATION`.
 - `load_audio` returns the native sample rate; **resampling is a separate torch-native op**, not
   in the loader.
 - ODR: vendored implementations gated behind `TORCHMEDIA_IO_IMPLEMENTATION` (consumer defines it

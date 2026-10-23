@@ -101,11 +101,14 @@ SOX -> FFmpeg (WIP in `_io.hpp`). Mux wants a dependency-light / "native" approa
   feed trusted audio only (relevant once OGG support lands).
 
 ## Open / TODO (carry-over)
-- FLAC / MP3 / OGG decode backends (dr_flac / dr_mp3 / stb_vorbis) — next progress.
+- ~~FLAC / MP3 / OGG decode backends (dr_flac / dr_mp3 / stb_vorbis)~~ — done in
+  [2026-10-23/progress05](../2026-10-23/progress05-audio-io-formats.md).
 - torch-native `functional::resample` (sinc-as-convolution) — separate progress.
 - `TORCHMEDIA_WITH_FFMPEG` optional path. (`THIRD_PARTY_LICENSES` landed with task01; stale entry corrected
   2026-10-23 after the audit flagged it.)
-- 24-bit / float32 WAV round-trip tests.
+- ~~24-bit / float32 WAV round-trip tests~~ — done in 2026-10-23/progress05 (every save encoding, plus U8 / S16 / S24 /
+  S32 / F32 / F64 decode fixtures). THIRD_PARTY_LICENSES now records the pinned commit and sha256 of every vendored
+  decoder (progress05 D1).
 
 ## Agent log
 - 2026-05-30 [ai] Ran a 4-way, web-verified research workflow on dependency-light C++ audio I/O
@@ -117,3 +120,5 @@ SOX -> FFmpeg (WIP in `_io.hpp`). Mux wants a dependency-light / "native" approa
   full-build verification: `load_audio("literal")` string/path overload ambiguity (added `const char*`
   overloads), and a `.gitignore` rule that was swallowing `CMakeLists.txt`. `audio_test_io` round-trip
   passes (max abs err 6.1e-05), zero ffmpeg/sox in the link line; full build (io + functional + vision) green.
+- 2026-10-23 [ai] FLAC / MP3 / Ogg Vorbis decode, frame ranges, info() and torchaudio.save parity landed in
+  2026-10-23/progress05 (task20-22); the related Open items above are closed.

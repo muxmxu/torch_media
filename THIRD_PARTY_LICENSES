@@ -3,11 +3,39 @@ with TorchMedia's MIT license. Vendored files retain the full upstream license t
 code it is reproduced here.
 
 ================================================================================
-dr_wav  (part of dr_libs)
+dr_wav, dr_flac, dr_mp3  (part of dr_libs)
   Upstream:  https://github.com/mackron/dr_libs
   Author:    David Reid <mackron@gmail.com>
-  Vendored:  libtorchmedia/include/torchmedia/_audio/_vendor/dr_wav.h
-  License:   public domain (Unlicense) OR MIT-0, at your option.
+  Pinned:    commit b4264c5c1f61c1d460aced4cf4d8a8dec197ca48 (2026-10-21), fetched as
+             https://raw.githubusercontent.com/mackron/dr_libs/<commit>/<file>. The latest tags (wav-0.14.5,
+             flac-0.13.3, mp3-0.7.3) predate fixes this library relies on (dr_mp3 seeking and file reading after a
+             LAME/Info frame, Xing/Info bounds checks; dr_flac seek and shift fixes; dr_wav malformed-chunk,
+             overflow and large-seek fixes).
+  Vendored:  libtorchmedia/include/torchmedia/_audio/_vendor/
+               dr_wav.h   "dr_wav - v0.14.6 - TBD"   sha256 999aecea26eebd44437216f1ca1d8856b438cce8354044642b9b5ce9c912943b
+               dr_flac.h  "dr_flac - v0.13.4 - TBD"  sha256 96b3dfca87d02eb977d01278d19b10caea84b3fcd545f373495940e0587a3c9e
+               dr_mp3.h   "dr_mp3 - v0.7.4 - TBD"    sha256 91f264e8559cc8ccecbcfc38abc77fff66533f5e95f666a4ba48238e69e190a4
+             (dr_wav.h was previously commit 243e26ffa08a24dc8ae2e7a8c57123d9e504690c, sha256 9fa5cce4...)
+  License:   public domain (Unlicense) OR MIT-0, at your option (full text at the end of each file).
+             dr_mp3 is based on minimp3 (https://github.com/lieff/minimp3), dedicated to the public domain under CC0.
+================================================================================
+stb_vorbis  (part of stb)
+  Upstream:  https://github.com/nothings/stb
+  Author:    Sean Barrett
+  Pinned:    commit 1ee679ca2ef753a528db5ba6801e1067b40481b8 (2021-07-12, the last change to stb_vorbis.c), fetched as
+             https://raw.githubusercontent.com/nothings/stb/<commit>/stb_vorbis.c
+  Vendored:  libtorchmedia/include/torchmedia/_audio/_vendor/stb_vorbis.c  "Ogg Vorbis audio decoder - v1.22"
+             upstream sha256 4c7cb2ff1f7011e9d67950446b7eb9ca044f2e464d76bfbb0b84dd2e23e65636
+             LOCALLY PATCHED (2026-10-23, each change marked "torchmedia patch"; no upstream fix exists at the pin):
+               1. decode_residue: residue type 2 reads n*ch values, not n*2. libvorbis's 5.1 mapping (44.1 / 48 kHz)
+                  puts 5 channels in one type-2 submap; v1.22 decoded such files to garbage without an error.
+               2. start_decoder, comment header: the vendor / comment lengths and the comment count are bounded by
+                  the bytes left in the stream (capped at 2^28), and comment_list is zeroed and its count reset on
+                  failure. v1.22 freed uninitialized pointers (crash) or over-allocated on one corrupt field.
+             patched sha256 1e011afee19e5fd6dfd0b23017d9ef05adec6531f7598851e2fcc078a3d44b7c
+             (diff: develop_log/2026-10-23/progress05-audio-io-formats.md, D1)
+             Decode trusted input only: stb_vorbis has the largest fuzzing / CVE record of the vendored decoders.
+  License:   public domain (Unlicense) OR MIT, at your option (full text at the end of the file).
 ================================================================================
 stb_image / stb_image_write  (part of stb)
   Upstream:  https://github.com/nothings/stb
