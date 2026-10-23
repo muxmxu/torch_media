@@ -6,7 +6,9 @@ reimplements **torchaudio / torchvision** functionality on top of **native libto
 (see develop_log/2026-06-01); vision covers the core torchvision.transforms.v2 resize / crop / pad / dtype / color /
 rotate / affine / perspective ops as functional ops and transform classes, point-wise identical to torchvision
 (develop_log/2026-10-23/progress07, progress09), the random augmentation classes and containers with seeded parity
-(progress10), plus image I/O (torchvision.io-style uint8 decode_image).
+(progress10), plus image I/O (torchvision.io-style uint8 decode_image). Metrics (`torchmedia::metric`, torchmetrics
+1.9 parity, develop_log/2026-10-23/progress11): detection (torchvision.ops box ops, IoU metrics, MeanAveragePrecision
+equal to pycocotools COCOeval, VOC AP), image quality and segmentation.
 
 ## Collaboration model (development, not research)
 
@@ -46,8 +48,10 @@ See `develop_log/README.md` for file conventions, templates, and naming.
 - **Style**: `.clang-format` (LLVM base, IndentWidth 4, ColumnLimit 120, namespaces indented).
   Run clang-format before committing.
 - **Naming**: `snake_case` for functions/variables; option structs as `xxx_option` with fluent
-  setters; namespaces `torchmedia::{audio,vision}::{io,functional,transform}`, `torchmedia::audio::separation` and
-  `torchmedia::audio::compliance::kaldi` (torchaudio.compliance.kaldi).
+  setters; namespaces `torchmedia::{audio,vision}::{io,functional,transform}`, `torchmedia::audio::separation`,
+  `torchmedia::audio::compliance::kaldi` (torchaudio.compliance.kaldi) and `torchmedia::metric::{detection,image,
+  segmentation}` (torchmetrics: a functional per metric plus a class with update / compute / reset / forward,
+  progress11 D1).
 - **No heavy runtime deps**: prefer header-only / vendored single-header over system libraries.
 - **Seeded parity**: a random vision transform class replicates its torchvision class's parameter draws (same torch
   calls, order and dtypes, on the global generator), so `torch::manual_seed(s)` reproduces `torch.manual_seed(s)`
@@ -88,10 +92,13 @@ See `develop_log/README.md` for file conventions, templates, and naming.
   assertion-based tests using `unit_test/test_util.hpp` (`TM_CHECK`, `TM_CHECK_TENSOR_CLOSE`) and
   registered with ctest. No eyeball / print-only tests.
 - A new or changed function is not "done" until covered; target **100% line coverage** for
-  every `_audio/*.hpp` and `_vision/*.hpp` header (vendored `_vendor/` is excluded), measured as the union over the
-  audio / vision test binaries (develop_log/2026-10-23/progress02 D11).
+  every `_audio/*.hpp`, `_vision/*.hpp` and `_metric/*.hpp` header (vendored `_vendor/` is excluded), measured as the
+  union over the audio / vision / metric test binaries (develop_log/2026-10-23/progress02 D11): each header with the
+  binary that owns it, a shared header per line over the binaries (llvm-cov's multi-object merge drops inline header
+  functions whose hashes differ per binary; progress11 D9).
 - Golden reference values: prefer closed-form truths and libtorch self-reference (portable, no deps).
-  Use the local `.venv` (torch/torchaudio 2.5.1, torchvision 0.20.1) as a development-time point-wise cross-check.
+  Use the local `.venv` (torch/torchaudio 2.5.1, torchvision 0.20.1, torchmetrics 1.9.0, pycocotools 2.0.11) as a
+  development-time point-wise cross-check.
 - `ctest --test-dir build` must be green before a task is marked done.
 - Coverage run: `cmake -S . -B build -DTORCHMEDIA_COVERAGE=ON`, then `llvm-profdata merge` +
   `xcrun llvm-cov` (with `--ignore-filename-regex='_vendor/.*'`).
