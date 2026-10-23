@@ -48,11 +48,11 @@ namespace torchmedia::audio::io {
         const auto n_channels = static_cast<int64_t>(channels);
         const auto n_frames = static_cast<int64_t>(total_frames);
 
-        // dr_wav gives a contiguous interleaved [frames, channels] f32 buffer.
-        // transpose + contiguous copies the data out into a tensor-owned buffer, so it is safe to
-        // free the dr_wav allocation immediately afterwards.
+        // dr_wav gives a contiguous interleaved [frames, channels] f32 buffer. clone() always copies it into a
+        // tensor-owned buffer; contiguous() would not for 1 channel or 1 frame (the transpose is already
+        // contiguous) and the result would alias the allocation freed below.
         auto interleaved_t = torch::from_blob(interleaved, {n_frames, n_channels}, torch::kFloat32);
-        auto data = interleaved_t.transpose(0, 1).contiguous(); // -> [channels, frames]
+        auto data = interleaved_t.transpose(0, 1).clone(torch::MemoryFormat::Contiguous); // -> [channels, frames]
         drwav_free(interleaved, nullptr);
 
         return {data, static_cast<int>(sample_rate)};

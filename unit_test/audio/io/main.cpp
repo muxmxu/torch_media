@@ -49,6 +49,27 @@ int main() {
         return 1;
     }
 
+    // Mono and single-frame files: transposing [frames, 1] or [1, channels] is already contiguous, so load_audio
+    // must still copy out of the decoder buffer it frees (regression: the result aliased freed memory, and the
+    // allocator overwrote the first frames of small files). Small sizes + a non-zero first sample expose it.
+    const auto mono = (0.5f * torch::cos(2.0 * pi * 440.0 * t.slice(0, 0, 4000))).unsqueeze(0); // [1, 4000]
+    const auto one_frame = torch::tensor({{0.5f}, {-0.25f}}); // [2, 1]
+    for (const auto &[label, ref]: {std::pair{"mono", mono}, std::pair{"single-frame", one_frame}}) {
+        const std::string small_path = std::string("roundtrip_") + label + "_test.wav";
+        if (!io::save_audio(ref, small_path, sample_rate)) {
+            std::print("FAIL: {} save_audio returned false\n", label);
+            return 1;
+        }
+        const auto small = io::load_audio(small_path).data;
+        auto churn = torch::randn({64, 64}); // reuse freed heap blocks before reading the loaded data
+        const float small_err = small.sizes() == ref.sizes() ? (small - ref).abs().max().item<float>() : 1.0f;
+        std::print("{} round-trip max abs error: {}\n", label, small_err);
+        if (small_err > 1e-3f) {
+            std::print("FAIL: {} round trip\n", label);
+            return 1;
+        }
+    }
+
     std::print("OK: WAV save/load round-trip via dr_wav passed (no FFmpeg).\n");
     return 0;
 }
