@@ -42,7 +42,7 @@ See `develop_log/README.md` for file conventions, templates, and naming.
 - **Style**: `.clang-format` (LLVM base, IndentWidth 4, ColumnLimit 120, namespaces indented).
   Run clang-format before committing.
 - **Naming**: `snake_case` for functions/variables; option structs as `xxx_option` with fluent
-  setters; namespaces `torchmedia::{audio,vision}::{io,functional,transform}`.
+  setters; namespaces `torchmedia::{audio,vision}::{io,functional,transform}` and `torchmedia::audio::separation`.
 - **No heavy runtime deps**: prefer header-only / vendored single-header over system libraries.
 
 ## Dependencies & build
@@ -68,7 +68,7 @@ See `develop_log/README.md` for file conventions, templates, and naming.
   assertion-based tests using `unit_test/test_util.hpp` (`TM_CHECK`, `TM_CHECK_TENSOR_CLOSE`) and
   registered with ctest. No eyeball / print-only tests.
 - A new or changed function is not "done" until covered; target **100% line coverage** for
-  `_audio/_functional*.hpp` (vendored `_vendor/` is excluded).
+  `_audio/_functional*.hpp` and `_audio/_separation.hpp` (vendored `_vendor/` is excluded).
 - Golden reference values: prefer closed-form truths and libtorch self-reference (portable, no deps).
   Use the local `.venv` (torch/torchaudio 2.5.1) as a development-time point-wise cross-check.
 - `ctest --test-dir build` must be green before a task is marked done.
