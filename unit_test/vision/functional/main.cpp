@@ -1,5 +1,7 @@
 // Assertion-based tests for the vision functional layer against torchvision 0.20.1 transforms.v2.functional
 // goldens (gen_golden.py -> golden.hpp: the seeded inputs and every expected output, bit for bit).
+#include <array>
+#include <cmath>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -323,6 +325,211 @@ static void test_flip() {
     TM_CHECK(torch::equal(vflip(B)[1][2][0], B[1][2][5]));
 }
 
+// ---------------- progress09: color ops ----------------
+static void test_color_adjust() {
+    const auto g1 = S.slice(-3, 0, 1);
+    CHECK_GOLDEN(adjust_contrast(S, 0.6), contrast_u8);
+    CHECK_GOLDEN(adjust_contrast(f32(S), 1.7), contrast_f32);
+    CHECK_GOLDEN(adjust_contrast(f64(B), 0.4), contrast_f64);
+    CHECK_GOLDEN(adjust_contrast(g1, 1.5), contrast_gray_u8);
+    CHECK_GOLDEN(adjust_contrast(f32(g1), 0.5), contrast_gray_f32);
+    CHECK_GOLDEN(adjust_saturation(S, 0.3), saturation_u8);
+    CHECK_GOLDEN(adjust_saturation(f32(L), 1.8), saturation_f32);
+    CHECK_GOLDEN(adjust_saturation(f64(B), 0.0), saturation_f64);
+    TM_CHECK(adjust_saturation(g1, 0.5).is_same(g1)); // 1 channel: returned as is
+    CHECK_GOLDEN(adjust_sharpness(L, 2.0), sharpness_u8);
+    CHECK_GOLDEN(adjust_sharpness(f32(S), 0.4), sharpness_f32);
+    CHECK_GOLDEN(adjust_sharpness(f64(L), 1.5), sharpness_f64);
+    CHECK_GOLDEN(adjust_sharpness(f32(B).reshape({2, 1, 3, 6, 10}), 3.0), sharpness_5d_f32);
+    const auto thin = S.slice(-2, 0, 2); // H <= 2: nothing to sharpen
+    TM_CHECK(adjust_sharpness(thin, 2.0).is_same(thin));
+    CHECK_GOLDEN(adjust_hue(S, 0.25), hue_u8);
+    CHECK_GOLDEN(adjust_hue(f32(L), -0.4), hue_f32);
+    CHECK_GOLDEN(adjust_hue(f64(B), 0.1), hue_f64);
+    CHECK_GOLDEN(adjust_hue(B, -0.5), hue_batch_u8);
+    TM_CHECK(adjust_hue(g1, 0.2).is_same(g1));
+    const auto empty = torch::zeros({0, 3, 4, 4});
+    TM_CHECK(adjust_hue(empty, 0.2).is_same(empty));
+    CHECK_GOLDEN(adjust_gamma(S, 0.5), gamma_u8);
+    CHECK_GOLDEN(adjust_gamma(S, 2.2, 1.3), gamma_gain_u8);
+    CHECK_GOLDEN(adjust_gamma(f32(L), 1.8), gamma_f32);
+    CHECK_GOLDEN(adjust_gamma(f64(B), 0.7, 0.8), gamma_gain_f64);
+    // half / bfloat16 with a gain: an in-place mul_(Scalar) would round the gain to the image dtype first
+    CHECK_GOLDEN(adjust_gamma(f32(S).to(torch::kHalf), 2.2, 0.7).to(torch::kFloat32), gamma_gain_f16);
+    CHECK_GOLDEN(adjust_gamma(f32(L).to(torch::kBFloat16), 1.0, 1.2).to(torch::kFloat32), gamma_gain_bf16);
+
+    TM_CHECK(throws_invalid([&] { return adjust_contrast(S, -0.1); }));
+    TM_CHECK(throws_invalid([&] { return adjust_contrast(B.slice(-3, 0, 2), 1.0); }));
+    TM_CHECK(throws_invalid([&] { return adjust_saturation(S, -0.1); }));
+    TM_CHECK(throws_invalid([&] { return adjust_saturation(torch::zeros({5, 7}), 1.0); }));
+    TM_CHECK(throws_invalid([&] { return adjust_sharpness(S, -0.1); }));
+    TM_CHECK(throws_invalid([&] { return adjust_sharpness(B.slice(-3, 0, 2), 1.0); }));
+    TM_CHECK(throws_invalid([&] { return adjust_hue(S, 0.51); }));
+    TM_CHECK(throws_invalid([&] { return adjust_hue(S, std::nan("")); }));
+    TM_CHECK(throws_invalid([&] { return adjust_hue(B.slice(-3, 0, 2), 0.1); }));
+    TM_CHECK(throws_invalid([&] { return adjust_gamma(S, -1.0); }));
+}
+
+static void test_color_tone() {
+    CHECK_GOLDEN(posterize(S, 3), posterize_u8);
+    CHECK_GOLDEN(posterize(f32(S), 2), posterize_f32);
+    CHECK_GOLDEN(posterize(torch::cat({f32(S), torch::ones({3, 1, 7})}, -2), 3), posterize_white_f32);
+    CHECK_GOLDEN(posterize(S.to(torch::kInt16) * 100, 5), posterize_i16);
+    TM_CHECK(posterize(S, 8).is_same(S)); // bits >= the dtype's value bits: unchanged
+    TM_CHECK(throws_invalid([&] { return posterize(S, -1); }));
+    TM_CHECK(throws_invalid([&] { return posterize(f32(S), 63); }));
+    TM_CHECK(throws_invalid([&] { return posterize(S.to(torch::kBool), 1); }));
+
+    CHECK_GOLDEN(solarize(S, 128.0), solarize_u8);
+    CHECK_GOLDEN(solarize(f32(L), 0.4), solarize_f32);
+    TM_CHECK(throws_invalid([&] { return solarize(S, 255.5); }));
+    TM_CHECK(throws_invalid([&] { return solarize(f32(S), 1.5); }));
+
+    const auto low = S.div(3, "floor") + 60;
+    const auto constant = torch::cat({S.slice(0, 0, 2), torch::full_like(S.slice(0, 0, 1), 99)});
+    CHECK_GOLDEN(autocontrast(low), autocontrast_u8);
+    CHECK_GOLDEN(autocontrast(f32(L) * 0.5 + 0.2), autocontrast_f32);
+    CHECK_GOLDEN(autocontrast(constant), autocontrast_const_u8);
+    const auto empty = torch::zeros({0, 3, 4, 4}, torch::kUInt8);
+    TM_CHECK(autocontrast(empty).is_same(empty));
+    TM_CHECK(throws_invalid([&] { return autocontrast(B.slice(-3, 0, 2)); }));
+
+    CHECK_GOLDEN(equalize(S), equalize_u8);
+    CHECK_GOLDEN(equalize(B), equalize_batch_u8);
+    CHECK_GOLDEN(equalize(f32(L)), equalize_f32);
+    CHECK_GOLDEN(equalize(constant), equalize_const_u8);
+    TM_CHECK(equalize(empty).is_same(empty));
+    TM_CHECK(throws_invalid([&] { return equalize(torch::ones({5}, torch::kUInt8)); }));
+}
+
+static void test_blur_erase() {
+    CHECK_GOLDEN(gaussian_blur(L, {3}), blur_u8);
+    CHECK_GOLDEN(gaussian_blur(f32(L), {5, 3}, {1.2, 0.7}), blur_f32);
+    CHECK_GOLDEN(gaussian_blur(f64(B), {3}, {0.9}), blur_f64);
+    CHECK_GOLDEN(gaussian_blur(f32(B).reshape({2, 1, 3, 6, 10}), {3, 5}), blur_5d_f32);
+    CHECK_GOLDEN(gaussian_blur(f64(L), {5, 9}), blur_default_sigma_f64);
+    // a NaN sigma passes torchvision's `s <= 0` check and blurs to NaN
+    TM_CHECK(gaussian_blur(f32(S), {3}, {std::nan(""), 1.0}).isnan().all().item<bool>());
+    const auto empty = torch::zeros({0, 3, 4, 4});
+    TM_CHECK(gaussian_blur(empty, {3}).is_same(empty));
+    TM_CHECK(throws_invalid([&] { return gaussian_blur(L, {}); }));
+    TM_CHECK(throws_invalid([&] { return gaussian_blur(L, {3, 3, 3}); }));
+    TM_CHECK(throws_invalid([&] { return gaussian_blur(L, {4}); }));
+    TM_CHECK(throws_invalid([&] { return gaussian_blur(L, {-3}); }));
+    TM_CHECK(throws_invalid([&] { return gaussian_blur(L, {3}, {0.0}); }));
+    TM_CHECK(throws_invalid([&] { return gaussian_blur(L, {3}, {1.0, 2.0, 3.0}); }));
+    TM_CHECK(throws_invalid([&] { return gaussian_blur(torch::zeros({5, 7}), {3}); }));
+
+    CHECK_GOLDEN(erase(S, 1, 2, 3, 4, torch::tensor({7, 8, 9}, torch::kUInt8).view({3, 1, 1})), erase_u8);
+    auto x = f32(B);
+    const auto y = erase(x, -3, -4, 2, 9, torch::tensor(0.25), true);
+    TM_CHECK(y.is_same(x)); // in place
+    CHECK_GOLDEN(x, erase_f32);
+    const auto s = f32(S);
+    const auto copy = erase(s, 0, 0, 1, 1, torch::tensor(1.0));
+    TM_CHECK(!copy.is_same(s) && s[0][0][0].item<float>() != 1.0f && copy[0][0][0].item<float>() == 1.0f);
+}
+
+// ---------------- progress09: geometry ----------------
+static void test_rotate() {
+    CHECK_GOLDEN(rotate(S, 30.0), rotate_30_u8);
+    CHECK_GOLDEN(rotate(f32(L), 30.0, IM::bilinear, false, {}, {0.1, 0.5, 0.9}), rotate_30_fill_f32);
+    CHECK_GOLDEN(rotate(L, 37.5, IM::bilinear, true, {}, {200}), rotate_expand_u8);
+    CHECK_GOLDEN(rotate(f32(S), -110.0, IM::nearest, true, {}, {0.0}), rotate_expand_nearest_f32);
+    CHECK_GOLDEN(rotate(f64(S), -20.0, IM::bilinear, false, {1.0, 2.0}), rotate_center_f64);
+    CHECK_GOLDEN(rotate(f32(B), 45.0, IM::nearest, false, {}, {0.3}), rotate_batch_f32);
+    CHECK_GOLDEN(rotate(S, 90.0), rotate_90_rect_u8);
+    // multiples of 90 degrees about the center are exact transposes (torchvision fast path)
+    const auto sq = L.slice(-1, 0, 11); // 11 x 11
+    const auto zero = rotate(S, 360.0);
+    TM_CHECK(torch::equal(zero, S) && !zero.is_same(S));
+    TM_CHECK(torch::equal(rotate(S, -180.0), torch::rot90(S, 2, {-2, -1})));
+    TM_CHECK(torch::equal(rotate(sq, 90.0), torch::rot90(sq, 1, {-2, -1})));
+    TM_CHECK(torch::equal(rotate(S, 450.0, IM::nearest, true), torch::rot90(S, 1, {-2, -1})));
+    TM_CHECK(torch::equal(rotate(S, -90.0, IM::nearest, true), torch::rot90(S, 3, {-2, -1})));
+    // float64 bilinear tells the fast path from the grid path (which is ~1e-16 off: sin(180 deg) != 0)
+    TM_CHECK(torch::equal(rotate(f64(S), 180.0, IM::bilinear), torch::rot90(f64(S), 2, {-2, -1})));
+    TM_CHECK(torch::equal(rotate(f64(sq), 270.0, IM::bilinear), torch::rot90(f64(sq), 3, {-2, -1})));
+    TM_CHECK(rotate(S, 270.0).sizes() == S.sizes()); // non-square, no expand: grid path keeps the size
+    const auto empty = torch::zeros({0, 3, 5, 7});
+    TM_CHECK(rotate(empty, 33.0, IM::nearest, true).sizes() == torch::IntArrayRef({0, 3, 9, 9}));
+    TM_CHECK(throws_invalid([&] { return rotate(S, 30.0, IM::bicubic); }));
+    TM_CHECK(throws_invalid([&] { return rotate(S, 30.0, IM::nearest_exact); }));
+    TM_CHECK(throws_invalid([&] { return rotate(S, 30.0, IM::nearest, false, {}, {1.0, 2.0}); }));
+    TM_CHECK(throws_invalid([&] { return rotate(S, 30.0, IM::nearest, false, {1.0}); }));
+    TM_CHECK(throws_invalid([&] { return rotate(S, 90.0, IM::nearest, false, {1.0, 2.0, 3.0}); }));
+    TM_CHECK(throws_invalid([&] { return rotate(torch::zeros({5, 7}), 30.0); }));
+}
+
+static void test_affine_perspective_elastic() {
+    CHECK_GOLDEN(affine(S, 25.0, {1.0, -2.0}, 0.9, {10.0, -5.0}), affine_u8);
+    CHECK_GOLDEN(affine(f32(L), -40.0, {0.5, 1.5}, 1.2, {15.0}, IM::bilinear, {0.2, 0.4, 0.6}, {3.0, 4.0}),
+                 affine_fill_f32);
+    CHECK_GOLDEN(affine(f64(B), 10.0, {0.0, 0.0}, 1.1, {0.0, 20.0}, IM::bilinear, {0.0}), affine_f64);
+    CHECK_GOLDEN(affine(L, 123.0, {-2.0, 0.0}, 0.75, {-8.0, 3.0}, IM::bilinear, {255, 0, 128}), affine_u8_bilinear);
+    TM_CHECK(throws_invalid([&] { return affine(S, 0.0, {1.0}, 1.0, {0.0}); }));
+    TM_CHECK(throws_invalid([&] { return affine(S, 0.0, {0.0, 0.0}, 0.0, {0.0}); }));
+    TM_CHECK(throws_invalid([&] { return affine(S, 0.0, {0.0, 0.0}, 1.0, {}); }));
+    TM_CHECK(throws_invalid([&] { return affine(S, 0.0, {0.0, 0.0}, 1.0, {0.0}, IM::bicubic); }));
+    TM_CHECK(throws_invalid([&] { return affine(S, 0.0, {0.0, 0.0}, 1.0, {0.0}, IM::nearest, {}, {1.0}); }));
+
+    using pts = std::vector<std::array<double, 2>>;
+    const pts sp{{0, 0}, {12, 0}, {12, 10}, {0, 10}};
+    CHECK_GOLDEN(perspective(L, sp, pts{{1, 0}, {11, 2}, {12, 9}, {0, 10}}), perspective_u8);
+    CHECK_GOLDEN(
+            perspective(f32(L), sp, pts{{0.5, 0.25}, {11.5, 0.0}, {12.0, 8.25}, {1.25, 10.0}}, IM::bilinear, {0.7}),
+            perspective_float_f32);
+    CHECK_GOLDEN(perspective(f32(L), sp, pts{{0.1, 0.3}, {11.7, 0.2}, {12, 9.9}, {0.4, 10}}, IM::bilinear),
+                 perspective_frac_f32);
+    CHECK_GOLDEN(perspective(f64(L), pts{{0.1, 0.2}, {12.3, 0}, {12, 10}, {0, 10}},
+                             pts{{1, 0}, {11, 2}, {12, 9}, {0, 10}}, IM::bilinear),
+                 perspective_frac_f64);
+    const std::vector<double> coeffs{1.1, 0.05, -0.5, -0.02, 0.95, 0.7, 0.001, -0.002};
+    CHECK_GOLDEN(perspective(f64(B), {}, {}, IM::nearest, {}, coeffs), perspective_coeffs_f64);
+    CHECK_GOLDEN(perspective(S, pts{{0, 0}, {6, 0}, {6, 4}, {0, 4}}, pts{{1, 1}, {5, 0}, {6, 4}, {0, 3}}, IM::nearest,
+                             {9, 99, 199}),
+                 perspective_nearest_fill_u8);
+    TM_CHECK(throws_invalid([&] { return perspective(S, sp, sp, IM::bilinear, {}, coeffs); }));
+    TM_CHECK(throws_invalid([&] { return perspective(S, {}, {}, IM::bilinear, {}, {1.0, 2.0}); }));
+    TM_CHECK(throws_invalid([&] { return perspective(S, sp, {}); }));
+    TM_CHECK(throws_invalid([&] { return perspective(S, pts{{0, 0}, {1, 1}, {2, 2}}, sp); }));
+    TM_CHECK(throws_invalid([&] { return perspective(S, sp, sp, IM::bicubic); }));
+    TM_CHECK(throws_invalid([&] { return perspective(torch::zeros({5, 7}), sp, sp); }));
+
+    const auto ds = G(golden::disp_s).to(torch::kFloat32);
+    const auto dl = G(golden::disp_l).to(torch::kFloat32);
+    CHECK_GOLDEN(elastic(S, ds), elastic_u8);
+    CHECK_GOLDEN(elastic(f32(L), dl, IM::bicubic), elastic_bicubic_f32);
+    CHECK_GOLDEN(elastic(f64(S), ds, IM::nearest, {0.5}), elastic_nearest_fill_f64);
+    CHECK_GOLDEN(elastic(L, dl, IM::bilinear, {10, 20, 30}), elastic_fill_u8);
+    CHECK_GOLDEN(elastic(f32(S), ds, IM::bicubic, {0.3}), elastic_bicubic_fill_f32);
+    // CPU float16 is warped in float32 and cast back (torchvision patch)
+    const auto half = elastic(f32(S).to(torch::kHalf), ds);
+    TM_CHECK(half.scalar_type() == torch::kHalf);
+    CHECK_GOLDEN(half.to(torch::kFloat32), elastic_half);
+    TM_CHECK(throws_invalid([&] { return elastic(S, dl); }));
+    TM_CHECK(throws_invalid([&] { return elastic(S, ds, IM::nearest_exact); }));
+    TM_CHECK(throws_invalid([&] { return elastic(torch::zeros({5, 7}), ds); }));
+}
+
+static void test_new_ops_devices() {
+#if GOLDEN_HAS_MPS
+    if (torch::mps::is_available()) {
+        const auto mps = [](const torch::Tensor &x) { return x.to(torch::kMPS); };
+        CHECK_GOLDEN(gaussian_blur(mps(f32(L)), {5, 3}, {1.2, 0.7}).cpu(), blur_mps_f32);
+        CHECK_GOLDEN(adjust_sharpness(mps(f32(S)), 0.4).cpu(), sharpness_mps_f32);
+        CHECK_GOLDEN(rotate(mps(f32(L)), 30.0, IM::bilinear, false, {}, {0.1, 0.5, 0.9}).cpu(), rotate_mps_f32);
+        const std::vector<std::array<double, 2>> sp{{0, 0}, {12, 0}, {12, 10}, {0, 10}};
+        CHECK_GOLDEN(perspective(mps(f32(L)), sp, {{1, 0}, {11, 2}, {12, 9}, {0, 10}}).cpu(), perspective_mps_f32);
+        CHECK_GOLDEN(equalize(mps(B)).cpu(), equalize_mps_u8);
+        // torchvision's MPS adjust_hue reads a freed non_blocking copy; ours equals the CPU golden
+        CHECK_GOLDEN(adjust_hue(mps(f32(L)), -0.4).cpu(), hue_f32);
+        // torchvision aborts here (MPSGraph mul(uint8, float)); the float32 luma path equals the CPU golden
+        CHECK_GOLDEN(adjust_contrast(mps(S), 0.6).cpu(), contrast_u8);
+    }
+#endif
+}
+
 int main() {
     TM_RUN(test_resize_modes);
     TM_RUN(test_resize_batch_and_sizes);
@@ -333,5 +540,11 @@ int main() {
     TM_RUN(test_to_dtype);
     TM_RUN(test_color);
     TM_RUN(test_flip);
+    TM_RUN(test_color_adjust);
+    TM_RUN(test_color_tone);
+    TM_RUN(test_blur_erase);
+    TM_RUN(test_rotate);
+    TM_RUN(test_affine_perspective_elastic);
+    TM_RUN(test_new_ops_devices);
     return tm_test::summary("vision_test_functional");
 }

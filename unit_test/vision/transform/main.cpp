@@ -174,10 +174,86 @@ static void test_validation() {
     TM_CHECK(throws_invalid([&] { return bad_gray(torch::zeros({3, 4, 4})); }));
 }
 
+static void check_values(const torch::Tensor &out, const std::vector<double> &expected) {
+    const auto e = torch::tensor(expected, torch::kFloat64).to(out.scalar_type()).reshape(out.sizes());
+    TM_CHECK_TENSOR_CLOSE(out, e, kTolPixel, 0.0);
+}
+
+static void test_gaussian_blur() {
+    const auto x = torch::arange(3 * 9 * 11).remainder(37).to(torch::kFloat32).reshape({3, 9, 11}) / 36;
+    torch::manual_seed(5);
+    const T::GaussianBlur blur(T::gaussian_blur_option().kernel_size({5}).sigma({0.5, 2.0}));
+    check_values(blur(x), golden::blur_out0);
+    check_values(blur.forward(x), golden::blur_out1);
+    check_values(blur(x), golden::blur_out2);
+    torch::manual_seed(6);
+    const T::GaussianBlur fixed(T::gaussian_blur_option().kernel_size({3, 5}).sigma({0.8}));
+    check_values(fixed(x), golden::blur_fixed_out);
+    TM_CHECK(torch::rand({1}).item<double>() == golden::blur_fixed_next_draw); // a fixed sigma still draws once
+    TM_CHECK(throws_invalid([] { return T::GaussianBlur(T::gaussian_blur_option()); }));
+    TM_CHECK(throws_invalid([] { return T::GaussianBlur(T::gaussian_blur_option().kernel_size({4})); }));
+    TM_CHECK(throws_invalid([] { return T::GaussianBlur(T::gaussian_blur_option().kernel_size({3, 0})); }));
+    TM_CHECK(throws_invalid([] { return T::GaussianBlur(T::gaussian_blur_option().kernel_size({3, 3, 3})); }));
+    TM_CHECK(throws_invalid(
+            [] { return T::GaussianBlur(T::gaussian_blur_option().kernel_size({3}).sigma({2.0, 1.0})); }));
+    TM_CHECK(throws_invalid([] { return T::GaussianBlur(T::gaussian_blur_option().kernel_size({3}).sigma({0.0})); }));
+    TM_CHECK(throws_invalid([] { return T::GaussianBlur(T::gaussian_blur_option().kernel_size({3}).sigma({})); }));
+}
+
+// Each p-gated class draws like torchvision v2 and, when applied, equals its functional op.
+template<class Cls, class Op>
+static void check_random_apply(const Cls &t, Op op, uint64_t seed, const std::vector<double> &applied,
+                               double next_draw) {
+    const auto x = (torch::arange(3 * 4 * 5) * 37).remainder(256).to(torch::kUInt8).reshape({3, 4, 5});
+    torch::manual_seed(seed);
+    for (size_t i = 0; i < applied.size(); ++i) {
+        const auto out = i % 2 ? t.forward(x) : t(x);
+        TM_CHECK(applied[i] == 1.0 ? (!out.is_same(x) && torch::equal(out, op(x))) : out.is_same(x));
+    }
+    TM_CHECK(torch::rand({1}).item<double>() == next_draw);
+}
+
+static void test_random_color() {
+    using namespace golden;
+    check_random_apply(T::RandomInvert(), F::invert, 21, invert_applied, invert_next_draw);
+    check_random_apply(T::RandomAutocontrast(T::random_apply_option().p(0.7)), F::autocontrast, 22,
+                       autocontrast_applied, autocontrast_next_draw);
+    check_random_apply(T::RandomEqualize(T::random_apply_option().p(0.4)), F::equalize, 23, equalize_applied,
+                       equalize_next_draw);
+    check_random_apply(
+            T::RandomGrayscale(), [](const torch::Tensor &x) { return F::rgb_to_grayscale(x, 3); }, 24,
+            grayscale_applied, grayscale_next_draw);
+    check_random_apply(
+            T::RandomPosterize(T::random_posterize_option().bits(3).p(0.6)),
+            [](const torch::Tensor &x) { return F::posterize(x, 3); }, 25, posterize_applied, posterize_next_draw);
+    check_random_apply(
+            T::RandomSolarize(T::random_solarize_option().threshold(100.0)),
+            [](const torch::Tensor &x) { return F::solarize(x, 100.0); }, 26, solarize_applied, solarize_next_draw);
+    check_random_apply(
+            T::RandomAdjustSharpness(T::random_adjust_sharpness_option().sharpness_factor(2.0).p(0.3)),
+            [](const torch::Tensor &x) { return F::adjust_sharpness(x, 2.0); }, 27, sharpness_applied,
+            sharpness_next_draw);
+    // RandomGrayscale keeps the channel count; a 2-D input reaches the functional op (which rejects it)
+    const T::RandomGrayscale always_gray(T::random_apply_option().p(1.0));
+    const auto one = torch::zeros({1, 4, 4}, torch::kUInt8);
+    TM_CHECK(always_gray(one).sizes() == one.sizes());
+    TM_CHECK(throws_invalid([&] { return always_gray(torch::zeros({4, 4})); }));
+    // the neutral option defaults change nothing on uint8 (torchvision has no defaults for these)
+    const auto x = torch::randint(0, 256, {3, 4, 5}, torch::kUInt8);
+    const T::RandomPosterize post(T::random_posterize_option().p(1.0));
+    const T::RandomSolarize sol(T::random_solarize_option().p(1.0));
+    const T::RandomAdjustSharpness sharp(T::random_adjust_sharpness_option().p(1.0));
+    TM_CHECK(torch::equal(post(x), x) && torch::equal(sol(x), x) && torch::equal(sharp(x), x));
+    TM_CHECK(throws_invalid([] { return T::RandomInvert(T::random_apply_option().p(1.1)); }));
+    TM_CHECK(throws_invalid([] { return T::RandomPosterize(T::random_posterize_option().p(-0.1)); }));
+}
+
 int main() {
     TM_RUN(test_imagenet_recipe);
     TM_RUN(test_classes_match_functional);
     TM_RUN(test_random_flips);
     TM_RUN(test_validation);
+    TM_RUN(test_gaussian_blur);
+    TM_RUN(test_random_color);
     return tm_test::summary("vision_test_transform");
 }

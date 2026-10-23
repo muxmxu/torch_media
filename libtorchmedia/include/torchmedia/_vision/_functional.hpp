@@ -9,11 +9,20 @@
 #include <cstdlib>
 #include <format>
 #include <limits>
+#include <numbers>
 #include <optional>
 #include <string>
 #include <torch/torch.h>
 #include <vector>
 #include "../globel_include.hpp"
+
+// Scalar math that mirrors Python float arithmetic must not be fused into FMAs (clang contracts a * b + c within an
+// expression by default; GCC in ISO mode and MSVC do not). Used as the first statement of such function bodies.
+#if defined(__clang__)
+#define TORCHMEDIA_FP_CONTRACT_OFF _Pragma("clang fp contract(off)")
+#else
+#define TORCHMEDIA_FP_CONTRACT_OFF
+#endif
 
 // Image tensors follow torchvision's [..., C, H, W] layout (uint8 in [0, 255] or floating in [0, 1]) with any number
 // of leading batch dims. Every op mirrors the torchvision 0.20.1 transforms.v2.functional tensor kernel (`*_image`)
@@ -211,6 +220,202 @@ namespace torchmedia::vision::functional {
             }
             return "";
         }
+
+        inline auto invalid(std::string msg) -> tensor_t {
+            return handle_exceptions<tensor_t, std::invalid_argument>(std::move(msg));
+        }
+
+        inline auto bad_channels(const tensor_t &img) -> bool {
+            return img.dim() < 3 || (img.size(-3) != 1 && img.size(-3) != 3);
+        }
+
+        // The float luma [..., 1, H, W] of a 3-channel image (torchvision _rgb_to_grayscale_image, preserve_dtype
+        // False). Integers enter as float32 up front (torch's own promotion, same values): MPS mul(uint8, float)
+        // aborts.
+        inline auto luma(const tensor_t &img) -> tensor_t {
+            const auto rgb = (img.is_floating_point() ? img : img.to(torch::kFloat32)).unbind(-3);
+            return rgb[0].mul(0.2989).add_(rgb[1], 0.587).add_(rgb[2], 0.114).unsqueeze(-3);
+        }
+
+        // torchvision _blend: img1 * ratio + img2 * (1 - ratio), clamped to the dtype range, integers truncated back.
+        inline auto blend(const tensor_t &img1, const tensor_t &img2, double ratio) -> tensor_t {
+            const auto out = img1.mul(ratio).add_(img2, 1.0 - ratio).clamp_(0, max_value(img1.scalar_type()));
+            return img1.is_floating_point() ? out : out.to(img1.scalar_type());
+        }
+
+        // torchvision _rgb_to_hsv / _hsv_to_rgb on float [..., 3, H, W], the same in-place op sequence.
+        inline auto rgb_to_hsv(const tensor_t &image) -> tensor_t {
+            const auto ch = image.unbind(-3);
+            auto [minc, maxc] = torch::aminmax(image, -3);
+            const auto eqc = maxc == minc;
+            const auto channels_range = maxc - minc;
+            const auto ones = torch::ones_like(maxc);
+            const auto s = channels_range / torch::where(eqc, ones, maxc);
+            const auto divisor = torch::where(eqc, ones, channels_range).unsqueeze_(-3);
+            const auto c = ((maxc.unsqueeze(-3) - image) / divisor).unbind(-3);
+            auto rc = c[0], gc = c[1], bc = c[2];
+            auto maxc_neq_r = maxc != ch[0];
+            auto maxc_eq_g = maxc == ch[1];
+            const auto hg = rc.add(2.0).sub_(bc).mul_(maxc_eq_g & maxc_neq_r);
+            const auto hr = bc.sub_(gc).mul_(~maxc_neq_r);
+            const auto hb = gc.add_(4.0).sub_(rc).mul_(maxc_neq_r.logical_and_(maxc_eq_g.logical_not_()));
+            auto h = hr.add_(hg).add_(hb);
+            h = h.mul_(1.0 / 6.0).add_(1.0).fmod_(1.0);
+            return torch::stack({h, s, maxc}, -3);
+        }
+
+        inline auto hsv_to_rgb(const tensor_t &img) -> tensor_t {
+            const auto hsv = img.unbind(-3);
+            const auto &s = hsv[1];
+            const auto &v = hsv[2];
+            const auto h6 = hsv[0].mul(6);
+            auto i = torch::floor(h6);
+            const auto f = h6.sub_(i);
+            i = i.to(torch::kInt32);
+            auto sxf = s * f;
+            auto one_minus_s = torch::rsub(s, 1.0);
+            const auto q = torch::rsub(sxf, 1.0).mul_(v).clamp_(0.0, 1.0);
+            const auto t = sxf.add_(one_minus_s).mul_(v).clamp_(0.0, 1.0);
+            const auto p = one_minus_s.mul_(v).clamp_(0.0, 1.0);
+            i.remainder_(6);
+            const auto vpqt = torch::stack({v, p, q, t}, -3);
+            auto select = torch::tensor({0, 2, 1, 1, 3, 0, 3, 0, 0, 2, 1, 1, 1, 1, 3, 0, 0, 2}, torch::kLong)
+                                  .view({3, 6})
+                                  .to(img.device());
+            select = select.index({torch::indexing::Slice(), i});
+            if (select.dim() > 3) {
+                select = select.movedim(0, -3);
+            }
+            return vpqt.gather(-3, select);
+        }
+
+        // Python float `a % b` for b > 0 (fmod, shifted into [0, b)).
+        inline auto py_mod(double a, double b) -> double {
+            const double m = std::fmod(a, b);
+            return m < 0 ? m + b : (m == 0 ? 0.0 : m);
+        }
+
+        // torchvision _get_inverse_affine_matrix (inverted=True): the output -> input pixel map around `center`
+        // (relative to the image center), in Python's double op order.
+        inline auto inverse_affine_matrix(const std::array<double, 2> &center, double angle,
+                                          const std::array<double, 2> &translate, double scale,
+                                          const std::array<double, 2> &shear) -> std::array<double, 6> {
+            TORCHMEDIA_FP_CONTRACT_OFF
+            constexpr double deg_to_rad = std::numbers::pi / 180.0; // math.radians
+            const double rot = angle * deg_to_rad;
+            const double sx = shear[0] * deg_to_rad;
+            const double sy = shear[1] * deg_to_rad;
+            const double cos_sy = std::cos(sy);
+            const double tan_sx = std::tan(sx);
+            const double rot_minus_sy = rot - sy;
+            const double cx_plus_tx = center[0] + translate[0];
+            const double cy_plus_ty = center[1] + translate[1];
+            const double a = std::cos(rot_minus_sy) / cos_sy;
+            const double b = -(a * tan_sx + std::sin(rot));
+            const double c = std::sin(rot_minus_sy) / cos_sy;
+            const double d = std::cos(rot) - c * tan_sx;
+            std::array<double, 6> m{d / scale, -b / scale, 0.0, -c / scale, a / scale, 0.0};
+            m[2] += center[0] - m[0] * cx_plus_tx - m[1] * cy_plus_ty;
+            m[5] += center[1] - m[3] * cx_plus_tx - m[4] * cy_plus_ty;
+            return m;
+        }
+
+        // torchvision _compute_affine_output_size_tensor (float32 corner math, 1e-4 truncation): {w, h}.
+        inline auto affine_output_size(const std::array<double, 6> &m, int64_t w, int64_t h) -> std::array<int64_t, 2> {
+            const double hw = 0.5 * static_cast<double>(w);
+            const double hh = 0.5 * static_cast<double>(h);
+            const auto f32 = [](std::vector<double> v) {
+                return torch::tensor(v, torch::kFloat64).to(torch::kFloat32);
+            };
+            const auto pts = f32({-hw, -hh, 1.0, -hw, hh, 1.0, hw, hh, 1.0, hw, -hh, 1.0}).view({4, 3});
+            const auto theta = f32({m.begin(), m.end()}).view({2, 3});
+            auto [min_vals, max_vals] = torch::matmul(pts, theta.t()).aminmax(0);
+            const auto halfs = f32({hw, hh});
+            min_vals.add_(halfs);
+            max_vals.add_(halfs);
+            const double tol = 1e-4;
+            const double inv_tol = 1.0 / tol;
+            const auto cmax = max_vals.mul_(inv_tol).trunc_().mul_(tol).ceil_();
+            const auto cmin = min_vals.mul_(inv_tol).trunc_().mul_(tol).floor_();
+            const auto size = cmax.sub_(cmin);
+            return {static_cast<int64_t>(size[0].item<float>()), static_cast<int64_t>(size[1].item<float>())};
+        }
+
+        // torchvision _affine_grid: the sampling grid of an output of oh x ow pixels, normalised by the input w x h.
+        // The base linspaces are default-dtype (float32) even for a float64 theta, as in torchvision.
+        inline auto affine_grid(const tensor_t &theta, int64_t w, int64_t h, int64_t ow, int64_t oh) -> tensor_t {
+            const auto dev = torch::TensorOptions().device(theta.device());
+            auto base_grid = torch::empty({1, oh, ow, 3}, theta.options());
+            const double fow = static_cast<double>(ow);
+            const double foh = static_cast<double>(oh);
+            base_grid.select(-1, 0).copy_(torch::linspace((1.0 - fow) * 0.5, (fow - 1.0) * 0.5, ow, dev));
+            base_grid.select(-1, 1).copy_(
+                    torch::linspace((1.0 - foh) * 0.5, (foh - 1.0) * 0.5, oh, dev).unsqueeze_(-1));
+            base_grid.select(-1, 2).fill_(1);
+            const auto scale =
+                    torch::tensor({0.5 * static_cast<double>(w), 0.5 * static_cast<double>(h)}, torch::kFloat64)
+                            .to(theta.options());
+            const auto rescaled_theta = theta.transpose(1, 2).div_(scale);
+            return base_grid.view({1, oh * ow, 3}).bmm(rescaled_theta).view({1, oh, ow, 2});
+        }
+
+        // torchvision _assert_grid_transform_inputs plus the [..., C, H, W] rank the grid ops need.
+        inline auto grid_error(const char *op, const tensor_t &img, interpolation_mode mode,
+                               const std::vector<double> &fill, const std::vector<double> &center = {}) -> std::string {
+            if (img.dim() < 3) {
+                return rank_error(op, img, 3);
+            }
+            if (!center.empty() && center.size() != 2) {
+                return std::format("{}: center must be empty or {{x, y}}.", op);
+            }
+            if (fill.size() > 1 && static_cast<int64_t>(fill.size()) != img.size(-3)) {
+                return std::format("{}: the number of elements in 'fill' cannot broadcast to match the number of "
+                                   "channels of the image ({} != {}).",
+                                   op, fill.size(), img.size(-3));
+            }
+            if (mode != interpolation_mode::nearest && mode != interpolation_mode::bilinear) {
+                return std::format("{}: only nearest and bilinear interpolation are supported.", op);
+            }
+            return "";
+        }
+
+        // torchvision _apply_grid_transform: grid_sample with zero padding; a non-empty fill samples a ones mask
+        // alongside the image and blends the fill in where the mask is not 1. Integer images are rounded back.
+        inline auto apply_grid_transform(const tensor_t &img, tensor_t grid, interpolation_mode mode,
+                                         const std::vector<double> &fill) -> tensor_t {
+            const auto c = img.size(-3);
+            const auto ih = img.size(-2);
+            const auto iw = img.size(-1);
+            auto out_shape = img.sizes().vec();
+            out_shape[out_shape.size() - 2] = grid.size(1);
+            out_shape.back() = grid.size(2);
+            if (img.numel() == 0) {
+                return img.reshape(out_shape);
+            }
+            auto x = img.reshape({-1, c, ih, iw});
+            const auto batch = x.size(0);
+            const bool fp = img.scalar_type() == grid.scalar_type();
+            if (!fp) {
+                x = x.to(grid.scalar_type());
+            }
+            if (batch > 1) {
+                grid = grid.expand({batch, -1, -1, -1});
+            }
+            if (!fill.empty()) {
+                x = torch::cat({x, torch::ones({batch, 1, ih, iw}, x.options())}, 1);
+            }
+            // torch.nn.functional.grid_sample: mode bilinear 0, nearest 1, bicubic 2; padding zeros 0
+            const int64_t m = mode == interpolation_mode::bilinear ? 0 : mode == interpolation_mode::nearest ? 1 : 2;
+            x = torch::grid_sampler(x, grid, m, 0, false);
+            if (!fill.empty()) {
+                const auto mask = x.slice(1, c).expand({-1, c, -1, -1});
+                x = x.slice(1, 0, c);
+                const auto fill_img = torch::tensor(fill, torch::kFloat64).to(x.options()).view({1, -1, 1, 1});
+                x = mode == interpolation_mode::nearest ? torch::where(mask < 0.5, fill_img.expand_as(x), x)
+                                                        : x.sub_(fill_img).mul_(mask).add_(fill_img);
+            }
+            return (fp ? x : x.round_().to(img.scalar_type())).reshape(out_shape);
+        }
     } // namespace detail
 
     inline auto hflip(const tensor_t &img) -> tensor_t { return img.flip(-1); }
@@ -224,7 +429,7 @@ namespace torchmedia::vision::functional {
             return handle_exceptions<tensor_t, std::invalid_argument>(
                     std::format("rgb_to_grayscale: num_output_channels must be 1 or 3, got {}.", num_output_channels));
         }
-        if (img.dim() < 3 || (img.size(-3) != 1 && img.size(-3) != 3)) {
+        if (detail::bad_channels(img)) {
             return handle_exceptions<tensor_t, std::invalid_argument>(
                     "rgb_to_grayscale: expected a [..., 1 or 3, H, W] image.");
         }
@@ -236,9 +441,7 @@ namespace torchmedia::vision::functional {
             reps[img.dim() - 3] = 3;
             return img.repeat(reps);
         }
-        // integers in float32 up front (torch's own promotion, same values): MPS mul(uint8, float) aborts the process
-        const auto rgb = (img.is_floating_point() ? img : img.to(torch::kFloat32)).unbind(-3);
-        auto l = rgb[0].mul(0.2989).add_(rgb[1], 0.587).add_(rgb[2], 0.114).unsqueeze(-3).to(img.scalar_type());
+        auto l = detail::luma(img).to(img.scalar_type());
         return num_output_channels == 3 ? l.expand(img.sizes()) : l;
     }
 
@@ -505,7 +708,7 @@ namespace torchmedia::vision::functional {
             return handle_exceptions<tensor_t, std::invalid_argument>(
                     std::format("adjust_brightness: brightness_factor ({}) is not non-negative.", brightness_factor));
         }
-        if (img.dim() < 3 || (img.size(-3) != 1 && img.size(-3) != 3)) {
+        if (detail::bad_channels(img)) {
             return handle_exceptions<tensor_t, std::invalid_argument>(
                     "adjust_brightness: expected a [..., 1 or 3, H, W] image.");
         }
@@ -526,6 +729,431 @@ namespace torchmedia::vision::functional {
                     "invert: only floating and integer images are supported.");
         }
         return img.bitwise_xor(detail::max_value(img.scalar_type()));
+    }
+
+    // Blend with the mean luma of each image (torchvision adjust_contrast: integer luma floored first).
+    inline auto adjust_contrast(const tensor_t &img, double contrast_factor) -> tensor_t {
+        if (contrast_factor < 0) {
+            return detail::invalid(
+                    std::format("adjust_contrast: contrast_factor ({}) is not non-negative.", contrast_factor));
+        }
+        if (detail::bad_channels(img)) {
+            return detail::invalid("adjust_contrast: expected a [..., 1 or 3, H, W] image.");
+        }
+        const bool fp = img.is_floating_point();
+        auto gray = img.size(-3) == 3 ? detail::luma(img) : (fp ? img : img.to(torch::kFloat32));
+        if (!fp && img.size(-3) == 3) {
+            gray = gray.floor_();
+        }
+        return detail::blend(img, gray.mean({-3, -2, -1}, true), contrast_factor);
+    }
+
+    // Blend with the per-pixel luma (integer luma floored first); a 1-channel image is returned as is.
+    inline auto adjust_saturation(const tensor_t &img, double saturation_factor) -> tensor_t {
+        if (saturation_factor < 0) {
+            return detail::invalid(
+                    std::format("adjust_saturation: saturation_factor ({}) is not non-negative.", saturation_factor));
+        }
+        if (detail::bad_channels(img)) {
+            return detail::invalid("adjust_saturation: expected a [..., 1 or 3, H, W] image.");
+        }
+        if (img.size(-3) == 1) {
+            return img;
+        }
+        auto gray = detail::luma(img);
+        return detail::blend(img, img.is_floating_point() ? gray : gray.floor_(), saturation_factor);
+    }
+
+    // Blend the interior pixels with a 3 x 3 smoothing (1, 5 center / 13) of the image; the border is kept.
+    inline auto adjust_sharpness(const tensor_t &img, double sharpness_factor) -> tensor_t {
+        if (detail::bad_channels(img)) {
+            return detail::invalid("adjust_sharpness: expected a [..., 1 or 3, H, W] image.");
+        }
+        if (sharpness_factor < 0) {
+            return detail::invalid(
+                    std::format("adjust_sharpness: sharpness_factor ({}) is not non-negative.", sharpness_factor));
+        }
+        const auto c = img.size(-3);
+        const auto h = img.size(-2);
+        const auto w = img.size(-1);
+        if (img.numel() == 0 || h <= 2 || w <= 2) {
+            return img;
+        }
+        const bool fp = img.is_floating_point();
+        const auto kdtype = fp ? img.scalar_type() : torch::kFloat32;
+        const double a = 1.0 / 13.0;
+        const double b = 5.0 / 13.0;
+        const auto kernel = torch::tensor({a, a, a, a, b, a, a, a, a}, torch::kFloat64)
+                                    .to(torch::TensorOptions().dtype(kdtype).device(img.device()))
+                                    .view({3, 3})
+                                    .expand({c, 1, 3, 3});
+        auto out = (img.dim() > 4 ? img.reshape({-1, c, h, w}) : img).to(kdtype, false, true);
+        auto blurred = torch::conv2d(out, kernel, {}, 1, torch::IntArrayRef{0}, 1, c);
+        if (!fp) {
+            blurred = blurred.round_();
+        }
+        auto view = out.slice(-2, 1, h - 1).slice(-1, 1, w - 1);
+        view.add_(blurred.sub_(view), 1.0 - sharpness_factor);
+        out = out.clamp_(0, detail::max_value(img.scalar_type()));
+        if (!fp) {
+            out = out.to(img.scalar_type());
+        }
+        return img.dim() > 4 ? out.reshape(img.sizes()) : out;
+    }
+
+    // Shift the hue by hue_factor (in [-0.5, 0.5]) through HSV in float32; a 1-channel image is returned as is.
+    inline auto adjust_hue(const tensor_t &img, double hue_factor) -> tensor_t {
+        if (!(hue_factor >= -0.5 && hue_factor <= 0.5)) {
+            return detail::invalid(std::format("adjust_hue: hue_factor ({}) is not in [-0.5, 0.5].", hue_factor));
+        }
+        if (detail::bad_channels(img)) {
+            return detail::invalid("adjust_hue: expected a [..., 1 or 3, H, W] image.");
+        }
+        if (img.size(-3) == 1 || img.numel() == 0) {
+            return img;
+        }
+        auto hsv = detail::rgb_to_hsv(to_dtype(img, torch::kFloat32, true)).unbind(-3);
+        hsv[0].add_(hue_factor).remainder_(1.0);
+        return to_dtype(detail::hsv_to_rgb(torch::stack(hsv, -3)), img.scalar_type(), true);
+    }
+
+    // gain * x^gamma on the [0, 1] scale (integers are scaled to float32 and back), clamped only when gain != 1.
+    inline auto adjust_gamma(const tensor_t &img, double gamma, double gain = 1.0) -> tensor_t {
+        if (gamma < 0) {
+            return detail::invalid("adjust_gamma: gamma should be a non-negative real number.");
+        }
+        auto out = img.is_floating_point() ? img.pow(gamma) : to_dtype(img, torch::kFloat32, true).pow_(gamma);
+        if (gain != 1.0) {
+            out = out.mul(gain).clamp_(0.0, 1.0); // out of place: see to_dtype (mul_(Scalar) on half / bfloat16)
+        }
+        return to_dtype(out, img.scalar_type(), true);
+    }
+
+    // Keep the `bits` most significant bits (floating images: floor to 2^bits levels).
+    inline auto posterize(const tensor_t &img, int64_t bits) -> tensor_t {
+        if (img.is_floating_point()) {
+            if (bits < 0 || bits > 62) {
+                return detail::invalid(
+                        std::format("posterize: bits must be in [0, 62] for floating images, got {}.", bits));
+            }
+            const int64_t levels = int64_t{1} << bits;
+            return img.mul(levels).floor_().clamp_(0, levels - 1).mul_(1.0 / static_cast<double>(levels));
+        }
+        const int64_t num_bits = detail::num_value_bits(img.scalar_type());
+        if (num_bits == 0 || bits < 0) {
+            return detail::invalid("posterize: expected an integer or floating image and bits >= 0.");
+        }
+        if (bits >= num_bits) {
+            return img;
+        }
+        return img.bitwise_and(((int64_t{1} << bits) - 1) << (num_bits - bits));
+    }
+
+    // Invert the pixels >= threshold.
+    inline auto solarize(const tensor_t &img, double threshold) -> tensor_t {
+        if (threshold > static_cast<double>(detail::max_value(img.scalar_type()))) {
+            return detail::invalid(std::format(
+                    "solarize: threshold should be less or equal the maximum value of the dtype, but got {}.",
+                    threshold));
+        }
+        return torch::where(img >= threshold, invert(img), img);
+    }
+
+    // Stretch each channel to the full range (a constant channel is left as is).
+    inline auto autocontrast(const tensor_t &img) -> tensor_t {
+        if (detail::bad_channels(img)) {
+            return detail::invalid("autocontrast: expected a [..., 1 or 3, H, W] image.");
+        }
+        if (img.numel() == 0) {
+            return img;
+        }
+        const auto bound = detail::max_value(img.scalar_type());
+        const bool fp = img.is_floating_point();
+        auto f = fp ? img : img.to(torch::kFloat32);
+        auto minimum = f.amin({-2, -1}, true);
+        auto maximum = f.amax({-2, -1}, true);
+        const auto eq_idxs = maximum == minimum;
+        auto inv_scale = maximum.sub_(minimum).mul_(1.0 / static_cast<double>(bound));
+        minimum.index_put_({eq_idxs}, 0.0);
+        inv_scale.index_put_({eq_idxs}, 1.0);
+        const auto diff = fp ? f.sub(minimum) : f.sub_(minimum);
+        return diff.div_(inv_scale).clamp_(0, bound).to(img.scalar_type());
+    }
+
+    // Histogram equalization per channel with PIL's lookup table, computed on the uint8 version of the image.
+    inline auto equalize(const tensor_t &img) -> tensor_t {
+        if (img.numel() == 0) {
+            return img;
+        }
+        const auto u8 = to_dtype(img, torch::kUInt8, true);
+        if (u8.dim() < 2) {
+            return detail::invalid(detail::rank_error("equalize", img, 2));
+        }
+        auto lut_shape = u8.sizes().vec();
+        lut_shape.resize(lut_shape.size() - 2);
+        const auto flat = u8.flatten(-2).to(torch::kLong);
+        lut_shape.push_back(256);
+        auto hist = flat.new_zeros(lut_shape, torch::kInt32);
+        hist.scatter_add_(-1, flat, hist.new_ones({1}).expand_as(flat));
+        auto cum_hist = hist.cumsum(-1);
+        const auto index = cum_hist.argmax(-1).unsqueeze_(-1);
+        auto step = torch::rsub(hist.gather(-1, index), flat.size(-1)).div_(255, "floor");
+        const auto valid = step.ne(0).unsqueeze_(-1);
+        cum_hist = cum_hist.slice(-1, 0, 255);
+        cum_hist.add_(torch::floor_divide(step, 2));
+        cum_hist.div_(step.clamp_min_(1), "floor").clamp_(0, 255);
+        auto lut = cum_hist.to(torch::kUInt8);
+        lut_shape.back() = 1;
+        lut = torch::cat({lut.new_zeros({1}).expand(lut_shape), lut}, -1);
+        const auto equalized = lut.gather(-1, flat).view_as(u8);
+        return to_dtype(torch::where(valid, equalized, u8), img.scalar_type(), true);
+    }
+
+    // Gaussian blur with reflect padding. kernel_size {k} or {kx, ky} (odd, positive); sigma {} (0.3 * ((k - 1) *
+    // 0.5 - 1) + 0.8 = k * 0.15 + 0.35 per axis), {s} or {sx, sy}. Integer images are blurred in float32 and rounded.
+    inline auto gaussian_blur(const tensor_t &img, std::vector<int64_t> kernel_size, std::vector<double> sigma = {})
+            -> tensor_t {
+        TORCHMEDIA_FP_CONTRACT_OFF
+        if (kernel_size.size() == 1) {
+            kernel_size.push_back(kernel_size[0]);
+        }
+        if (kernel_size.size() != 2) {
+            return detail::invalid(
+                    std::format("gaussian_blur: kernel_size must have 1 or 2 elements, got {}.", kernel_size.size()));
+        }
+        for (const auto k: kernel_size) {
+            if (k % 2 == 0 || k < 0) {
+                return detail::invalid(
+                        std::format("gaussian_blur: kernel_size should have odd and positive integers, got {}.", k));
+            }
+        }
+        if (sigma.empty()) {
+            for (const auto k: kernel_size) {
+                sigma.push_back(static_cast<double>(k) * 0.15 + 0.35);
+            }
+        } else if (sigma.size() == 1) {
+            sigma.push_back(sigma[0]);
+        }
+        if (sigma.size() != 2 || sigma[0] <= 0.0 || sigma[1] <= 0.0) { // torchvision's `s <= 0.0`: NaN passes
+            return detail::invalid("gaussian_blur: sigma should have 1 or 2 positive values.");
+        }
+        if (img.dim() < 3) {
+            return detail::invalid(detail::rank_error("gaussian_blur", img, 3));
+        }
+        if (img.numel() == 0) {
+            return img;
+        }
+        const bool fp = img.is_floating_point();
+        const auto opts = torch::TensorOptions().dtype(fp ? img.scalar_type() : torch::kFloat32).device(img.device());
+        const auto kernel1d = [&](int64_t k, double s) {
+            const double lim = static_cast<double>(k - 1) / (2.0 * std::sqrt(2.0));
+            return torch::softmax(torch::linspace(-lim, lim, k, opts).div(s).pow(2).neg(), 0);
+        };
+        const auto c = img.size(-3);
+        const auto kernel = (kernel1d(kernel_size[1], sigma[1]).unsqueeze(-1) * kernel1d(kernel_size[0], sigma[0]))
+                                    .expand({c, 1, kernel_size[1], kernel_size[0]});
+        auto x = img.dim() == 3 ? img.unsqueeze(0) : img.reshape({-1, c, img.size(-2), img.size(-1)});
+        x = torch::pad(fp ? x : x.to(torch::kFloat32),
+                       {kernel_size[0] / 2, kernel_size[0] / 2, kernel_size[1] / 2, kernel_size[1] / 2}, "reflect");
+        x = torch::conv2d(x, kernel, {}, 1, torch::IntArrayRef{0}, 1, c).reshape(img.sizes());
+        return fp ? x : x.round_().to(img.scalar_type());
+    }
+
+    // Set img[..., i:i+h, j:j+w] = v (Python slice semantics); a copy unless inplace.
+    inline auto erase(const tensor_t &img, int64_t i, int64_t j, int64_t h, int64_t w, const tensor_t &v,
+                      bool inplace = false) -> tensor_t {
+        auto out = inplace ? img : img.clone();
+        using torch::indexing::Ellipsis;
+        using torch::indexing::Slice;
+        out.index_put_({Ellipsis, Slice(i, i + h), Slice(j, j + w)}, v);
+        return out;
+    }
+
+    // ---------------- geometry: grid-sampled warps (torchvision rotate / affine / perspective / elastic)
+    // ---------------- interpolation: nearest or bilinear (elastic also bicubic). fill: {} = None (zero padding, no
+    // mask), {v} or one value per channel (blended in through a sampled mask, as torchvision does). center: {} = image
+    // center, or {x, y} in pixel coordinates.
+
+    // Rotate counter-clockwise by angle degrees; expand grows the output to hold the whole rotated image. Multiples of
+    // 90 degrees about the image center are exact transposes (180, and 90 / 270 when square or expand).
+    inline auto rotate(const tensor_t &img, double angle,
+                       interpolation_mode interpolation = interpolation_mode::nearest, bool expand = false,
+                       const std::vector<double> &center = {}, const std::vector<double> &fill = {}) -> tensor_t {
+        angle = detail::py_mod(angle, 360.0);
+        if (center.empty()) {
+            if (angle == 0) {
+                return img.clone();
+            }
+            if (angle == 180) {
+                return torch::rot90(img, 2, {-2, -1});
+            }
+            if (expand || img.size(-1) == img.size(-2)) {
+                if (angle == 90) {
+                    return torch::rot90(img, 1, {-2, -1});
+                }
+                if (angle == 270) {
+                    return torch::rot90(img, 3, {-2, -1});
+                }
+            }
+        }
+        if (auto err = detail::grid_error("rotate", img, interpolation, fill, center); !err.empty()) {
+            return detail::invalid(err);
+        }
+        const auto h = img.size(-2);
+        const auto w = img.size(-1);
+        std::array<double, 2> center_f{0.0, 0.0};
+        if (!center.empty()) { // relative to the image center
+            center_f = {center[0] - static_cast<double>(w) * 0.5, center[1] - static_cast<double>(h) * 0.5};
+        }
+        const auto m = detail::inverse_affine_matrix(center_f, -angle, {0.0, 0.0}, 1.0, {0.0, 0.0});
+        const auto out_wh = expand ? detail::affine_output_size(m, w, h) : std::array<int64_t, 2>{w, h};
+        const auto dtype = img.is_floating_point() ? img.scalar_type() : torch::kFloat32;
+        const auto theta = torch::tensor(torch::ArrayRef<double>(m.data(), m.size()), torch::kFloat64)
+                                   .to(torch::TensorOptions().dtype(dtype).device(img.device()))
+                                   .reshape({1, 2, 3});
+        return detail::apply_grid_transform(img, detail::affine_grid(theta, w, h, out_wh[0], out_wh[1]), interpolation,
+                                            fill);
+    }
+
+    // Affine warp: rotate by angle degrees (clockwise), scale, shear ({s} = {s, s}; torchvision's scalar s is
+    // {s, 0}) in degrees, then translate by {tx, ty} pixels, all about center.
+    inline auto affine(const tensor_t &img, double angle, const std::vector<double> &translate, double scale,
+                       std::vector<double> shear, interpolation_mode interpolation = interpolation_mode::nearest,
+                       const std::vector<double> &fill = {}, const std::vector<double> &center = {}) -> tensor_t {
+        if (translate.size() != 2) {
+            return detail::invalid("affine: translate should be a sequence of length 2.");
+        }
+        if (scale <= 0.0) {
+            return detail::invalid("affine: scale should be positive.");
+        }
+        if (shear.size() == 1) {
+            shear.push_back(shear[0]);
+        }
+        if (shear.size() != 2) {
+            return detail::invalid("affine: shear should contain one or two values.");
+        }
+        if (auto err = detail::grid_error("affine", img, interpolation, fill, center); !err.empty()) {
+            return detail::invalid(err);
+        }
+        const auto h = img.size(-2);
+        const auto w = img.size(-1);
+        std::array<double, 2> center_f{0.0, 0.0};
+        if (!center.empty()) {
+            center_f = {center[0] - static_cast<double>(w) * 0.5, center[1] - static_cast<double>(h) * 0.5};
+        }
+        const auto m = detail::inverse_affine_matrix(center_f, angle, {translate[0], translate[1]}, scale,
+                                                     {shear[0], shear[1]});
+        const auto dtype = img.is_floating_point() ? img.scalar_type() : torch::kFloat32;
+        const auto theta = torch::tensor(torch::ArrayRef<double>(m.data(), m.size()), torch::kFloat64)
+                                   .to(torch::TensorOptions().dtype(dtype).device(img.device()))
+                                   .reshape({1, 2, 3});
+        return detail::apply_grid_transform(img, detail::affine_grid(theta, w, h, w, h), interpolation, fill);
+    }
+
+    // Perspective warp mapping the 4 startpoints (tl, tr, br, bl; {x, y}) to the endpoints, or given directly by the 8
+    // coefficients (a..h: x' = (ax + by + c) / (gx + hy + 1), y' = (dx + ey + f) / (gx + hy + 1)). Integral point
+    // coordinates are solved exactly like torchvision's Python ints; a row with a fractional coordinate is rounded to
+    // float32 like its Python float list.
+    inline auto perspective(const tensor_t &img, const std::vector<std::array<double, 2>> &startpoints,
+                            const std::vector<std::array<double, 2>> &endpoints,
+                            interpolation_mode interpolation = interpolation_mode::bilinear,
+                            const std::vector<double> &fill = {}, const std::vector<double> &coefficients = {})
+            -> tensor_t {
+        const bool points = !startpoints.empty() && !endpoints.empty();
+        std::string err;
+        if (!coefficients.empty()) {
+            err = points ? "the startpoints/endpoints and the coefficients shouldn't be defined concurrently."
+                  : coefficients.size() != 8 ? "coefficients should have 8 float values."
+                                             : "";
+        } else if (!points) {
+            err = "either the startpoints/endpoints or the coefficients must be given.";
+        } else if (startpoints.size() != 4 || endpoints.size() != 4) {
+            err = std::format("please provide exactly four corners, got {} startpoints and {} endpoints.",
+                              startpoints.size(), endpoints.size());
+        }
+        if (!err.empty()) {
+            return detail::invalid("perspective: " + err);
+        }
+        if (auto e = detail::grid_error("perspective", img, interpolation, fill); !e.empty()) {
+            return detail::invalid(e);
+        }
+        std::vector<double> c = coefficients;
+        if (c.empty()) { // torchvision _get_perspective_coeffs: float64 least squares (gels), rounded to float32
+            auto a = torch::zeros({8, 8}, torch::kFloat64);
+            std::vector<double> b;
+            const auto integral = [](double v) { return v == std::trunc(v); };
+            for (int64_t i = 0; i < 4; ++i) {
+                const auto &p1 = endpoints[i];
+                const auto &p2 = startpoints[i];
+                for (int64_t k = 0; k < 2; ++k) {
+                    std::vector<double> row{0, 0, 0, 0, 0, 0, -p2[k] * p1[0], -p2[k] * p1[1]};
+                    row[3 * k] = p1[0];
+                    row[3 * k + 1] = p1[1];
+                    row[3 * k + 2] = 1;
+                    auto r = torch::tensor(row, torch::kFloat64);
+                    if (!(integral(p1[0]) && integral(p1[1]) && integral(p2[k]))) {
+                        r = r.to(torch::kFloat32).to(torch::kFloat64);
+                    }
+                    a[2 * i + k].copy_(r);
+                    b.push_back(p2[k]);
+                }
+            }
+            const auto res =
+                    std::get<0>(torch::linalg_lstsq(a, torch::tensor(b, torch::kFloat64), std::nullopt, "gels"))
+                            .to(torch::kFloat32)
+                            .to(torch::kFloat64);
+            c.assign(res.data_ptr<double>(), res.data_ptr<double>() + 8);
+        }
+        // torchvision _perspective_grid
+        const auto oh = img.size(-2);
+        const auto ow = img.size(-1);
+        const auto opts = torch::TensorOptions()
+                                  .dtype(img.is_floating_point() ? img.scalar_type() : torch::kFloat32)
+                                  .device(img.device());
+        const auto theta1 =
+                torch::tensor({c[0], c[1], c[2], c[3], c[4], c[5]}, torch::kFloat64).to(opts).view({1, 2, 3});
+        const auto theta2 = torch::tensor({c[6], c[7], 1.0, c[6], c[7], 1.0}, torch::kFloat64).to(opts).view({1, 2, 3});
+        const double d = 0.5;
+        auto base_grid = torch::empty({1, oh, ow, 3}, opts);
+        base_grid.select(-1, 0).copy_(torch::linspace(d, static_cast<double>(ow) + d - 1.0, ow, opts));
+        base_grid.select(-1, 1).copy_(torch::linspace(d, static_cast<double>(oh) + d - 1.0, oh, opts).unsqueeze_(-1));
+        base_grid.select(-1, 2).fill_(1);
+        const auto scale =
+                torch::tensor({0.5 * static_cast<double>(ow), 0.5 * static_cast<double>(oh)}, torch::kFloat64).to(opts);
+        const auto rescaled_theta1 = theta1.transpose(1, 2).div_(scale);
+        const auto flat = base_grid.view({1, oh * ow, 3});
+        const auto grid = flat.bmm(rescaled_theta1).div_(flat.bmm(theta2.transpose(1, 2))).sub_(1.0);
+        return detail::apply_grid_transform(img, grid.view({1, oh, ow, 2}), interpolation, fill);
+    }
+
+    // Displace every output pixel by displacement [1, H, W, 2] (normalised [-1, 1] grid units) from the identity grid.
+    inline auto elastic(const tensor_t &img, const tensor_t &displacement,
+                        interpolation_mode interpolation = interpolation_mode::bilinear,
+                        const std::vector<double> &fill = {}) -> tensor_t {
+        if (img.dim() < 3) {
+            return detail::invalid(detail::rank_error("elastic", img, 3));
+        }
+        if (interpolation == interpolation_mode::nearest_exact) {
+            return detail::invalid("elastic: nearest_exact interpolation is not supported by grid_sample.");
+        }
+        const auto h = img.size(-2);
+        const auto w = img.size(-1);
+        if (displacement.sizes() != torch::IntArrayRef({1, h, w, 2})) {
+            return detail::invalid(std::format("elastic: displacement shape should be (1, {}, {}, 2).", h, w));
+        }
+        // torchvision patch: CPU float16 is warped in float32
+        const bool cpu_half = img.device().is_cpu() && img.scalar_type() == torch::kHalf;
+        const auto x = cpu_half ? img.to(torch::kFloat32) : img;
+        const auto opts = torch::TensorOptions()
+                                  .dtype(x.is_floating_point() ? x.scalar_type() : torch::kFloat32)
+                                  .device(img.device());
+        auto grid = torch::empty({1, h, w, 2}, opts); // torchvision _create_identity_grid
+        const double fw = static_cast<double>(w);
+        const double fh = static_cast<double>(h);
+        grid.select(-1, 0).copy_(torch::linspace((1.0 - fw) / fw, (fw - 1.0) / fw, w, opts));
+        grid.select(-1, 1).copy_(torch::linspace((1.0 - fh) / fh, (fh - 1.0) / fh, h, opts).unsqueeze_(-1));
+        const auto out = detail::apply_grid_transform(x, grid.add_(displacement.to(opts)), interpolation, fill);
+        return cpu_half ? out.to(torch::kHalf) : out;
     }
 
 } // namespace torchmedia::vision::functional

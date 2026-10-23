@@ -41,6 +41,18 @@ stb_image / stb_image_write  (part of stb)
   Upstream:  https://github.com/nothings/stb
   Author:    Sean Barrett
   Vendored:  libtorchmedia/include/torchmedia/_vision/_vendor/{stb_image.h, stb_image_write.h}
+             stb_image.h "stb_image - v2.30", sha256 594c2fe35d49488b4382dbfaec8f98366defca819d916ac95becf3e75f4200b3
+             LOCALLY PATCHED (2026-10-23, marked "torchmedia patch"; JPEG chroma upsampling as libjpeg-turbo does it):
+               1. stbi__resample_row_h_2: the second-to-last output sample of a 4:2:2 (h2v1) chroma row weighted the
+                  far input sample by 3/4 instead of the near one (input[w-2]*3 + input[w-1]); now
+                  input[w-1]*3 + input[w-2], like libjpeg-turbo's fancy upsampling. v2.30 decoded one column of every
+                  4:2:2 JPEG up to ~120 levels off.
+               2. stbi__resample_row_h_2: the left output sample of each pair rounds with +1 instead of +2
+                  (libjpeg-turbo h2v1_fancy_upsample); 4:2:2 mean |delta| 0.24 -> 0.05.
+               3. resampler selection: a 2x horizontally subsampled chroma row of <= 2 samples (images <= 4 px wide) is
+                  replicated, not fancy-upsampled (libjpeg-turbo jinit_upsampler); was up to 92 levels off.
+             patched sha256 1f35cf0502e4a3eb911f9560cd04990569e33428b20738fb61cf64c4d77f0c44
+             (develop_log/2026-10-23/progress09-vision-color-geometry.md, D6)
   License:   public domain (Unlicense) OR MIT, at your option.
 ================================================================================
 torchiva  (algorithm port, not vendored)

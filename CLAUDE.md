@@ -3,9 +3,9 @@
 torch_media (a.k.a. **TorchMedia / libtorchmedia**) is a **header-only C++ library** that
 reimplements **torchaudio / torchvision** functionality on top of **native libtorch
 (`torch::Tensor`) operators**. MIT licensed. Audio covers torchaudio.functional and torchaudio.transforms
-(see develop_log/2026-06-01); vision covers the core torchvision.transforms.v2 resize / crop / pad / dtype / color
-ops as functional ops and transform classes, point-wise identical to torchvision (develop_log/2026-10-23/progress07),
-plus image I/O.
+(see develop_log/2026-06-01); vision covers the core torchvision.transforms.v2 resize / crop / pad / dtype / color /
+rotate / affine / perspective ops as functional ops and transform classes, point-wise identical to torchvision
+(develop_log/2026-10-23/progress07, progress09), plus image I/O (torchvision.io-style uint8 decode_image).
 
 ## Collaboration model (development, not research)
 
@@ -48,6 +48,9 @@ See `develop_log/README.md` for file conventions, templates, and naming.
   setters; namespaces `torchmedia::{audio,vision}::{io,functional,transform}`, `torchmedia::audio::separation` and
   `torchmedia::audio::compliance::kaldi` (torchaudio.compliance.kaldi).
 - **No heavy runtime deps**: prefer header-only / vendored single-header over system libraries.
+- **Python-order scalar math**: a function that reproduces Python float arithmetic (e.g. torchvision's affine matrix)
+  starts with `TORCHMEDIA_FP_CONTRACT_OFF` (clang otherwise fuses `a * b + c` into FMAs and breaks bit-exactness);
+  `-ffast-math` / `-ffp-contract=fast` builds are not bit-exact (develop_log/2026-10-23/progress09 D4).
 
 ## Dependencies & build
 
@@ -62,6 +65,10 @@ See `develop_log/README.md` for file conventions, templates, and naming.
 - Audio I/O: WAV (dr_wav), FLAC (dr_flac), MP3 (dr_mp3) and Ogg Vorbis (stb_vorbis), vendored single-header and
   pinned in THIRD_PARTY_LICENSES; the implementation blocks are emitted in the one TU that defines
   `TORCHMEDIA_IO_IMPLEMENTATION` (each test's `main.cpp` does this). Saving is WAV only.
+- Vision I/O: stb_image / stb_image_write (same implementation macro). `stb_image.h` carries `torchmedia patch`es
+  (JPEG chroma upsampling, THIRD_PARTY_LICENSES): re-apply them when re-vendoring. JPEG decodes differ from
+  torchvision (libjpeg-turbo) by up to 3 levels (4 for 4:4:0 chroma); PNG is exact apart from documented palette /
+  sBIT cases (develop_log/2026-10-23/progress09 D5, D6).
 - Unit tests live in `unit_test/` and double as usage examples.
 - Optional plotting: `torchmedia::plot` (matplot++ / gnuplot) is **opt-in** via `-DTORCHMEDIA_WITH_PLOT=ON`
   (needs gnuplot at runtime + `dependence/matplotplusplus`). The core audio/vision stays header-only and

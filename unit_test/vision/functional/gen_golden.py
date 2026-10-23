@@ -151,6 +151,93 @@ emit("normalize_f32", F.normalize(f32(S), *IMAGENET))
 emit("normalize_f64", F.normalize(f64(B), *IMAGENET))
 emit("normalize_scalar_f32", F.normalize(f32(S), [0.5], [0.25]))
 
+# ---- color ops (progress09): uint8 / float32 / float64, 1- and 3-channel, batch and 5-D ----
+G1 = S[:1]  # 1-channel [1, 5, 7]
+emit("contrast_u8", F.adjust_contrast(S, 0.6))
+emit("contrast_f32", F.adjust_contrast(f32(S), 1.7))
+emit("contrast_f64", F.adjust_contrast(f64(B), 0.4))
+emit("contrast_gray_u8", F.adjust_contrast(G1, 1.5))
+emit("contrast_gray_f32", F.adjust_contrast(f32(G1), 0.5))
+emit("saturation_u8", F.adjust_saturation(S, 0.3))
+emit("saturation_f32", F.adjust_saturation(f32(L), 1.8))
+emit("saturation_f64", F.adjust_saturation(f64(B), 0.0))
+emit("sharpness_u8", F.adjust_sharpness(L, 2.0))
+emit("sharpness_f32", F.adjust_sharpness(f32(S), 0.4))
+emit("sharpness_f64", F.adjust_sharpness(f64(L), 1.5))
+emit("sharpness_5d_f32", F.adjust_sharpness(f32(B).reshape(2, 1, 3, 6, 10), 3.0))
+emit("hue_u8", F.adjust_hue(S, 0.25))
+emit("hue_f32", F.adjust_hue(f32(L), -0.4))
+emit("hue_f64", F.adjust_hue(f64(B), 0.1))
+emit("hue_batch_u8", F.adjust_hue(B, -0.5))
+emit("gamma_u8", F.adjust_gamma(S, 0.5))
+emit("gamma_gain_u8", F.adjust_gamma(S, 2.2, 1.3))
+emit("gamma_f32", F.adjust_gamma(f32(L), 1.8))
+emit("gamma_gain_f64", F.adjust_gamma(f64(B), 0.7, 0.8))
+# half / bfloat16 with a gain: Python's mul_(float) keeps the float opmath (libtorch's mul_(Scalar) would not)
+emit("gamma_gain_f16", F.adjust_gamma(f32(S).half(), 2.2, 0.7).float())
+emit("gamma_gain_bf16", F.adjust_gamma(f32(L).bfloat16(), 1.0, 1.2).float())
+emit("posterize_u8", F.posterize(S, 3))
+emit("posterize_f32", F.posterize(f32(S), 2))
+emit("posterize_white_f32", F.posterize(torch.cat([f32(S), torch.ones(3, 1, 7)], -2), 3))  # 1.0 hits the clamp
+emit("posterize_i16", F.posterize(S.to(torch.int16) * 100, 5))
+emit("solarize_u8", F.solarize(S, 128.0))
+emit("solarize_f32", F.solarize(f32(L), 0.4))
+LOW = S // 3 + 60  # [60, 145]: stretched by autocontrast
+CONST = torch.cat([S[:2], torch.full_like(S[:1], 99)])  # a constant channel: left as is
+emit("autocontrast_u8", F.autocontrast(LOW))
+emit("autocontrast_f32", F.autocontrast(f32(L) * 0.5 + 0.2))
+emit("autocontrast_const_u8", F.autocontrast(CONST))
+emit("equalize_u8", F.equalize(S))
+emit("equalize_batch_u8", F.equalize(B))
+emit("equalize_f32", F.equalize(f32(L)))
+emit("equalize_const_u8", F.equalize(CONST))  # step == 0 for the constant channel
+emit("blur_u8", F.gaussian_blur(L, 3))
+emit("blur_f32", F.gaussian_blur(f32(L), [5, 3], [1.2, 0.7]))
+emit("blur_f64", F.gaussian_blur(f64(B), 3, 0.9))
+emit("blur_5d_f32", F.gaussian_blur(f32(B).reshape(2, 1, 3, 6, 10), [3, 5]))
+emit("blur_default_sigma_f64", F.gaussian_blur(f64(L), [5, 9]))  # k * 0.15 + 0.35 in Python order (no FMA)
+emit("erase_u8", F.erase(S, 1, 2, 3, 4, torch.tensor([7, 8, 9], dtype=torch.uint8).view(3, 1, 1)))
+emit("erase_f32", F.erase(f32(B), -3, -4, 2, 9, torch.tensor(0.25)))
+
+# ---- geometry (progress09): rotate / affine / perspective / elastic ----
+NE, BI, BC = IM.NEAREST, IM.BILINEAR, IM.BICUBIC
+emit("rotate_30_u8", F.rotate(S, 30.0))
+emit("rotate_30_fill_f32", F.rotate(f32(L), 30.0, BI, fill=[0.1, 0.5, 0.9]))
+emit("rotate_expand_u8", F.rotate(L, 37.5, BI, expand=True, fill=[200.0]))
+emit("rotate_expand_nearest_f32", F.rotate(f32(S), -110.0, NE, expand=True, fill=[0.0]))
+emit("rotate_center_f64", F.rotate(f64(S), -20.0, BI, center=[1.0, 2.0]))
+emit("rotate_batch_f32", F.rotate(f32(B), 45.0, NE, fill=[0.3]))
+emit("rotate_90_rect_u8", F.rotate(S, 90.0))  # non-square, no expand: grid path
+emit("affine_u8", F.affine(S, 25.0, [1.0, -2.0], 0.9, [10.0, -5.0]))
+emit("affine_fill_f32", F.affine(f32(L), -40.0, [0.5, 1.5], 1.2, [15.0], BI, [0.2, 0.4, 0.6], [3.0, 4.0]))
+emit("affine_f64", F.affine(f64(B), 10.0, [0.0, 0.0], 1.1, [0.0, 20.0], BI, [0.0]))
+emit("affine_u8_bilinear", F.affine(L, 123.0, [-2.0, 0.0], 0.75, [-8.0, 3.0], BI, [255.0, 0.0, 128.0]))
+SP = [[0, 0], [12, 0], [12, 10], [0, 10]]
+emit("perspective_u8", F.perspective(L, SP, [[1, 0], [11, 2], [12, 9], [0, 10]]))
+emit("perspective_float_f32", F.perspective(f32(L), SP, [[0.5, 0.25], [11.5, 0.0], [12.0, 8.25], [1.25, 10.0]], BI, [0.7]))
+# non-dyadic fractional points: float32 rows of the system; float32 coefficients, visible on a float64 image
+emit("perspective_frac_f32", F.perspective(f32(L), SP, [[0.1, 0.3], [11.7, 0.2], [12, 9.9], [0.4, 10]], BI))
+emit("perspective_frac_f64", F.perspective(f64(L), [[0.1, 0.2], [12.3, 0], [12, 10], [0, 10]], [[1, 0], [11, 2], [12, 9], [0, 10]], BI))
+COEFFS = [1.1, 0.05, -0.5, -0.02, 0.95, 0.7, 0.001, -0.002]
+emit("perspective_coeffs_f64", F.perspective(f64(B), None, None, NE, None, COEFFS))
+emit("perspective_nearest_fill_u8", F.perspective(S, [[0, 0], [6, 0], [6, 4], [0, 4]], [[1, 1], [5, 0], [6, 4], [0, 3]], NE, [9.0, 99.0, 199.0]))
+DS = (torch.rand(1, 5, 7, 2) - 0.5) * 0.4
+DL = (torch.rand(1, 11, 13, 2) - 0.5) * 0.4
+emit("disp_s", DS)
+emit("disp_l", DL)
+emit("elastic_u8", F.elastic(S, DS))
+emit("elastic_bicubic_f32", F.elastic(f32(L), DL, BC))
+emit("elastic_nearest_fill_f64", F.elastic(f64(S), DS, NE, [0.5]))
+emit("elastic_fill_u8", F.elastic(L, DL, BI, [10.0, 20.0, 30.0]))
+emit("elastic_half", F.elastic(f32(S).half(), DS).float())  # CPU float16: warped in float32, cast back
+emit("elastic_bicubic_fill_f32", F.elastic(f32(S), DS, BC, [0.3]))  # bicubic fill: the blend, not nearest's where
+if HAS_MPS:  # torchvision on MPS (float32); its MPS adjust_hue is wrong (non_blocking copy race), see progress09
+    emit("blur_mps_f32", F.gaussian_blur(f32(L).to("mps"), [5, 3], [1.2, 0.7]))
+    emit("sharpness_mps_f32", F.adjust_sharpness(f32(S).to("mps"), 0.4))
+    emit("rotate_mps_f32", F.rotate(f32(L).to("mps"), 30.0, BI, fill=[0.1, 0.5, 0.9]))
+    emit("perspective_mps_f32", F.perspective(f32(L).to("mps"), SP, [[1, 0], [11, 2], [12, 9], [0, 10]], BI))
+    emit("equalize_mps_u8", F.equalize(B.to("mps")))
+
 out = pathlib.Path(__file__).with_name("golden.hpp")
 out.write_text(
     "// Generated by gen_golden.py from torchvision 0.20.1 / torch 2.5.1 on arm64 -- do not edit.\n"

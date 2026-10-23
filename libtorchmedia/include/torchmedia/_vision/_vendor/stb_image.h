@@ -3488,10 +3488,10 @@ static stbi_uc*  stbi__resample_row_h_2(stbi_uc *out, stbi_uc *in_near, stbi_uc 
    out[1] = stbi__div4(input[0]*3 + input[1] + 2);
    for (i=1; i < w-1; ++i) {
       int n = 3*input[i]+2;
-      out[i*2+0] = stbi__div4(n+input[i-1]);
+      out[i*2+0] = stbi__div4(n-1+input[i-1]); // torchmedia patch: libjpeg-turbo rounds the left sample with +1
       out[i*2+1] = stbi__div4(n+input[i+1]);
    }
-   out[i*2+0] = stbi__div4(input[w-2]*3 + input[w-1] + 2);
+   out[i*2+0] = stbi__div4(input[w-1]*3 + input[w-2] + 1); // torchmedia patch: 3/4 weight on the nearer sample (was swapped), +1 rounding
    out[i*2+1] = input[w-1];
 
    STBI_NOTUSED(in_far);
@@ -3913,6 +3913,7 @@ static stbi_uc *load_jpeg_image(stbi__jpeg *z, int *out_x, int *out_y, int *comp
 
          if      (r->hs == 1 && r->vs == 1) r->resample = resample_row_1;
          else if (r->hs == 1 && r->vs == 2) r->resample = stbi__resample_row_v_2;
+         else if (r->hs == 2 && r->w_lores <= 2) r->resample = stbi__resample_row_generic; // torchmedia patch: libjpeg-turbo replicates chroma <= 2 samples wide
          else if (r->hs == 2 && r->vs == 1) r->resample = stbi__resample_row_h_2;
          else if (r->hs == 2 && r->vs == 2) r->resample = z->resample_row_hv_2_kernel;
          else                               r->resample = stbi__resample_row_generic;
