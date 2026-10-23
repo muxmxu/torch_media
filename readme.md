@@ -39,7 +39,7 @@ int main() {
     );
     
     // Print the result
-    fmt::print("{}", torchmedia::basic::to_string(spectrogram));
+    std::print("{}", torchmedia::basic::to_string(spectrogram));
     
     return 0;
 }
@@ -49,7 +49,6 @@ int main() {
 
 TorchMedia is lightweight but relies on a few essentials:
 
-- **fmt** (any version) – For formatted output.
 - **LibTorch** (any version) – PyTorch's C++ frontend.
 - **SOX** (any version) – For audio processing.
 

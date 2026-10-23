@@ -1,9 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(torch_media LANGUAGES CXX)
 
-# --- language standard (C++20; bump to 23 by overriding TORCHMEDIA_CXX_STANDARD) ---
-set(TORCHMEDIA_CXX_STANDARD 20 CACHE STRING "C++ standard (20 or 23)")
-set(CMAKE_CXX_STANDARD ${TORCHMEDIA_CXX_STANDARD})
+# --- language standard (C++23: the headers use <print> / <format>) ---
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -14,7 +13,7 @@ endif()
 
 # Bundled dependencies live under dependence/ (fetched by script/download_dep).
 set(TORCHMEDIA_DEPENDENCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependence"
-    CACHE PATH "Directory holding bundled dependencies (libtorch, fmt)")
+    CACHE PATH "Directory holding bundled dependencies (libtorch, matplotplusplus)")
 
 # --- libtorch (bundled under dependence/libtorch) ---
 list(PREPEND CMAKE_PREFIX_PATH "${TORCHMEDIA_DEPENDENCE_DIR}/libtorch")

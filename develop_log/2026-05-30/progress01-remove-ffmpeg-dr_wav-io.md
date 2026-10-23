@@ -79,6 +79,7 @@ SOX -> FFmpeg (WIP in `_io.hpp`). Mux wants a dependency-light / "native" approa
   C++17 and libc++'s C++23 library support still has gaps; C++20 is the safe, sufficient baseline
   (the codebase already uses `<ranges>`).
 - Impact: `CMAKE_CXX_STANDARD=20`, `cxx_std_20` on the torch_media target.
+- Superseded 2026-10-23 by [2026-10-23/progress01](../2026-10-23/progress01-cxx23-drop-fmt.md) (C++23, fmt removed).
 
 ### D7 — Migrate the build system from xmake to CMake
 - Decision: Replace xmake with CMake (>= 3.20) as the build system.

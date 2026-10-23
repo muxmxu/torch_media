@@ -47,14 +47,14 @@ See `develop_log/README.md` for file conventions, templates, and naming.
 
 ## Dependencies & build
 
-- Deps live in `dependence/` (libtorch, fmt) — fetched by `script/download_dep`.
+- Deps live in `dependence/` (libtorch; matplotplusplus for the optional plot module) — fetched by `script/download_dep`.
 - Build system: **CMake** (>= 3.20). libtorch is found via `dependence/libtorch`
-  (`find_package(Torch)`); fmt is used header-only.
+  (`find_package(Torch)`). No formatting library: use `std::format` / `std::print`.
   - `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release` — configure.
   - `cmake --build build -j` — build all targets.
   - `cmake --build build --target audio_test_io && ./build/unit_test/audio/io/audio_test_io` — build & run the I/O test.
   - `ctest --test-dir build` — run registered tests.
-- C++ standard: **C++20** (override with `-DTORCHMEDIA_CXX_STANDARD=23`).
+- C++ standard: **C++23** (headers use `<print>`; see develop_log/2026-10-23/progress01).
 - Audio I/O: WAV via vendored header-only `dr_wav`; the implementation block is emitted in the one TU
   that defines `TORCHMEDIA_IO_IMPLEMENTATION` (each test's `main.cpp` does this).
 - Unit tests live in `unit_test/` and double as usage examples.

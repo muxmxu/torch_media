@@ -2,7 +2,7 @@
 // Exercises the dr_wav backend with no external WAV fixture and no FFmpeg linkage.
 #define TORCHMEDIA_IO_IMPLEMENTATION
 #include <cmath>
-#include <fmt/core.h>
+#include <print>
 #include <torch/torch.h>
 #include <torchmedia.hpp>
 
@@ -22,33 +22,33 @@ int main() {
     const std::string path = "roundtrip_test.wav";
 
     if (!io::save_audio(wave, path, sample_rate)) {
-        fmt::print("FAIL: save_audio returned false\n");
+        std::print("FAIL: save_audio returned false\n");
         return 1;
     }
 
     auto loaded = io::load_audio(path);
-    fmt::print("saved  shape: [{}, {}]\n", wave.size(0), wave.size(1));
-    fmt::print("loaded shape: [{}, {}], sample_rate = {}\n", loaded.data.size(0), loaded.data.size(1),
+    std::print("saved  shape: [{}, {}]\n", wave.size(0), wave.size(1));
+    std::print("loaded shape: [{}, {}], sample_rate = {}\n", loaded.data.size(0), loaded.data.size(1),
                loaded.sample_rate);
 
     if (loaded.sample_rate != sample_rate) {
-        fmt::print("FAIL: sample_rate mismatch ({} != {})\n", loaded.sample_rate, sample_rate);
+        std::print("FAIL: sample_rate mismatch ({} != {})\n", loaded.sample_rate, sample_rate);
         return 1;
     }
     if (loaded.data.sizes() != wave.sizes()) {
-        fmt::print("FAIL: shape mismatch\n");
+        std::print("FAIL: shape mismatch\n");
         return 1;
     }
 
     const float max_err = (loaded.data - wave).abs().max().item<float>();
-    fmt::print("max round-trip abs error: {}\n", max_err);
+    std::print("max round-trip abs error: {}\n", max_err);
 
     // PCM16 quantization step is ~1/32768 ≈ 3e-5; allow a small margin.
     if (max_err > 1e-3f) {
-        fmt::print("FAIL: round-trip error too large\n");
+        std::print("FAIL: round-trip error too large\n");
         return 1;
     }
 
-    fmt::print("OK: WAV save/load round-trip via dr_wav passed (no FFmpeg).\n");
+    std::print("OK: WAV save/load round-trip via dr_wav passed (no FFmpeg).\n");
     return 0;
 }

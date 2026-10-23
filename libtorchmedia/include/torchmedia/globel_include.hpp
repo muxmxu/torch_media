@@ -6,7 +6,6 @@
 #include <string_view>
 #include <vector>
 
-#include <fmt/core.h>
 #include <torch/torch.h>
 
 #include "util.hpp"

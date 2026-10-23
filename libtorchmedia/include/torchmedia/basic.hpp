@@ -1,10 +1,10 @@
 #pragma once
 #include <ostream>
+#include <print>
 #include <ranges>
 #include <sstream>
 #include <string>
 #include <torch/torch.h>
-#include "fmt/core.h"
 #include "torchmedia/globel_include.hpp"
 #ifndef LIBTORCH_MEDIA_BASIC
 #define LIBTORCH_MEDIA_BASIC
@@ -33,7 +33,7 @@ namespace torchmedia::util {
         return ss.str();
     }
 
-    auto inline print_tensor(const tensor_t &t) -> void { fmt::print("{}", to_string(t)); }
+    auto inline print_tensor(const tensor_t &t) -> void { std::print("{}", to_string(t)); }
 
     auto inline tensor_wise_equals(const tensor_t &left, const tensor_t &right) { return torch::all(left == right); }
 } // namespace torchmedia::util
