@@ -8,7 +8,8 @@ rotate / affine / perspective ops as functional ops and transform classes, point
 (develop_log/2026-10-23/progress07, progress09), the random augmentation classes and containers with seeded parity
 (progress10), plus image I/O (torchvision.io-style uint8 decode_image). Metrics (`torchmedia::metric`, torchmetrics
 1.9 parity, develop_log/2026-10-23/progress11): detection (torchvision.ops box ops, IoU metrics, MeanAveragePrecision
-equal to pycocotools COCOeval, VOC AP), image quality and segmentation.
+equal to pycocotools COCOeval, VOC AP), image quality and segmentation; audio (SNR family, SDR, PIT, STOI = pystoi,
+mir_eval bss_eval_sources, EER / minDCF) and text (WER family, EditDistance) (develop_log/2026-10-24/progress01).
 
 ## Collaboration model (development, not research)
 
@@ -50,8 +51,8 @@ See `develop_log/README.md` for file conventions, templates, and naming.
 - **Naming**: `snake_case` for functions/variables; option structs as `xxx_option` with fluent
   setters; namespaces `torchmedia::{audio,vision}::{io,functional,transform}`, `torchmedia::audio::separation`,
   `torchmedia::audio::compliance::kaldi` (torchaudio.compliance.kaldi) and `torchmedia::metric::{detection,image,
-  segmentation}` (torchmetrics: a functional per metric plus a class with update / compute / reset / forward,
-  progress11 D1).
+  segmentation,audio,text}` (torchmetrics: a functional per metric plus a class with update / compute / reset /
+  forward, progress11 D1; audio / text: develop_log/2026-10-24/progress01).
 - **No heavy runtime deps**: prefer header-only / vendored single-header over system libraries.
 - **Seeded parity**: a random vision transform class replicates its torchvision class's parameter draws (same torch
   calls, order and dtypes, on the global generator), so `torch::manual_seed(s)` reproduces `torch.manual_seed(s)`
@@ -97,8 +98,9 @@ See `develop_log/README.md` for file conventions, templates, and naming.
   binary that owns it, a shared header per line over the binaries (llvm-cov's multi-object merge drops inline header
   functions whose hashes differ per binary; progress11 D9).
 - Golden reference values: prefer closed-form truths and libtorch self-reference (portable, no deps).
-  Use the local `.venv` (torch/torchaudio 2.5.1, torchvision 0.20.1, torchmetrics 1.9.0, pycocotools 2.0.11) as a
-  development-time point-wise cross-check.
+  Use the local `.venv` (torch/torchaudio 2.5.1, torchvision 0.20.1, torchmetrics 1.9.0, pycocotools 2.0.11, pystoi
+  0.4.1, mir_eval 0.8.2, jiwer 4.0.0, scipy, scikit-learn) as a development-time point-wise cross-check; pin
+  `OPENBLAS_NUM_THREADS=1` in reference scripts that solve with numpy (threaded solves change run to run).
 - `ctest --test-dir build` must be green before a task is marked done.
 - Coverage run: `cmake -S . -B build -DTORCHMEDIA_COVERAGE=ON`, then `llvm-profdata merge` +
   `xcrun llvm-cov` (with `--ignore-filename-regex='_vendor/.*'`).

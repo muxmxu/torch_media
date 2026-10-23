@@ -212,6 +212,23 @@ static void test_p8_sites() {
     TM_CHECK(returns_default([&] { return fn::rtf_power(c3, c3.slice(0, 0, 2), hot); }));
 }
 
+// torchmedia::metric (develop_log/2026-10-24/progress01 D8): PIT's linear_sum_assignment check fails inside the
+// computation; the functional returns an undefined tensor and the class update leaves its state untouched.
+static void test_metric_sites() {
+    namespace ma = torchmedia::metric::audio;
+    const auto nan_metric = [](const torch::Tensor &p, const torch::Tensor &) {
+        return torch::full({p.size(0)}, NAN, p.options());
+    };
+    ma::PermutationInvariantTraining m(ma::permutation_invariant_training_option().metric_func(nan_metric));
+    const auto x = torch::randn({2, 3, 100});
+    TM_CHECK(!ma::permutation_invariant_training(x, x, m.options()).first.defined());
+    TM_CHECK(returns_default([&] {
+        m.update(x, x);
+        return torch::empty({1});
+    }));
+    TM_CHECK(std::isnan(m.compute().item<float>())); // 0 / 0: nothing accumulated
+}
+
 int main() {
     TM_RUN(test_convolve_resample_deltas);
     TM_RUN(test_spectral);
@@ -220,5 +237,6 @@ int main() {
     TM_RUN(test_p4_surface_sites);
     TM_RUN(test_kaldi_sites);
     TM_RUN(test_p8_sites);
+    TM_RUN(test_metric_sites);
     return tm_test::summary("audio_test_noexcept");
 }

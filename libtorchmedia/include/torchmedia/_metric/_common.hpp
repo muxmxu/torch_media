@@ -108,14 +108,14 @@ namespace torchmedia::metric {
 
         // Stateful-class base (torchmetrics Metric): forward(args) / operator()(args) update the accumulated state and
         // return the metric of this batch alone. Derived provides update, compute and options() (its option struct,
-        // from which a fresh instance is built).
+        // from which a fresh instance is built; a class without options is default-constructed).
         template<class Derived>
         class metric_base {
         public:
             template<class... Args>
             auto forward(const Args &...args) {
                 auto &self = static_cast<Derived &>(*this);
-                Derived batch(self.options());
+                Derived batch = fresh(self);
                 batch.update(args...);
                 self.update(args...);
                 return batch.compute();
@@ -126,7 +126,16 @@ namespace torchmedia::metric {
             }
             auto reset() -> void {
                 auto &self = static_cast<Derived &>(*this);
-                self = Derived(self.options());
+                self = fresh(self);
+            }
+
+        private:
+            static auto fresh(const Derived &self) -> Derived {
+                if constexpr (requires { self.options(); }) {
+                    return Derived(self.options());
+                } else {
+                    return Derived();
+                }
             }
         };
     } // namespace detail

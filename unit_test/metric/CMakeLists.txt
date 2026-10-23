@@ -1,5 +1,5 @@
 # unit_test/metric/CMakeLists.txt -- torchmedia::metric, one ctest target per area (goldens: gen_golden.py).
-foreach(area detection image segmentation)
+foreach(area audio detection image segmentation text)
     add_executable(metric_test_${area} test_${area}.cpp)
     target_link_libraries(metric_test_${area} PRIVATE torch_media)
     add_test(NAME metric_test_${area} COMMAND metric_test_${area})

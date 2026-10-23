@@ -6,7 +6,7 @@
 # (printed last). The union can list comment lines of functions another binary instantiates without running.
 C=$1; W=$2
 cd $C
-for t in detection image segmentation; do
+for t in audio detection image segmentation text; do
   xcrun llvm-profdata merge -sparse $C/$t.profraw -o $C/$t.profdata
   for h in $W/libtorchmedia/include/torchmedia/_metric/*.hpp; do
     xcrun llvm-cov show ./unit_test/metric/metric_test_$t -instr-profile=$C/$t.profdata $h 2>/dev/null | sed "s|^|$(basename $h) |"
@@ -24,7 +24,7 @@ for f, d in sorted(cnt.items()):
     miss = sorted(n for n, v in d.items() if v == 0)
     print(f"{f}: {len(d) - len(miss)}/{len(d)} lines ({100 * (len(d) - len(miss)) / len(d):.2f}%) missed {miss}")
 '
-for t in detection image segmentation; do
+for t in audio detection image segmentation text; do
   xcrun llvm-cov report ./unit_test/metric/metric_test_$t -instr-profile=$C/$t.profdata \
     $W/libtorchmedia/include/torchmedia/_metric/_$t.hpp 2>/dev/null | grep '^TOTAL' | sed "s/^TOTAL/_$t.hpp/"
 done

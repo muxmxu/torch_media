@@ -1,4 +1,4 @@
-// Sweep driver: evaluates cases.pt (sweep_gen.py) with torchmedia::metric, writes results.pt.
+// Sweep driver: evaluates cases.pt (sweep_gen.py / sweep_audio_gen.py) with torchmedia::metric, writes results.pt.
 #include <fstream>
 #include <torchmedia.hpp>
 using namespace torchmedia::metric;
@@ -139,6 +139,89 @@ int main() {
                                                          .sigma({sg})
                                                          .betas({0.4, 0.35, 0.25})
                                                          .data_range(dr)
+                                                         .reduction(reduction_mode::none)));
+            } else if (kind == "snr") {
+                using namespace audio;
+                const auto p = get("p"), t = get("t");
+                const bool zm = get("zm").item<int64_t>();
+                out.insert("snr", signal_noise_ratio(p, t, zm));
+                out.insert("sisdr", scale_invariant_signal_distortion_ratio(p, t, zm));
+                out.insert("sisnr", scale_invariant_signal_noise_ratio(p, t));
+                out.insert("sasdr",
+                           source_aggregated_signal_distortion_ratio(p, t,
+                                                                     source_aggregated_signal_distortion_ratio_option()
+                                                                             .scale_invariant(get("si").item<int64_t>())
+                                                                             .zero_mean(zm)));
+                if (p.size(-1) % 2 == 0) {
+                    const std::vector<int64_t> shape{p.size(0), p.size(1), p.size(2) / 2, 2};
+                    out.insert("csisnr",
+                               complex_scale_invariant_signal_noise_ratio(p.reshape(shape), t.reshape(shape), zm));
+                }
+            } else if (kind == "sdr") {
+                using namespace audio;
+                const auto cg = get("cg").item<int64_t>();
+                const auto ld = get("ld").item<double>();
+                out.insert("sdr", signal_distortion_ratio(
+                                          get("p"), get("t"),
+                                          signal_distortion_ratio_option()
+                                                  .filter_length(get("fl").item<int64_t>())
+                                                  .zero_mean(get("zm").item<int64_t>())
+                                                  .use_cg_iter(cg < 0 ? std::nullopt : std::optional<int64_t>(cg))
+                                                  .load_diag(ld < 0 ? std::nullopt : std::optional<double>(ld))));
+            } else if (kind == "pit") {
+                using namespace audio;
+                const auto fn = get("fn").item<int64_t>();
+                auto opt = permutation_invariant_training_option();
+                if (fn == 0) {
+                    opt.metric_func(
+                            [](const T &a, const T &b) { return scale_invariant_signal_distortion_ratio(a, b); });
+                } else if (fn == 1) {
+                    opt.metric_func([](const T &a, const T &b) { return signal_noise_ratio(a, b); });
+                } else if (fn == 2) {
+                    opt.metric_func([](const T &a, const T &b) {
+                           return (a - b).pow(2).mean({-1});
+                       }).eval_func(eval_func_mode::min);
+                } else {
+                    opt.metric_func([](const T &a, const T &b) {
+                           return source_aggregated_signal_distortion_ratio(a, b);
+                       }).mode(pit_mode::permutation_wise);
+                }
+                const auto [m, perm] = permutation_invariant_training(get("p"), get("t"), opt);
+                out.insert("metric", m);
+                out.insert("perm", perm);
+            } else if (kind == "bss") {
+                const auto r = audio::bss_eval_sources(get("r"), get("e"), get("cp").item<int64_t>());
+                out.insert("sdr", r.sdr);
+                out.insert("sir", r.sir);
+                out.insert("sar", r.sar);
+                out.insert("perm", r.perm);
+            } else if (kind == "sv") {
+                const auto prm = vec_d(get("prm"));
+                out.insert("eer", audio::equal_error_rate(get("tar"), get("non")));
+                out.insert("dcf", audio::min_dcf(get("tar"), get("non"),
+                                                 audio::min_dcf_option().p_target(prm[0]).c_miss(prm[1]).c_fa(prm[2])));
+            } else if (kind == "stoi") {
+                out.insert("stoi", audio::short_time_objective_intelligibility(
+                                           get("p").unsqueeze(0), get("t").unsqueeze(0), get("fs").item<int64_t>(),
+                                           get("ext").item<int64_t>()));
+            } else if (kind == "text") {
+                using namespace text;
+                const auto strs = [&](const char *k) {
+                    std::vector<std::string> v;
+                    for (const auto &x: d.at(k).toList()) {
+                        v.push_back(x.get().toStringRef());
+                    }
+                    return v;
+                };
+                const auto p = strs("p"), t = strs("t");
+                out.insert("wer", word_error_rate(p, t));
+                out.insert("cer", char_error_rate(p, t));
+                out.insert("mer", match_error_rate(p, t));
+                out.insert("wil", word_information_lost(p, t));
+                out.insert("wip", word_information_preserved(p, t));
+                out.insert("edit", edit_distance(p, t,
+                                                 edit_distance_option()
+                                                         .substitution_cost(get("sc").item<int64_t>())
                                                          .reduction(reduction_mode::none)));
             } else {
                 using namespace segmentation;
