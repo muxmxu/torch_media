@@ -89,7 +89,9 @@ See `develop_log/README.md` for file conventions, templates, and naming.
 - Vision I/O: stb_image / stb_image_write (same implementation macro). `stb_image.h` carries `torchmedia patch`es
   (JPEG chroma upsampling, THIRD_PARTY_LICENSES): re-apply them when re-vendoring. JPEG decodes differ from
   torchvision (libjpeg-turbo) by up to 3 levels (4 for 4:4:0 chroma); PNG is exact apart from documented palette /
-  sBIT cases (develop_log/2026-10-23/progress09 D5, D6).
+  sBIT cases (develop_log/2026-10-23/progress09 D5, D6). `load_image` reads PNM (P1-P6, 8 / 16-bit, ASCII) with its own
+  netpbm reader as float32 sample / maxval, never through stb_image (no 16-bit byte swap, maxval ignored, no P1-P4);
+  `decode_image` / `read_image` stay JPEG / PNG like torchvision (develop_log/2026-10-24/progress04).
 - Unit tests live in `unit_test/` and double as usage examples.
 - Optional plotting: `torchmedia::plot` (matplot++ / gnuplot) is **opt-in** via `-DTORCHMEDIA_WITH_PLOT=ON`
   (needs gnuplot at runtime + `dependence/matplotplusplus`). The core audio/vision stays header-only and

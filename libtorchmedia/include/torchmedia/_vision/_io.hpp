@@ -7,6 +7,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -30,10 +31,112 @@
 
 namespace torchmedia::vision::io {
 
-    // Load an image into a [C, H, W] float32 tensor in [0, 1].
+    namespace detail {
+        // Netpbm P1-P6 (netpbm.sourceforge.net/doc/pbm.html, pgm.html, ppm.html); `s` is the file after its magic.
+        // Whitespace is blank / TAB / CR / LF; '#' through the next CR / LF is a comment that separates tokens
+        // (libnetpbm's pm_getc); the P4-P6 raster follows the one whitespace byte after the last header token; samples
+        // are 2 big-endian bytes when maxval > 255; P4 rows are padded to whole bytes; P1 bits need no separator.
+        // -> float32 [C, H, W] = sample / maxval (P1 / P4: 1 = black -> 0, 0 = white -> 1). stb_image v2.30 keeps
+        // 16-bit samples unswapped, ignores maxval and reads no P1-P4, so load_image does not hand PNM to it.
+        inline auto pnm_decode(int kind, const std::string &s, const std::string &path) -> tensor_t {
+            const auto *p = reinterpret_cast<const uint8_t *>(s.data());
+            const auto n = static_cast<int64_t>(s.size());
+            int64_t i = 0;
+            const auto fail = [&](const std::string &why) {
+                throw std::runtime_error("Could not load image: " + path + " (PNM: " + why + ")");
+            };
+            const auto space = [](uint8_t ch) { return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r'; };
+            const auto comment = [&] {
+                while (i < n && p[i] != '\n' && p[i] != '\r') {
+                    ++i;
+                }
+            };
+            const auto skip = [&] {
+                while (i < n && (space(p[i]) || p[i] == '#')) {
+                    if (p[i] == '#') {
+                        comment();
+                    } else {
+                        ++i;
+                    }
+                }
+            };
+            const auto uint = [&](int64_t lo, int64_t hi) {
+                skip();
+                int64_t v = -1;
+                for (; i < n && p[i] >= '0' && p[i] <= '9'; ++i) {
+                    v = std::min(std::max<int64_t>(v, 0) * 10 + (p[i] - '0'), hi + 1); // saturated: no overflow
+                }
+                if (v < 0) {
+                    fail("expected a decimal integer");
+                }
+                if (v < lo || v > hi) {
+                    fail("value outside [" + std::to_string(lo) + ", " + std::to_string(hi) + "]");
+                }
+                return v;
+            };
+            const int64_t w = uint(1, 1 << 24), h = uint(1, 1 << 24); // stb_image's STBI_MAX_DIMENSIONS
+            const int64_t maxval = kind == 1 || kind == 4 ? 1 : uint(1, 65535);
+            const int64_t c = kind == 3 || kind == 6 ? 3 : 1;
+            if (kind >= 4) {
+                if (i < n && p[i] == '#') {
+                    comment(); // a comment right after the last token ends at the raster's whitespace byte
+                }
+                if (i >= n || !space(p[i++])) {
+                    fail("no whitespace byte before the raster");
+                }
+            }
+            // bytes the raster needs (a plain sample takes at least one): checked before allocating
+            const int64_t need = kind == 4 ? h * ((w + 7) / 8) : h * w * c * (kind >= 5 && maxval > 255 ? 2 : 1);
+            if (need > n - i) {
+                fail("truncated raster");
+            }
+            tensor_t x;
+            if (kind <= 3) {
+                x = torch::empty({h * w * c}, torch::kInt32);
+                auto *q = x.data_ptr<int32_t>();
+                for (int64_t k = 0; k < x.numel(); ++k) {
+                    if (kind == 2 || kind == 3) {
+                        q[k] = static_cast<int32_t>(uint(0, 65535));
+                        continue;
+                    }
+                    skip();
+                    if (i >= n || (p[i] != '0' && p[i] != '1')) {
+                        fail("expected a PBM bit");
+                    }
+                    q[k] = p[i++] == '0';
+                }
+            } else {
+                const auto raw = torch::from_blob(const_cast<uint8_t *>(p + i), {need}, torch::kUInt8); // view of s
+                if (kind == 4) {
+                    const auto bits = raw.view({h, -1, 1}).bitwise_right_shift(torch::arange(7, -1, -1, torch::kInt32));
+                    x = 1 - bits.bitwise_and(1).flatten(1).narrow(1, 0, w);
+                } else if (maxval > 255) {
+                    const auto be = raw.view({-1, 2});
+                    x = be.select(1, 0).to(torch::kInt32).mul_(256).add_(be.select(1, 1));
+                } else {
+                    x = raw;
+                }
+            }
+            if (x.max().item<int64_t>() > maxval) {
+                fail("sample above maxval");
+            }
+            // one float32 buffer: copy_ converts and transposes, the division runs in place (peak memory)
+            auto y = torch::empty({c, h, w}, torch::kFloat32);
+            y.copy_(x.reshape({h, w, c}).permute({2, 0, 1}));
+            return y.div_(static_cast<double>(maxval));
+        }
+    } // namespace detail
+
+    // Load an image into a [C, H, W] float32 tensor in [0, 1]: stb_image (8 bits per channel; a 16-bit PNG keeps its
+    // high byte), except PNM P1-P6, read by detail::pnm_decode as sample / maxval at full precision.
     inline auto load_image(const std::string &path) -> tensor_t {
         if (!std::filesystem::exists(path)) {
             throw std::runtime_error("File does not exist: " + path);
+        }
+        std::ifstream f(path, std::ios::binary);
+        char magic[2] = {};
+        if (f.read(magic, 2) && magic[0] == 'P' && magic[1] >= '1' && magic[1] <= '6') {
+            return detail::pnm_decode(magic[1] - '0', std::string(std::istreambuf_iterator<char>(f), {}), path);
         }
         int w = 0, h = 0, c = 0;
         unsigned char *data = stbi_load(path.c_str(), &w, &h, &c, 0);
@@ -62,16 +165,14 @@ namespace torchmedia::vision::io {
                                  .permute({1, 2, 0})
                                  .contiguous();
         const int stride = static_cast<int>(w * c);
-        const int ok = stbi_write_png(path.c_str(), static_cast<int>(w), static_cast<int>(h),
-                                      static_cast<int>(c), hwc.data_ptr<uint8_t>(), stride);
+        const int ok = stbi_write_png(path.c_str(), static_cast<int>(w), static_cast<int>(h), static_cast<int>(c),
+                                      hwc.data_ptr<uint8_t>(), stride);
         return ok != 0;
     }
 
     inline auto load_image(const char *path) -> tensor_t { return load_image(std::string(path)); }
     inline auto load_image(const std::filesystem::path &path) -> tensor_t { return load_image(path.string()); }
-    inline auto save_image(const tensor_t &img, const char *path) -> bool {
-        return save_image(img, std::string(path));
-    }
+    inline auto save_image(const tensor_t &img, const char *path) -> bool { return save_image(img, std::string(path)); }
     inline auto save_image(const tensor_t &img, const std::filesystem::path &path) -> bool {
         return save_image(img, path.string());
     }

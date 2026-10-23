@@ -115,6 +115,101 @@ b = io.BytesIO()
 photo.save(b, "JPEG", quality=75, subsampling=2, restart_marker_blocks=1)  # RSTn markers in the entropy-coded data
 file("jpeg_rst", b.getvalue(), [M.UNCHANGED])
 
+# PNM (P1-P6) for io::load_image, decoded here from the netpbm spec (netpbm.sourceforge.net/doc/pbm.html, pgm.html,
+# ppm.html): whitespace is blank / TAB / CR / LF; '#' through the next CR / LF is a comment and separates tokens (as
+# libnetpbm's pm_getc turns it into the newline); the raster of P4-P6 follows the single whitespace byte after the last
+# header token; samples are 2 big-endian bytes when maxval > 255; P4 rows are padded to whole bytes; P1 bits need no
+# separator; 1 = black. load_image's contract: float32 sample / maxval (PBM: 1 - bit). torchvision's decode_image reads
+# no PNM, so the cross-check is PIL, where it reads the variant (exact for maxval 255 / 65535 gray and PBM, else within
+# its 8- / 16-bit rounding).
+WS = b" \t\r\n"
+
+
+def pnm_reference(d):
+    kind, i = d[1] - 48, 2
+
+    def skip():
+        nonlocal i
+        while i < len(d) and (d[i] in WS or d[i] == 35):
+            i += 1
+            if d[i - 1] == 35:
+                while i < len(d) and d[i] not in b"\r\n":
+                    i += 1
+
+    def uint():
+        nonlocal i
+        skip()
+        j = i
+        while i < len(d) and 48 <= d[i] <= 57:
+            i += 1
+        assert i > j, "integer expected"
+        return int(d[j:i])
+
+    w, h = uint(), uint()
+    maxval, c = (1 if kind in (1, 4) else uint()), (3 if kind in (3, 6) else 1)
+    if kind == 1:
+        bits = []
+        while len(bits) < w * h:
+            skip()
+            assert d[i] in b"01"
+            bits.append(d[i] - 48)
+            i += 1
+        s = 1 - np.array(bits)
+    elif kind in (2, 3):
+        s = np.array([uint() for _ in range(w * h * c)])
+    else:
+        if d[i] == 35:  # a comment right after the last token ends at the raster's whitespace byte
+            while d[i] not in b"\r\n":
+                i += 1
+        assert d[i] in WS
+        i += 1
+        if kind == 4:
+            rb = (w + 7) // 8
+            s = 1 - np.unpackbits(np.frombuffer(d, np.uint8, h * rb, i).reshape(h, rb), axis=1)[:, :w]
+        else:
+            s = np.frombuffer(d, ">u2" if maxval > 255 else "u1", w * h * c, i)
+    s = s.astype(np.int64).reshape(h, w, c).transpose(2, 0, 1)
+    assert 0 < maxval < 65536 and s.max() <= maxval
+    return s, maxval
+
+
+def pnm(name, data, pil=True):
+    s, maxval = pnm_reference(data)
+    if pil:
+        im = Image.open(io.BytesIO(data))
+        a = np.asarray(im).astype(np.int64).reshape(s.shape[1], s.shape[2], -1).transpose(2, 0, 1)
+        if im.mode == "1":
+            assert (a == s).all(), name
+        else:
+            top = 65535 if im.mode == "I" else 255
+            assert np.abs(a / top - s / maxval).max() <= (0 if maxval == top else 0.5 / top + 1e-12), name
+    emit(name, torch.frombuffer(bytearray(data), dtype=torch.uint8))
+    emit(f"{name}_samples", torch.from_numpy(np.ascontiguousarray(s)))
+    emit(f"{name}_maxval", torch.tensor(maxval))
+
+
+g8 = rng.integers(0, 256, (5, 7), dtype=np.uint8)
+g8[0, :3] = [10, 32, 35]  # raster starting with LF / blank / '#': only one whitespace byte ends the header
+pnm("pnm_p5", b"P5\n# a comment line\n7 5\n255\n" + g8.tobytes())
+g16 = rng.integers(0, 65536, (5, 7), dtype=np.uint16)
+g16[0, :3] = [1000, 0, 65535]  # stb_image v2.30 returns the low byte of 1000 (232)
+pnm("pnm_p5_16", b"P5 7 5 65535\n" + g16.astype(">u2").tobytes())
+pnm("pnm_p5_1000", b"P5\t7\r\n5 #c\r1000\r" + (g16 % 1001).astype(">u2").tobytes())  # 16-bit, scaled by maxval
+pnm("pnm_p5_15", b"P5 7 5 15\n" + (g8 % 16).tobytes())  # 8-bit storage, maxval 15
+pnm("pnm_p6", b"P6\n7 5\n255\n" + rgb.tobytes())
+pnm("pnm_p6_4095", b"P6\n7 5\n4095\n" + (rgb16 % 4096).astype(">u2").tobytes())
+plain = lambda a: "\n".join(" ".join(str(int(v)) for v in row) for row in a.reshape(a.shape[0], -1)).encode()
+pnm("pnm_p2", b"P2\r\n# plain\r\n7 5\r\n1000\r\n" + plain(g16[:2] % 1001) + b"  # in the raster\n\t" + plain(g16[2:] % 1001))
+pnm("pnm_p3", b"P3 7 5 255 " + plain(rgb) + b"\n")
+bits = rng.integers(0, 2, (5, 7))
+rows = ["".join(str(v) for v in r) for r in bits]
+pnm("pnm_p1", ("P1\n7 5\n" + rows[0] + "\n" + " ".join(rows[1]) + "#c\n" + "\n".join(rows[2:])).encode())
+packed = np.packbits(np.pad(rng.integers(0, 2, (5, 11)), ((0, 0), (0, 5)), constant_values=1), axis=1)
+pnm("pnm_p4", b"P4\n11 5\n" + packed.tobytes())  # padding bits set: ignored
+# a comment between digits splits the token (libnetpbm), one after maxval ends at the raster's whitespace byte, and a
+# second image after the raster is not read; PIL joins split tokens and reads the comment into the raster
+pnm("pnm_comments", b"P5 7#width\n5 25#maxval\n" + (g8 % 26).tobytes() + b"P5 1 1 255\n\x00", pil=False)
+
 out = pathlib.Path(__file__).with_name("golden.hpp")
 out.write_text(
     "// Generated by gen_golden.py from torchvision 0.20.1 / torch 2.5.1 on arm64 -- do not edit.\n"

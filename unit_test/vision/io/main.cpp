@@ -1,6 +1,7 @@
 // Image I/O tests (stb_image): float load / save round trip, error / overload branches, and torchvision.io-style
 // decode_image / read_image against torchvision 0.20.1 goldens (gen_golden.py -> golden.hpp): PNG bit-exact in every
-// read mode, JPEG within the measured stb_image vs libjpeg-turbo bound (develop_log/2026-10-23/progress09).
+// read mode, JPEG within the measured stb_image vs libjpeg-turbo bound (develop_log/2026-10-23/progress09); load_image
+// of PNM P1-P6 against gen_golden.py's netpbm-spec decode (develop_log/2026-10-24/progress04).
 #define TORCHMEDIA_IO_IMPLEMENTATION
 #include <filesystem>
 #include <fstream>
@@ -43,7 +44,10 @@ static void test_io_branches() {
     TM_CHECK(threw_missing);
 
     // non-image file -> stbi_load returns null -> throws
-    { std::ofstream f("not_an_image.png"); f << "not a png"; }
+    {
+        std::ofstream f("not_an_image.png");
+        f << "not a png";
+    }
     bool threw_bad = false;
     try {
         (void) io::load_image("not_an_image.png");
@@ -194,11 +198,92 @@ static void test_read_image() {
             [] { return io::decode_image(torch::tensor({255, 216, 255, 0}).to(torch::kUInt8)); }));
 }
 
+// load_image of a PNM file = float32 sample / maxval (PBM: 1 - bit, white 1.0), exactly.
+static void check_pnm(const golden::entry &file, const golden::entry &samples, const golden::entry &maxval,
+                      const char *name, int line) {
+    const auto data = bytes(file);
+    const auto path = std::string(name) + ".pnm";
+    {
+        std::ofstream f(path, std::ios::binary);
+        f.write(reinterpret_cast<const char *>(data.data_ptr<uint8_t>()), data.numel());
+    }
+    const auto out = io::load_image(path);
+    const auto want = torch::tensor(samples.data).reshape(samples.shape).to(torch::kFloat32) /
+                      static_cast<double>(maxval.data.at(0));
+    std::string detail;
+    tm_test::record(out.scalar_type() == torch::kFloat32 && tm_test::tensor_close(out, want, 0, 0, detail), name,
+                    __FILE__, line, detail);
+}
+#define CHECK_PNM(file) check_pnm(golden::file, golden::file##_samples, golden::file##_maxval, #file, __LINE__)
+
+// load_image's message for a PNM file holding `data`.
+static auto pnm_error(const std::string &data) -> std::string {
+    {
+        std::ofstream f("bad.pnm", std::ios::binary);
+        f << data;
+    }
+    try {
+        (void) io::load_image("bad.pnm");
+    } catch (const std::runtime_error &e) {
+        return e.what();
+    }
+    return "no error";
+}
+
+static void test_load_pnm() {
+    CHECK_PNM(pnm_p5); // raster starting with LF / blank / '#'
+    CHECK_PNM(pnm_p5_16); // big-endian: 1000 stays 1000 (stb_image: 232)
+    CHECK_PNM(pnm_p5_1000);
+    CHECK_PNM(pnm_p5_15);
+    CHECK_PNM(pnm_p6);
+    CHECK_PNM(pnm_p6_4095);
+    CHECK_PNM(pnm_p2);
+    CHECK_PNM(pnm_p3);
+    CHECK_PNM(pnm_p1);
+    CHECK_PNM(pnm_p4);
+    CHECK_PNM(pnm_comments);
+    // closed form: 16-bit full scale, and PBM white = 1
+    TM_CHECK(torch::equal(io::load_image("pnm_p5_16.pnm").flatten().slice(0, 0, 3),
+                          torch::tensor({1000.f / 65535.f, 0.f, 1.f})));
+    {
+        std::ofstream("pbm.pbm") << "P1 3 1 0 1 0";
+    }
+    TM_CHECK(torch::equal(io::load_image("pbm.pbm"), torch::tensor({1.f, 0.f, 1.f}).reshape({1, 1, 3})));
+
+    const auto err = [](const std::string &why) { return "Could not load image: bad.pnm (PNM: " + why + ")"; };
+    using namespace std::string_literals;
+    TM_CHECK(pnm_error("P5 a 1 255\n\0"s) == err("expected a decimal integer"));
+    TM_CHECK(pnm_error("P5\v1 1 255\n\0"s) == err("expected a decimal integer")); // VT / FF are not netpbm whitespace
+    TM_CHECK(pnm_error("P5 1 1") == err("expected a decimal integer"));
+    TM_CHECK(pnm_error("P5 0 1 255\n\0"s) == err("value outside [1, 16777216]"));
+    TM_CHECK(pnm_error("P5 1 99999999999999999999999 255\n\0"s) == err("value outside [1, 16777216]"));
+    TM_CHECK(pnm_error("P5 1 1 0\n\0"s) == err("value outside [1, 65535]"));
+    TM_CHECK(pnm_error("P5 1 1 65536\n\0\0"s) == err("value outside [1, 65535]"));
+    TM_CHECK(pnm_error("P2 1 1 255 70000") == err("value outside [0, 65535]"));
+    TM_CHECK(pnm_error("P1 2 1 0 2") == err("expected a PBM bit"));
+    TM_CHECK(pnm_error("P5 1 1 255") == err("no whitespace byte before the raster"));
+    TM_CHECK(pnm_error("P5 1 1 255x\0"s) == err("no whitespace byte before the raster"));
+    TM_CHECK(pnm_error("P5 1 1 255#a comment up to the end of the file") ==
+             err("no whitespace byte before the raster"));
+    TM_CHECK(pnm_error("P5 2 2 255\n\1\2\3") == err("truncated raster"));
+    TM_CHECK(pnm_error("P5 1 2 256\n\0\1\0"s) == err("truncated raster"));
+    TM_CHECK(pnm_error("P6 16777216 16777216 255\n\0"s) == err("truncated raster")); // checked before allocating
+    TM_CHECK(pnm_error("P1 16777216 16777216\n0") == err("truncated raster"));
+    TM_CHECK(pnm_error("P5 1 1 7\n\10") == err("sample above maxval"));
+    TM_CHECK(pnm_error("P5 1 1 300\n\1\55"s) == err("sample above maxval"));
+    TM_CHECK(pnm_error("P2 2 1 10 5 11") == err("sample above maxval"));
+
+    // torchvision.io.decode_image reads no PNM: decode_image / read_image keep raising
+    TM_CHECK(throws<std::runtime_error>([] { return io::decode_image(bytes(golden::pnm_p6)); }));
+    TM_CHECK(throws<std::runtime_error>([] { return io::read_image("pnm_p6.pnm"); }));
+}
+
 int main() {
     test_roundtrip();
     test_io_branches();
     TM_RUN(test_decode_png);
     TM_RUN(test_decode_jpeg);
     TM_RUN(test_read_image);
+    TM_RUN(test_load_pnm);
     return tm_test::summary("vision_test_io");
 }

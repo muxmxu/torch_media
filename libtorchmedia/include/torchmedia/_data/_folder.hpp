@@ -239,8 +239,8 @@ namespace torchmedia::data {
     // The image loader: torchvision.io.decode_image in `mode` (rgb, like ImageFolder's PIL loader's convert("RGB")) as
     // uint8 [C, H, W]; a 16-bit PNG is scaled to 8 bits as v2.functional.to_dtype(scale=True) does (PIL takes the high
     // byte of 16-bit RGB too, but clips 16-bit gray), except in mode unchanged, which is decode_image's output as is
-    // (uint16 kept). With load_image(true): vision::io::load_image (stb_image, more formats) as float32 [3, H, W] in
-    // [0, 1], gray repeated and alpha dropped like convert("RGB"); `mode` is not used.
+    // (uint16 kept). With load_image(true): vision::io::load_image (stb_image, more formats; PNM as sample / maxval) as
+    // float32 [3, H, W] in [0, 1], gray repeated and alpha dropped like convert("RGB"); `mode` is not used.
     typedef struct image_folder_option {
         vision::io::image_read_mode _mode = vision::io::image_read_mode::rgb;
         bool _load_image = false;
@@ -255,12 +255,11 @@ namespace torchmedia::data {
         }
     } image_folder_option_t;
 
-    // torchvision's IMG_EXTENSIONS that the loader decodes: decode_image reads JPEG / PNG, stb_image also BMP (not RLE
-    // / 1-bit). Not .ppm / .pgm: stb_image reads 16-bit PNM with swapped bytes (silently wrong) and no ASCII PNM; pass
-    // them in `extensions` for 8-bit binary PNM files.
+    // torchvision's IMG_EXTENSIONS (in its order) that the loader decodes: decode_image reads JPEG / PNG; load_image
+    // also PNM and BMP (stb_image: not RLE / 1-bit).
     inline auto image_extensions(const image_folder_option &opt = {}) -> std::vector<std::string> {
         if (opt._load_image) {
-            return {".jpg", ".jpeg", ".png", ".bmp"};
+            return {".jpg", ".jpeg", ".png", ".ppm", ".bmp", ".pgm"};
         }
         return {".jpg", ".jpeg", ".png"};
     }

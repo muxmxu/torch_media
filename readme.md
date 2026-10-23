@@ -20,8 +20,14 @@ records the measurements and every intentional difference.
 | `torchmedia::audio::transform` | `torchaudio.transforms` | Spectrogram, MelSpectrogram, MFCC, LFCC, InverseMelScale, GriffinLim, Resample, Speed, SpeedPerturbation, PitchShift, TimeStretch, SpecAugment, Vol, Vad, Loudness, PSD, MVDR, SoudenMVDR, RTFMVDR, ... |
 | `torchmedia::audio::compliance::kaldi` | `torchaudio.compliance.kaldi` | fbank, mfcc, spectrogram |
 | `torchmedia::audio::separation` | torchiva 0.1.1 | AuxIVA-IP, OverIVA and ILRMA-IP blind source separation |
-| `torchmedia::vision::io` | | image load / save (stb_image) |
+| `torchmedia::vision::io` | `torchvision.io.read_file` / `decode_image` / `read_image` | decode_image / read_image: JPEG and PNG to uint8 (uint16 for 16-bit PNG) in torchvision's read modes, PNG bit-exact except palette PNGs in unchanged mode (colours, not indices) and the 16-bit sBIT shift, JPEG within a few levels (stb_image instead of libjpeg-turbo); load_image: float32 [0, 1] from PNG, JPEG, BMP, ... (stb_image) and PNM P1-P6 (sample / maxval); save_image (PNG) |
 | `torchmedia::vision::functional`, `torchmedia::vision::transform` | `torchvision.transforms.v2` | resize, crop, center / five / ten crop, pad, normalize, to_dtype, grayscale, flips, brightness, invert; the Resize, CenterCrop, Pad, Normalize, ToDtype, Grayscale, RandomHorizontalFlip, RandomVerticalFlip, FiveCrop and TenCrop classes |
+| `torchmedia::metric::detection` | `torchmetrics.detection`, `torchvision.ops`, pycocotools | box ops (box_iou, generalized / distance / complete IoU, box_convert), the IoU metrics, MeanAveragePrecision (= pycocotools COCOeval, bbox and segm), VOC average precision |
+| `torchmedia::metric::image`, `torchmedia::metric::segmentation` | `torchmetrics.image`, `torchmetrics.segmentation` | PSNR, SSIM, MS-SSIM, UQI, TotalVariation, SAM, ERGAS, RASE, RMSE-SW, SCC, VIF; MeanIoU, DiceScore, GeneralizedDiceScore |
+| `torchmedia::metric::audio` | `torchmetrics.audio`, pystoi, mir_eval | SNR, SI-SDR, SI-SNR, C-SI-SNR, SDR, SA-SDR, PIT, STOI (= pystoi), bss_eval_sources (= mir_eval), speaker-verification EER / minDCF |
+| `torchmedia::metric::text` | `torchmetrics.text` | WER, CER, MER, WIL, WIP, EditDistance |
+| `torchmedia::metric::classification` | `torchmetrics.classification` | binary / multiclass / multilabel stat scores, accuracy, precision, recall, F-scores, specificity, confusion matrix, Jaccard, MCC, Cohen's kappa, ROC / PR curves, AUROC, average precision, EER, fixed-point metrics, calibration error, hinge loss, ranking metrics |
+| `torchmedia::data` | `torchvision.datasets`, `torch.utils.data` | datasets for libtorch's `torch::data` loader: DatasetFolder / ImageFolder (torchvision's sample order and errors), AudioFolder, ManifestDataset (Kaldi-style or TSV lists), PadCollate (variable-length batches), Subset / ConcatDataset / random_split (same split as torch for the same seed) |
 
 `<torchmedia.hpp>` includes all of the above. The optional `torchmedia::plot` module (matplot++, needs gnuplot at
 runtime) is built with `-DTORCHMEDIA_WITH_PLOT=ON` and included separately with `<torchmedia/plot.hpp>`.
@@ -127,6 +133,95 @@ int main() {
 ```
 
 It prints `3x224x224`.
+
+## Metric example
+
+`torchmedia::metric` follows torchmetrics 1.9: each metric is a functional (`word_error_rate(preds, target)`) and a
+class with `update` / `compute` / `reset` / `forward`. MeanAveragePrecision reproduces pycocotools' COCOeval in float64;
+`develop_log/` lists the parity measured for each family. A COCO mAP over two images and a word error rate:
+
+```cpp
+#include <print>
+#include <torchmedia.hpp>
+
+namespace detection = torchmedia::metric::detection;
+namespace text = torchmedia::metric::text;
+
+int main() {
+    // torchmetrics.detection.MeanAveragePrecision (= pycocotools COCOeval): one update per batch of images, each
+    // image with xyxy boxes, scores and labels (predictions) or boxes and labels (targets).
+    detection::MeanAveragePrecision coco_map;
+    coco_map.update({{torch::tensor({{10., 10., 50., 50.}, {60., 60., 90., 95.}}), torch::tensor({0.9, 0.6}),
+                      torch::tensor({1, 2})},
+                     {torch::tensor({{0., 0., 30., 30.}}), torch::tensor({0.8}), torch::tensor({1})}},
+                    {{torch::tensor({{12., 8., 48., 52.}, {58., 62., 92., 90.}}), torch::tensor({1, 2})},
+                     {torch::tensor({{5., 5., 35., 35.}, {40., 40., 70., 70.}}), torch::tensor({1, 1})}});
+    const auto r = coco_map.compute();
+    std::println("map {:.4f}, map_50 {:.4f}, map_75 {:.4f}, mar_100 {:.4f}", r.map, r.map_50, r.map_75, r.mar_100);
+
+    // torchmetrics.text.WordErrorRate: word edit distances over all pairs / number of target words.
+    const auto wer = text::word_error_rate({"the cat sat on the mat", "hello world"},
+                                           {"the cat sat on a mat", "hello big world"});
+    std::println("wer {:.4f}", wer.item<double>());
+}
+```
+
+It prints `map 0.3842, map_50 0.8317, map_75 0.1683, mar_100 0.3833` and `wer 0.2222`, the values torchmetrics (with
+pycocotools) gives for the same input.
+
+## Data example
+
+`torchmedia::data` adds datasets to libtorch's own `torch::data` loader (samplers, worker threads, `Stack`), which it
+does not reimplement. An AudioFolder batched with PadCollate:
+
+```cpp
+#define TORCHMEDIA_IO_IMPLEMENTATION // in exactly one .cpp of your program: emits the vendored codecs
+#include <filesystem>
+#include <print>
+#include <torchmedia.hpp>
+
+namespace data = torchmedia::data;
+
+int main() {
+    // A torchvision-style tree root/<class>/<file>: three noise clips of different lengths in two classes.
+    const std::filesystem::path root = "speech";
+    const std::vector<std::pair<std::string, int64_t>> files = {
+            {"no/a.wav", 12000}, {"yes/b.wav", 16000}, {"yes/c.wav", 9000}};
+    for (const auto &[file, frames]: files) {
+        std::filesystem::create_directories((root / file).parent_path());
+        torchmedia::audio::io::save_audio(0.1 * torch::randn({1, frames}), root / file, 16000);
+    }
+
+    // AudioFolder = torchvision's DatasetFolder over load_audio (here mono at 16 kHz); classes are the sorted
+    // sub-directory names, samples are {waveform [1, T], class index}.
+    data::AudioFolder clips(root, {}, data::audio_folder_option().sample_rate(16000).mono(true));
+    std::println("classes {}, {} clips", clips.classes(), clips.size().value());
+
+    // libtorch's own DataLoader; PadCollate pads each batch to its longest clip and keeps the lengths.
+    auto loader = torch::data::make_data_loader<torch::data::samplers::SequentialSampler>(
+            clips.map(data::PadCollate()), torch::data::DataLoaderOptions(2));
+    for (const auto &batch: *loader) { // padded_batch {data [B, 1, T_max], target [B], lengths [B]}
+        std::print("batch [{}, {}, {}]:", batch.data.size(0), batch.data.size(1), batch.data.size(2));
+        for (int64_t i = 0; i < batch.data.size(0); ++i) {
+            std::print(" (class {}, {} frames)", batch.target[i].item<int64_t>(), batch.lengths[i].item<int64_t>());
+        }
+        std::println();
+    }
+}
+```
+
+It prints
+
+```
+classes ["no", "yes"], 3 clips
+batch [2, 1, 16000]: (class 0, 12000 frames) (class 1, 16000 frames)
+batch [1, 1, 9000]: (class 1, 9000 frames)
+```
+
+ImageFolder works the same way: it decodes with `decode_image` (JPEG / PNG as uint8 RGB, batched with
+`torch::data::transforms::Stack<>()`) or, with `image_folder_option().load_image(true)`, with `load_image` (float32,
+also BMP and PNM). `random_split(dataset, {0.8, 0.2}, seed)` gives the indices of `torch.utils.data.random_split` with
+`torch.Generator().manual_seed(seed)`.
 
 ## Behaviour
 

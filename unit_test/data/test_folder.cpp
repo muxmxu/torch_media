@@ -214,10 +214,10 @@ static void test_has_file_allowed_extension() {
     TM_CHECK(td::has_file_allowed_extension("A.JPG/x.Jpeg", {".png", ".jpeg"}));
     TM_CHECK(!td::has_file_allowed_extension("a.png/x", {".png"}));
     TM_CHECK(!td::has_file_allowed_extension("a.png", {}));
-    // stb_image reads 16-bit PNM with the wrong byte order and no ASCII PNM, so .ppm / .pgm are not defaults
+    // load_image reads PNM (develop_log/2026-10-24/progress04); decode_image, like torchvision's, does not
     TM_CHECK(td::image_extensions() == std::vector<std::string>({".jpg", ".jpeg", ".png"}) &&
              td::image_extensions(td::image_folder_option().load_image(true)) ==
-                     std::vector<std::string>({".jpg", ".jpeg", ".png", ".bmp"}));
+                     std::vector<std::string>({".jpg", ".jpeg", ".png", ".ppm", ".bmp", ".pgm"}));
 }
 
 // get(): loader, transform and target_transform (a vision transform class as the sample transform); index checks.
@@ -297,7 +297,9 @@ static void test_image_mixed_and_corrupt() {
     TM_CHECK(vio::save_image(rgb, t.base / "c/a.png"));
     std::ofstream(t.base / "c/b.png", std::ios::binary)
             .write(reinterpret_cast<const char *>(gray16_png.data()), std::ssize(gray16_png));
-    t.write("c/d.pgm", std::string("P5\n2 2\n255\n") + "\x01\x02\x03\x04");
+    using namespace std::string_literals;
+    t.write("c/d.pgm", "P5\n2 2\n65535\n\x00\x00\x03\xe8\x9c\x40\xff\xff"s); // 16-bit: 0, 1000, 40000, 65535
+    t.write("c/e.ppm", "P3 2 2 255\n0 10 20 30 40 50\n60 70 80 90 100 255\n"); // ASCII
     const auto want16 = torch::tensor({0, 3, 156, 255}, torch::kUInt8).reshape({1, 2, 2}).expand({3, -1, -1});
 
     td::ImageFolder ds(t.base);
@@ -313,17 +315,26 @@ static void test_image_mixed_and_corrupt() {
     // unchanged: decode_image's output, uint16 kept
     td::ImageFolder raw(t.base, {}, td::image_folder_option().mode(vio::image_read_mode::unchanged));
     TM_CHECK(raw.get(1).data.scalar_type() == torch::kUInt16 && raw.get(1).data.size(0) == 1);
-    // load_image(true): the same values as floats; .pgm only when asked for
+    // load_image(true): the same values as floats, plus the PNM files (sample / maxval), all stacked
     td::ImageFolder floats(t.base, {}, td::image_folder_option().load_image(true));
-    TM_CHECK(floats.size().value() == 2);
+    TM_CHECK(floats.size().value() == 4);
     for (size_t i = 0; i < 2; ++i) {
         TM_CHECK_TENSOR_CLOSE(floats.get(i).data, ds.get(i).data.to(torch::kFloat32) / 255.0, 1e-7, 0.0);
     }
-    td::ImageFolder pgm(t.base, td::dataset_folder_option().extensions({".pgm"}),
-                        td::image_folder_option().load_image(true));
-    TM_CHECK_TENSOR_CLOSE(pgm.get(0).data,
-                          torch::tensor({1.f, 2.f, 3.f, 4.f}).reshape({1, 2, 2}).expand({3, -1, -1}) / 255.0, 1e-7,
-                          0.0);
+    TM_CHECK(torch::equal(
+            floats.get(2).data,
+            torch::tensor({0.f, 1000.f, 40000.f, 65535.f}).div(65535.0).reshape({1, 2, 2}).expand({3, -1, -1})));
+    TM_CHECK(torch::equal(
+            floats.get(3).data,
+            torch::arange(0, 120, 10, torch::kFloat32).index_put_({11}, 255).reshape({2, 2, 3}).permute({2, 0, 1}) /
+                    255.0));
+    auto float_loader = torch::data::make_data_loader(floats.map(torch::data::transforms::Stack<>()),
+                                                      torch::data::DataLoaderOptions(4));
+    int64_t float_batches = 0;
+    for (const auto &b: *float_loader) {
+        float_batches += b.data.sizes() == torch::IntArrayRef({4, 3, 2, 2});
+    }
+    TM_CHECK(float_batches == 1);
 
     // corrupt files: get() and a 2-worker loader name the file
     const auto png = t.write("bad/c/zz.png", "not a png at all");

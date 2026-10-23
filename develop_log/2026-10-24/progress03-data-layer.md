@@ -71,14 +71,18 @@ utilities. The design below was set by the orchestrator under Mux's delegation.
   16-bit PNGs batch. Mode `unchanged` returns decode_image's output as is (file channels, uint16 kept). A decode error
   is re-thrown as std::runtime_error "{path}: {decode_image's message}" (decode_image's messages do not name the file;
   PIL's do), so a bad file is found from `get()` and from a loader worker's WorkerException. `load_image(true)`:
-  `vision::io::load_image` (stb_image, more formats) -> float32 [3, H, W] in [0, 1], gray repeated and alpha dropped
-  like convert("RGB"); `mode` is not used. `image_extensions(opt)`: torchvision's IMG_EXTENSIONS that the loader
-  decodes — {.jpg, .jpeg, .png} for decode_image, plus {.bmp} for stb (no .tif / .tiff / .webp decoder).
+  `vision::io::load_image` (stb_image, more formats; PNM as sample / maxval) -> float32 [3, H, W] in [0, 1], gray
+  repeated and alpha dropped like convert("RGB"); `mode` is not used. `image_extensions(opt)`: torchvision's
+  IMG_EXTENSIONS that the loader decodes, in its order — {.jpg, .jpeg, .png} for decode_image; {.jpg, .jpeg, .png,
+  .ppm, .bmp, .pgm} for load_image (no .tif / .tiff / .webp decoder; .ppm / .pgm since progress04).
 - Deviations: a 16-bit **gray** PNG is scaled (PIL opens it as I;16 and convert("RGB") clips every value > 255 to
-  255; for 16-bit RGB / RGBA PIL keeps the high byte, the same as >> 8). .ppm / .pgm are not defaults: stb_image v2.30
-  reads 16-bit PNM samples without swapping their big-endian bytes (silently wrong values) and has no ASCII PNM
-  (P2 / P3); 8-bit binary PNM decodes correctly when passed in `extensions`. stb reads no RLE or 1-bit BMP (the error
-  names the file).
+  255; for 16-bit RGB / RGBA PIL keeps the high byte, the same as >> 8). Until progress04 .ppm / .pgm were not
+  defaults (stb_image v2.30 read 16-bit PNM samples without swapping their big-endian bytes and had no ASCII PNM);
+  load_image now reads PNM itself (2026-10-24/progress04 D1) as sample / maxval at full 16-bit precision. PIL differs
+  when maxval != 255: RGB PNM and gray PNM with maxval < 256 are rescaled to 8 bits; gray PNM with maxval > 255 opens
+  as I (rescaled to 0..65535) and convert("RGB") clips every value > 255 to 255, as for 16-bit gray PNG (P2 maxval
+  1000, samples 0 / 50 / 100: torchvision [0, 255, 255], here 0 / 0.05 / 0.1). stb reads no RLE or 1-bit BMP (the
+  error names the file).
 - `audio_loader(audio_folder_option)`: `audio::io::load_audio` (float32 [C, T]), then optional `mono` (mean over
   channels, before resampling: cheaper, and resampling is linear), `sample_rate` (> 0: `audio::functional::resample`
   with its defaults; equal rates return the input), `num_frames` (> 0: the first num_frames, or zero-padded at the end;
@@ -156,12 +160,12 @@ utilities. The design below was set by the orchestrator under Mux's delegation.
   splits for seeds 0 / 1 / 42 / 2024 over nine (n, lengths) cases with explicit generators and four with the global
   generator, and its two error messages. `golden.hpp` carries TREE, which the C++ test rebuilds (image-named files as
   real PNGs written by `save_image`).
-- ctest `data_test_folder` (222 checks): the goldens equal (order, targets, class_to_idx, messages); find_classes
+- ctest `data_test_folder` (222 checks; 224 since progress04): the goldens equal (order, targets, class_to_idx, messages); find_classes
   raises for a self-referential root symlink and skips a broken one; ImageFolder decodes RGB / gray / RGBA PNGs to the
   saved values in rgb / unchanged / float modes (float: RGB), the broken symlink fails on `get()`; a folder mixing an
-  8-bit RGB PNG, a 16-bit gray PNG (embedded bytes) and an 8-bit .pgm gives uint8 [3, 2, 2] (16-bit = >> 8) that a
-  Stack loader batches, uint16 in mode unchanged, the same values as floats with load_image(true), .pgm only via
-  `extensions`; a corrupt .png is named in `get()`'s error and in a 2-worker loader's WorkerException, a corrupt .wav
+  8-bit RGB PNG, a 16-bit gray PNG (embedded bytes), a 16-bit binary .pgm and an ASCII .ppm (progress04): the default
+  loader lists the PNGs and gives uint8 [3, 2, 2] (16-bit = >> 8) that a Stack loader batches, uint16 in mode
+  unchanged; load_image(true) gives the same values as floats plus both PNM files (sample / maxval), stacked; a corrupt .png is named in `get()`'s error and in a 2-worker loader's WorkerException, a corrupt .wav
   in AudioFolder's; AudioFolder over float32 WAVs from `save_audio` (exact), resampled (= `functional::resample`),
   mono, crop / pad (partial read), all three (full decode); ManifestDataset Kaldi / class-label / header formats and
   every error (incl. an empty TSV path and a directory as the manifest); transforms (a vision ToDtype class) and
@@ -203,7 +207,8 @@ utilities. The design below was set by the orchestrator under Mux's delegation.
   - P1: the default loader returned uint16 for a 16-bit PNG next to uint8 samples (Stack: "Promotion for uint16 ...
     not supported") -> scaled to uint8 except in mode unchanged (D3).
   - P2: load_image(true) listed .ppm / .pgm; 16-bit PNM decoded to the low bytes (1000 -> 232), ASCII PNM threw ->
-    dropped from the defaults (D3); the stb bug itself is in Open.
+    dropped from the defaults (D3); the stb bug itself is in Open. Fixed in 2026-10-24/progress04 (load_image reads
+    PNM itself); .ppm / .pgm are load_image defaults again.
   - P3: find_classes skipped a root entry it could not stat; torchvision raises OSError -> std::runtime_error (D2).
   - P4: load_image(true) kept the file's channel count ([1, H, W] next to [3, H, W]) -> RGB like ImageFolder (D3).
   - R1: decode errors from ImageFolder's default loader did not name the file -> "{path}: ..." (D3).
@@ -218,9 +223,8 @@ utilities. The design below was set by the orchestrator under Mux's delegation.
 - ConcatDataset over different dataset types (Python allows it), a random-offset crop option in AudioFolder, and
   decoding only the needed frames when cropping with resampling (the loader then decodes the whole file; `shortcut:`
   comment).
-- `vision::io::load_image` (stb_image v2.30) returns the low byte of 16-bit PNM samples (stb copies the big-endian
-  samples without a swap) and cannot read ASCII PNM; outside this layer (the folder defaults no longer list PNM). Fix
-  there if PNM matters: `stbi_load_16` + byte swap + `>> 8` for 16-bit P5 / P6.
+- ~~`vision::io::load_image` returns the low byte of 16-bit PNM samples and cannot read ASCII PNM~~ — resolved by
+  2026-10-24/progress04 (a netpbm reader in `_vision/_io.hpp`; .ppm / .pgm back in the load_image defaults).
 - The example carries no sample rate: set `sample_rate` for trees with mixed rates.
 - ManifestDataset: no quoted TSV fields, no Kaldi pipes (`cmd |`) or ark offsets.
 - Python DataLoader features absent from torch::data (pin_memory, persistent workers, worker_init_fn / per-worker
@@ -239,3 +243,6 @@ utilities. The design below was set by the orchestrator under Mux's delegation.
   `_folder.hpp` 259/259, `_manifest.hpp` 127/127, `_collate.hpp` 56/56, `_dataset.hpp` 114/114 (union). Reviewer probe
   re-run: AudioFolder num_frames(16000) on a 10-minute WAV 0.3 ms per get() (was 40.2 ms), equal output; a manifest
   directory now throws. Full Release build + ctest 21 / 21 green; clang-format clean. Not committed.
+- 2026-10-24 [ai] progress04: load_image reads PNM P1-P6 itself (sample / maxval), so `image_extensions(load_image)`
+  lists .ppm / .pgm again (torchvision's order); test_image_mixed_and_corrupt now mixes a 16-bit .pgm and an ASCII .ppm
+  into the float folder (red before the fix: 216/219). data_test_folder 224 checks; `_folder.hpp` 259/259 lines.
