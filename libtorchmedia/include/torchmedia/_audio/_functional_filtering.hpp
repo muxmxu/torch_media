@@ -5,7 +5,7 @@
 #include <limits>
 #include <optional>
 #include <torch/torch.h>
-#include "../globel_include.hpp"
+#include "../global_include.hpp"
 
 namespace torchmedia::audio::functional {
     namespace detail {

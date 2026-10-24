@@ -14,7 +14,7 @@
 #include <string>
 #include <torch/torch.h>
 #include <vector>
-#include "../globel_include.hpp"
+#include "../global_include.hpp"
 
 // Scalar math that mirrors Python float arithmetic must not be fused into FMAs (clang contracts a * b + c within an
 // expression by default; GCC in ISO mode and MSVC do not). Used as the first statement of such function bodies.

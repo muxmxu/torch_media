@@ -7,7 +7,7 @@
 #include <torch/torch.h>
 #include <matplot/matplot.h>
 
-#include "../globel_include.hpp"
+#include "../global_include.hpp"
 
 // Optional plotting module (matplot++ / gnuplot backend). Not included by torchmedia.hpp; include
 // <torchmedia/plot.hpp> explicitly and link torch_media_plot. See develop_log/2026-05-31/progress05.

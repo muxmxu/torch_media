@@ -19,7 +19,7 @@
 #include <string>
 #include <tuple>
 #include <utility>
-#include "../globel_include.hpp"
+#include "../global_include.hpp"
 #include "_functional.hpp" // create_dct
 
 namespace torchmedia::audio::compliance::kaldi {

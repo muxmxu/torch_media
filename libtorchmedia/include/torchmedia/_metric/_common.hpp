@@ -15,7 +15,7 @@
 #include <torch/torch.h>
 #include <utility>
 #include <vector>
-#include "../globel_include.hpp"
+#include "../global_include.hpp"
 
 // Scalar math that mirrors Python / C float arithmetic must not be fused into FMAs (same definition as in
 // _vision/_functional.hpp; first statement of such function bodies).

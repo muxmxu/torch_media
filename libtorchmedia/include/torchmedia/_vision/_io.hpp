@@ -13,7 +13,7 @@
 #include <string>
 #include <torch/torch.h>
 
-#include "../globel_include.hpp"
+#include "../global_include.hpp"
 
 // stb_image / stb_image_write: header-only image codecs (public domain / MIT). The implementation is
 // emitted in the one TU that defines TORCHMEDIA_IO_IMPLEMENTATION (same macro as dr_wav), keeping the

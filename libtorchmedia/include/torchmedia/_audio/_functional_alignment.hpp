@@ -6,7 +6,7 @@
 #include <torch/torch.h>
 #include <utility>
 #include <vector>
-#include "../globel_include.hpp"
+#include "../global_include.hpp"
 
 // CTC forced alignment (mirrors torchaudio.functional.forced_align / merge_tokens / TokenSpan).
 // Upstream dispatches to a compiled op; here its CPU kernel is reimplemented as a header-only Viterbi DP over the

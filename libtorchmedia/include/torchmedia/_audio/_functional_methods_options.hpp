@@ -4,7 +4,7 @@
 
 #ifndef LIB_TORCH_MEDIA_AUDIO_FUNCTIONAL_METHODS_OPTIONS_HPP
 #define LIB_TORCH_MEDIA_AUDIO_FUNCTIONAL_METHODS_OPTIONS_HPP
-#include "../globel_include.hpp"
+#include "../global_include.hpp"
 
 namespace torchmedia::audio::functional {
     namespace detail {

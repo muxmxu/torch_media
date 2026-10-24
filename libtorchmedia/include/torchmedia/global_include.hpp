@@ -1,5 +1,5 @@
-#ifndef LIB_TORCH_MEDIA_GLOBEL_INCLUDE_HPP
-#define LIB_TORCH_MEDIA_GLOBEL_INCLUDE_HPP
+#ifndef LIB_TORCH_MEDIA_GLOBAL_INCLUDE_HPP
+#define LIB_TORCH_MEDIA_GLOBAL_INCLUDE_HPP
 #include <filesystem>
 #include <stdexcept>
 #include <string>
@@ -44,4 +44,4 @@ namespace torchmedia {
 
 
 } // namespace torchmedia
-#endif // LIB_TORCH_MEDIA_GLOBEL_INCLUDE_HPP
+#endif // LIB_TORCH_MEDIA_GLOBAL_INCLUDE_HPP

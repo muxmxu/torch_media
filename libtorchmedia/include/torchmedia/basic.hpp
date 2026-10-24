@@ -5,7 +5,7 @@
 #include <sstream>
 #include <string>
 #include <torch/torch.h>
-#include "torchmedia/globel_include.hpp"
+#include "torchmedia/global_include.hpp"
 #ifndef LIBTORCH_MEDIA_BASIC
 #define LIBTORCH_MEDIA_BASIC
 

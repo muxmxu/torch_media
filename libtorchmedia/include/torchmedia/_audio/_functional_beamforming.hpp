@@ -2,7 +2,7 @@
 #ifndef LIB_TORCH_MEDIA_AUDIO_FUNCTIONAL_BEAMFORMING_HPP
 #define LIB_TORCH_MEDIA_AUDIO_FUNCTIONAL_BEAMFORMING_HPP
 #include <torch/torch.h>
-#include "../globel_include.hpp"
+#include "../global_include.hpp"
 
 // Multichannel beamforming (mirrors the MVDR / RTF ops in torchaudio.functional). All operate on
 // COMPLEX tensors and use torch::linalg::solve / eigh. reference_channel is modelled with int and

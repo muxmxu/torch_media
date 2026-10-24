@@ -23,7 +23,7 @@
 #include <torch/torch.h>
 #include <utility>
 #include <vector>
-#include "../globel_include.hpp"
+#include "../global_include.hpp"
 
 namespace torchmedia::data {
     // One sample: the loaded (and transformed) tensor and its target.

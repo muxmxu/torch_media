@@ -5,7 +5,7 @@
 #include <cmath>
 #include <format>
 #include <stdexcept>
-#include "../globel_include.hpp"
+#include "../global_include.hpp"
 
 namespace torchmedia::audio::separation {
     enum class source_model { laplace, gauss, nmf };

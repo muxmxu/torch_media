@@ -16,7 +16,7 @@
 #include <torch/torch.h>
 #include <vector>
 
-#include "../globel_include.hpp"
+#include "../global_include.hpp"
 
 // Vendored single-header codecs (provenance and licenses: THIRD_PARTY_LICENSES): dr_wav (WAV read + write), dr_flac,
 // dr_mp3 (public domain / MIT-0) and stb_vorbis (public domain / MIT). Their implementations are emitted in exactly ONE

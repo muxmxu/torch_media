@@ -9,7 +9,7 @@
 #include <stdexcept>
 #include <torch/torch.h>
 #include <utility>
-#include "../globel_include.hpp"
+#include "../global_include.hpp"
 #include "_functional_filtering.hpp" // lfilter / biquads for deemphasis and loudness
 #include "_functional_methods_options.hpp"
 
