@@ -37,7 +37,9 @@ runtime) is built with `-DTORCHMEDIA_WITH_PLOT=ON` and included separately with 
 
 - A C++23 compiler (the headers use `<print>`). Developed and tested on macOS arm64 with Apple clang 21.
 - CMake 3.20 or newer.
-- libtorch 2.5.1. `script/download_dep` fetches the CPU build for macOS arm64, Linux or Windows.
+- libtorch. The parity measurements use 2.5.1, which `script/download_dep` fetches (CPU build for macOS arm64, Linux or
+  Windows). Other versions work as far as libtorch keeps its API: 2.14.1 builds and runs the whole test suite, with
+  results that differ from the 2.5.1 references at rounding level ([doc/reproducibility.md](doc/reproducibility.md)).
 
 ## Build and test
 
@@ -72,7 +74,7 @@ target_link_libraries(vision_example PRIVATE torch_media)
 
 For a libtorch outside `torch_media/dependence/`, set `TORCHMEDIA_DEPENDENCE_DIR` to the directory containing
 `libtorch/` before `add_subdirectory` (or pass it with `-D`). If no libtorch is there, `find_package(Torch)` uses any
-other libtorch it finds on the system; TorchMedia is written against libtorch 2.5.1.
+other libtorch it finds on the system.
 
 The audio and image codecs are vendored single-header C libraries (dr_wav, dr_flac, dr_mp3, stb_vorbis, stb_image).
 Their implementation is compiled only in the translation unit that defines `TORCHMEDIA_IO_IMPLEMENTATION` before

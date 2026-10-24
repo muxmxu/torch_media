@@ -5,7 +5,7 @@
 #include "../global_include.hpp"
 
 // Multichannel beamforming (mirrors the MVDR / RTF ops in torchaudio.functional). All operate on
-// COMPLEX tensors and use torch::linalg::solve / eigh. reference_channel is modelled with int and
+// COMPLEX tensors and use torch::linalg_solve / linalg_eigh. reference_channel is modelled with int and
 // Tensor (one-hot) overloads.
 namespace torchmedia::audio::functional {
     namespace detail {
@@ -95,7 +95,7 @@ namespace torchmedia::audio::functional {
         if (diagonal_loading) {
             psd_n = _tik_reg(psd_n, diag_eps);
         }
-        const auto numerator = torch::linalg::solve(psd_n, psd_s, /*left=*/true);
+        const auto numerator = torch::linalg_solve(psd_n, psd_s, /*left=*/true);
         const auto ws = numerator / (_compute_mat_trace(numerator).index({Ellipsis, None, None}) + eps);
         return ws.index({Ellipsis, Slice(), reference_channel});
     }
@@ -111,7 +111,7 @@ namespace torchmedia::audio::functional {
         if (diagonal_loading) {
             psd_n = _tik_reg(psd_n, diag_eps);
         }
-        const auto numerator = torch::linalg::solve(psd_n, psd_s, /*left=*/true);
+        const auto numerator = torch::linalg_solve(psd_n, psd_s, /*left=*/true);
         const auto ws = numerator / (_compute_mat_trace(numerator).index({Ellipsis, None, None}) + eps);
         const auto ref = reference_channel.to(psd_n.scalar_type());
         return torch::einsum("...c,...c->...", {ws, ref.index({Ellipsis, None, None, Slice()})});
@@ -128,7 +128,7 @@ namespace torchmedia::audio::functional {
         if (diagonal_loading) {
             psd_n = _tik_reg(psd_n, diag_eps);
         }
-        const auto numerator = torch::linalg::solve(psd_n, rtf.unsqueeze(-1), /*left=*/true).squeeze(-1);
+        const auto numerator = torch::linalg_solve(psd_n, rtf.unsqueeze(-1), /*left=*/true).squeeze(-1);
         const auto denominator = torch::einsum("...d,...d->...", {rtf.conj(), numerator});
         auto beamform_weights = numerator / (torch::real(denominator).unsqueeze(-1) + eps);
         if (reference_channel.has_value()) {
@@ -148,7 +148,7 @@ namespace torchmedia::audio::functional {
         if (diagonal_loading) {
             psd_n = _tik_reg(psd_n, diag_eps);
         }
-        const auto numerator = torch::linalg::solve(psd_n, rtf.unsqueeze(-1), /*left=*/true).squeeze(-1);
+        const auto numerator = torch::linalg_solve(psd_n, rtf.unsqueeze(-1), /*left=*/true).squeeze(-1);
         const auto denominator = torch::einsum("...d,...d->...", {rtf.conj(), numerator});
         auto beamform_weights = numerator / (torch::real(denominator).unsqueeze(-1) + eps);
         const auto ref = reference_channel.to(psd_n.scalar_type());
@@ -165,7 +165,7 @@ namespace torchmedia::audio::functional {
         if (psd_s.size(-1) != psd_s.size(-2)) {
             return handle_exceptions<tensor_t, std::invalid_argument>("The last two dimensions of psd_s must match.");
         }
-        const auto eig = torch::linalg::eigh(psd_s, "L");
+        const auto eig = torch::linalg_eigh(psd_s, "L");
         const auto v = std::get<1>(eig); // eigenvectors (columns), ascending eigenvalues
         return v.index({Ellipsis, -1}); // principal eigenvector (max eigenvalue)
     }
@@ -185,7 +185,7 @@ namespace torchmedia::audio::functional {
             if (diagonal_loading) {
                 psd_n = _tik_reg(psd_n, diag_eps);
             }
-            const auto phi = torch::linalg::solve(psd_n, psd_s, /*left=*/true);
+            const auto phi = torch::linalg_solve(psd_n, psd_s, /*left=*/true);
             auto rtf = column(phi).unsqueeze(-1); // (..., freq, channel, 1)
             if (n_iter >= 2) {
                 for (int k = 0; k < n_iter - 2; ++k) {

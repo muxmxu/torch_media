@@ -61,6 +61,10 @@ See `develop_log/README.md` for file conventions, templates, and naming.
   `torchmedia::data` (datasets deriving from libtorch's `torch::data::datasets::Dataset`, used with its
   `make_data_loader` / samplers / Stack; read-only after construction, so safe for loader workers;
   develop_log/2026-10-24/progress03).
+- **Any compatible libtorch** (Mux, 2026-10-24: no version pinning): use libtorch APIs that exist across versions —
+  the ATen functions (`torch::linalg_solve`, `torch::linalg_eigh`, ...) rather than the C++ frontend's
+  `torch::linalg::` namespace, which newer libtorch removed (develop_log/2026-10-24/progress08). Parity goldens stay
+  PyTorch 2.5.1.
 - **No heavy runtime deps**: prefer header-only / vendored single-header over system libraries.
 - **Error policy** (the user's choice; `global_include.hpp`, develop_log/2026-10-24/progress05): every library error
   goes through `return handle_exceptions<T, E>(msg)` (no raw `throw` except the two progress05 D4 keeps): it throws by

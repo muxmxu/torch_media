@@ -704,7 +704,7 @@ namespace torchmedia::audio::functional {
         }
         const auto a = (mu_x - mu_y).square().sum();
         const auto b = sigma_x.trace() + sigma_y.trace();
-        const auto c = torch::real(torch::sqrt(torch::linalg::eigvals(torch::matmul(sigma_x, sigma_y)))).sum();
+        const auto c = torch::real(torch::sqrt(torch::linalg_eigvals(torch::matmul(sigma_x, sigma_y)))).sum();
         return a + b - 2.0 * c;
     }
 

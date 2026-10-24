@@ -108,8 +108,9 @@ Additions with no Python counterpart:
 
 - **Codec implementations.** Define `TORCHMEDIA_IO_IMPLEMENTATION` in exactly one `.cpp` before including TorchMedia.
   That file then contains the vendored codecs. The readme's "Use it in your project" shows the CMake side.
-- **libtorch version.** Use libtorch 2.5.1, the version the library is written and tested against. A newer libtorch
-  is not guaranteed to compile: Homebrew's 2.14.1 fails, because `torch::linalg` is not declared.
+- **libtorch version.** Any libtorch that keeps the API works; 2.5.1 and 2.14.1 are tested. For results identical to
+  your Python pipeline, use the libtorch version of the PyTorch that ran it (see
+  [reproducibility.md](reproducibility.md)).
 - **Pointing at libtorch.** Set `TORCHMEDIA_DEPENDENCE_DIR` to the directory that holds `libtorch/`, either before
   `add_subdirectory` or with `-D`. If no libtorch is there, `find_package(Torch)` silently takes any other libtorch it
   finds on the system, and the compile errors then come from the version mismatch.

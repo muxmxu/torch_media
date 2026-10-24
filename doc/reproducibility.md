@@ -14,6 +14,16 @@ results are bit-identical, what can break that, and how to get the same random d
 
 ## What can change the bits
 
+- **The libtorch version.** The reference values come from PyTorch 2.5.1, and a newer libtorch changes some kernels.
+  Measured with libtorch 2.14.1 (Homebrew build, same machine): the suite builds and runs without errors, and 371 of
+  20,710 checks differ from the 2.5.1 references.
+  - 322 of them by less than 5e-7, and 41 more by less than 1e-3.
+  - Ill-conditioned cases amplify the change: SDR of a short signal moves by 2.6 dB, and a PIT tie picks the other
+    permutation.
+  - float16 `gaussian_noise` draws a different random stream.
+  - On MPS, uint8 bilinear `resize` is one level off.
+
+  For bit-exact results, run the same libtorch version as the PyTorch that produced the Python results.
 - **The CPU.** libtorch picks kernels by CPU capability, and so does torchvision. An example is uint8 bilinear
   `resize`: on an AVX2 machine it uses torch's native uint8 kernel, otherwise it goes through float32 (arm64 does
   the latter). Both sides take the same path on the same machine. Compare against Python on the machine you deploy
