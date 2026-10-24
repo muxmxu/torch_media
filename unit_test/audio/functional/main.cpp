@@ -1334,6 +1334,7 @@ static void test_resample_parity() {
     // speed / pitch_shift reuse resample.
     TM_CHECK(speed(x, 16000, 1.0).first.equal(x));
     TM_CHECK(raises_inv([&] { (void) speed(x, 16000, 0.0); }));
+    TM_CHECK(raises_inv([&] { (void) speed(x, 0, 1.0); })); // gcd(0, 0) used to divide by zero
     TM_CHECK(speed(x.to(torch::kDouble), 16000, 1.5).first.scalar_type() == torch::kDouble);
     const auto xl = torch::randn({1, 2000});
     TM_CHECK_TENSOR_CLOSE(pitch_shift(xl, 16000, 0), xl, 1e-5, 1e-5); // only the stft/istft round trip remains
@@ -1374,6 +1375,9 @@ static void test_coverage_gaps_filtering_beamforming_alignment() {
     TM_CHECK(raises_inv([] { (void) _lfilter_core(torch::randn({8}), torch::ones({1, 3}), torch::ones({1, 3})); }));
     TM_CHECK(raises_inv([&] { (void) _lfilter_core(w3, torch::ones({1, 0}), torch::ones({1, 0})); }));
     TM_CHECK(raises_inv([] { (void) lfilter(torch::randn({3, 8}), torch::ones({2, 3}), torch::ones({2, 3})); }));
+    // A 0-D waveform (shape.back() of an empty shape used to be UB).
+    TM_CHECK(raises_inv([] { (void) lfilter(torch::tensor(0.5f), torch::ones({3}), torch::ones({3})); }));
+    TM_CHECK(raises_inv([] { (void) lfilter(torch::tensor(0.5f), torch::ones({2, 3}), torch::ones({2, 3})); }));
     // riaa_biquad 48 kHz / 88.2 kHz tables.
     const auto w = filt_wav();
     TM_CHECK_TENSOR_CLOSE(riaa_biquad(w, 48000),

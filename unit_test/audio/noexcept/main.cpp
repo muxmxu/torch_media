@@ -113,6 +113,8 @@ static void test_filtering_beamforming_alignment() {
     TM_CHECK(is_default(fn::lfilter(wav, torch::tensor({1.f, 0.f}), torch::tensor({1.f, 0.f, 0.f}))));
     TM_CHECK(is_default(fn::lfilter(wav, torch::zeros({2, 2, 3}), torch::zeros({2, 2, 3}))));
     TM_CHECK(is_default(fn::lfilter(torch::randn({3, 8}), torch::ones({2, 3}), torch::ones({2, 3}))));
+    TM_CHECK(is_default(fn::lfilter(torch::tensor(0.5f), torch::ones({3}), torch::ones({3}))));
+    TM_CHECK(is_default(fn::speed(torch::randn({1, 64}), 0, 1.0).first));
     TM_CHECK(is_default(fn::deemph_biquad(wav, 16000)));
     TM_CHECK(is_default(fn::riaa_biquad(wav, 16000)));
     TM_CHECK(is_default(fn::contrast(wav, 150.0)));

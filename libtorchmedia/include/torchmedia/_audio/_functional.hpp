@@ -650,7 +650,8 @@ namespace torchmedia::audio::functional {
             -> std::pair<tensor_t, c10::optional<tensor_t>> {
         int source_sample_rate = static_cast<int>(factor * orig_freq);
         int target_sample_rate = orig_freq;
-        const int g = std::gcd(source_sample_rate, target_sample_rate);
+        // orig_freq 0 gives gcd 0 (torchaudio: ZeroDivisionError); 1 keeps 0 -> 0 for resample to reject.
+        const int g = std::max(std::gcd(source_sample_rate, target_sample_rate), 1);
         source_sample_rate /= g;
         target_sample_rate /= g;
         const auto out = resample(waveform, source_sample_rate, target_sample_rate);

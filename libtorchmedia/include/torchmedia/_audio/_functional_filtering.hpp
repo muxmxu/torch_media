@@ -113,9 +113,13 @@ namespace torchmedia::audio::functional {
             return handle_exceptions<tensor_t, std::invalid_argument>("Expected coeffs to have at most 2 dimensions.");
         }
 
+        if (waveform.dim() <= 0) { // torchaudio: this ValueError with 2-D coeffs, an IndexError otherwise
+            return handle_exceptions<tensor_t, std::invalid_argument>(
+                    "Expected waveform to have a positive number of dimensions. Found: 0");
+        }
         if (a_coeffs.dim() > 1) {
             if (batching) {
-                if (waveform.dim() <= 0 || waveform.size(-2) != a_coeffs.size(0)) {
+                if (waveform.size(-2) != a_coeffs.size(0)) {
                     return handle_exceptions<tensor_t, std::invalid_argument>(
                             "Expected number of batches in waveform and coeffs to be the same.");
                 }

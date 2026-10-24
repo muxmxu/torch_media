@@ -107,7 +107,7 @@ namespace torchmedia::audio::transform {
         explicit Speed(speed_option opt = {}) : _opt(opt) {
             int source = static_cast<int>(_opt._factor * _opt._orig_freq);
             int target = _opt._orig_freq;
-            const int g = std::gcd(source, target);
+            const int g = std::max(std::gcd(source, target), 1); // orig_freq 0: Resample rejects 0 -> 0
             _source = source / g;
             _target = target / g;
             _resampler = Resample(resample_option().orig_freq(_source).new_freq(_target));

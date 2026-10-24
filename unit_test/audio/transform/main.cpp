@@ -1187,6 +1187,7 @@ static void test_resample_parity() {
     TM_CHECK(threw_inv([&] { (void) r(torch::tensor(1.0f)); }));
     TM_CHECK(threw_inv([&] { (void) r(torch::zeros({1, 30}, torch::kShort)); }));
     TM_CHECK(threw_inv([] { tf::Speed(tf::speed_option().factor(0.0)); }));
+    TM_CHECK(threw_inv([] { tf::Speed(tf::speed_option().orig_freq(0)); })); // gcd(0, 0) used to divide by zero
 }
 
 // Cached buffers (window, fb, DCT, filter, kernel, phase advance) follow the input dtype/device (new finding).
