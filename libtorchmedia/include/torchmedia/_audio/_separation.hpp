@@ -142,35 +142,39 @@ namespace torchmedia::audio::separation {
     // G2, D7). Devices: CPU tested, CUDA untested, MPS unsupported (libtorch lacks complex norm and linalg_solve).
     inline auto auxiva_ip(const_tensor_lref_t X, const auxiva_option &opt = {}) -> tensor_t {
         if (X.dim() < 3) {
-            throw std::invalid_argument(
+            return handle_exceptions<tensor_t, std::invalid_argument>(
                     std::format("auxiva_ip: X must be [..., n_chan, n_freq, n_frames], got {} dims", X.dim()));
         }
         if (X.scalar_type() != torch::kComplexFloat && X.scalar_type() != torch::kComplexDouble) {
-            throw std::invalid_argument(std::format("auxiva_ip: X must be a complex64 or complex128 STFT, got {}",
-                                                    c10::toString(X.scalar_type())));
+            return handle_exceptions<tensor_t, std::invalid_argument>(std::format(
+                    "auxiva_ip: X must be a complex64 or complex128 STFT, got {}", c10::toString(X.scalar_type())));
         }
         const auto n_chan = X.size(-3);
         const auto n_freq = X.size(-2);
         const auto n_frames = X.size(-1);
         if (opt._n_src == 0 || opt._n_src < -1 || opt._n_src > n_chan) {
-            throw std::invalid_argument(
+            return handle_exceptions<tensor_t, std::invalid_argument>(
                     std::format("auxiva_ip: n_src must be -1 or in [1, n_chan={}], got {}", n_chan, opt._n_src));
         }
         if (opt._n_iter < 0) {
-            throw std::invalid_argument(std::format("auxiva_ip: n_iter must be >= 0, got {}", opt._n_iter));
+            return handle_exceptions<tensor_t, std::invalid_argument>(
+                    std::format("auxiva_ip: n_iter must be >= 0, got {}", opt._n_iter));
         }
         if (opt._proj_back_mic < -1 || opt._proj_back_mic >= n_chan) {
-            throw std::invalid_argument(std::format("auxiva_ip: proj_back_mic must be -1 or in [0, n_chan={}), got {}",
-                                                    n_chan, opt._proj_back_mic));
+            return handle_exceptions<tensor_t, std::invalid_argument>(std::format(
+                    "auxiva_ip: proj_back_mic must be -1 or in [0, n_chan={}), got {}", n_chan, opt._proj_back_mic));
         }
         if (opt._n_basis < 1) {
-            throw std::invalid_argument(std::format("auxiva_ip: n_basis must be >= 1, got {}", opt._n_basis));
+            return handle_exceptions<tensor_t, std::invalid_argument>(
+                    std::format("auxiva_ip: n_basis must be >= 1, got {}", opt._n_basis));
         }
         if (!(std::isfinite(opt._eps) && opt._eps > 0.0)) {
-            throw std::invalid_argument(std::format("auxiva_ip: eps must be finite and > 0, got {}", opt._eps));
+            return handle_exceptions<tensor_t, std::invalid_argument>(
+                    std::format("auxiva_ip: eps must be finite and > 0, got {}", opt._eps));
         }
         if (!(std::isfinite(opt._load) && opt._load > 0.0)) {
-            throw std::invalid_argument(std::format("auxiva_ip: load must be finite and > 0, got {}", opt._load));
+            return handle_exceptions<tensor_t, std::invalid_argument>(
+                    std::format("auxiva_ip: load must be finite and > 0, got {}", opt._load));
         }
         torch::NoGradGuard no_grad;
         const int64_t n_src = opt._n_src == -1 ? n_chan : opt._n_src;

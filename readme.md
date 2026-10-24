@@ -232,8 +232,11 @@ also BMP and PNM). `random_split(dataset, {0.8, 0.2}, seed)` gives the indices o
   and clang (GCC's GNU-mode default, `fast`, changes results); pass it yourself without the CMake target.
 - Autograd input keeps these loops as tensor ops on its device. On MPS the forward pass is correct, but a backward
   pass through them exhausts GPU memory beyond about 20k samples (torchaudio's own loops fail there too).
-- Invalid arguments raise `std::invalid_argument` where torchaudio raises. With `LIB_TORCH_MEDIA_NO_EXCEPTIONS`
-  defined, a call with invalid arguments returns a default value instead.
+- Invalid arguments raise `std::invalid_argument` where torchaudio raises (`std::runtime_error` for I/O). Define
+  `LIB_TORCH_MEDIA_NO_EXCEPTIONS` (for the whole program) to keep the library silent instead: a failing call returns
+  an undefined tensor (`!out.defined()`), a value-initialised struct or an empty container, and
+  `torchmedia::last_error()` returns its message (per thread; `torchmedia::clear_last_error()` resets it). Errors from
+  libtorch itself (`c10::Error`) still throw.
 - libtorch 2.5.1's MPS backend lacks some ops (`istft`, `angle`), so GriffinLim, InverseSpectrogram, PitchShift and
   TimeStretch do not run on MPS.
 

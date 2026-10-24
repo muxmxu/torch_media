@@ -118,6 +118,7 @@ namespace torchmedia::audio::io {
         // samples, either float32 or full-scale int32 (x / 2^31).
         struct decoder {
             audio_info info;
+            std::string error; // set by a constructor that could not open the stream (open() reports it)
             virtual ~decoder() = default;
             virtual auto seek(uint64_t frame) -> bool = 0;
             virtual auto read(int64_t frames) -> tensor_t = 0;
@@ -129,7 +130,8 @@ namespace torchmedia::audio::io {
             explicit wav_decoder(const source &src) {
                 if (!(src.path.empty() ? drwav_init_memory(&wav, src.data, src.size, nullptr)
                                        : drwav_init_file(&wav, src.path.c_str(), nullptr))) {
-                    throw std::runtime_error("Could not decode WAV: " + src.name());
+                    error = "Could not decode WAV: " + src.name();
+                    return;
                 }
                 const auto tag = wav.translatedFormatTag;
                 info = {static_cast<int>(wav.sampleRate), static_cast<int64_t>(wav.totalPCMFrameCount), wav.channels,
@@ -140,7 +142,11 @@ namespace torchmedia::audio::io {
                         : tag == DR_WAVE_FORMAT_MULAW      ? "ULAW"
                                                            : "UNKNOWN"};
             }
-            ~wav_decoder() override { drwav_uninit(&wav); }
+            ~wav_decoder() override {
+                if (error.empty()) {
+                    drwav_uninit(&wav);
+                }
+            }
 
             auto seek(uint64_t frame) -> bool override { return drwav_seek_to_pcm_frame(&wav, frame); }
             auto read(int64_t frames) -> tensor_t override {
@@ -178,8 +184,9 @@ namespace torchmedia::audio::io {
                     // dr_flac reads the 32-bit frame-header code as reserved and would decode no frames
                     const bool wide = flac != nullptr;
                     drflac_close(flac);
-                    throw std::runtime_error(
-                            std::string(wide ? "Unsupported 32-bit FLAC: " : "Could not decode FLAC: ") + src.name());
+                    flac = nullptr;
+                    error = std::string(wide ? "Unsupported 32-bit FLAC: " : "Could not decode FLAC: ") + src.name();
+                    return;
                 }
                 if (flac->totalPCMFrameCount == 0) {
                     // A streamed encode may leave the length unset in STREAMINFO: count it by decoding once (seeking
@@ -205,13 +212,18 @@ namespace torchmedia::audio::io {
             explicit mp3_decoder(const source &src) {
                 if (!(src.path.empty() ? drmp3_init_memory(&mp3, src.data, src.size, nullptr)
                                        : drmp3_init_file(&mp3, src.path.c_str(), nullptr))) {
-                    throw std::runtime_error("Could not decode MP3: " + src.name());
+                    error = "Could not decode MP3: " + src.name();
+                    return;
                 }
                 // The Xing / LAME tag's length minus encoder delay and padding, else a frame-header scan.
                 info = {static_cast<int>(mp3.sampleRate), static_cast<int64_t>(drmp3_get_pcm_frame_count(&mp3)),
                         static_cast<int>(mp3.channels), 0, "MP3"};
             }
-            ~mp3_decoder() override { drmp3_uninit(&mp3); }
+            ~mp3_decoder() override {
+                if (error.empty()) {
+                    drmp3_uninit(&mp3);
+                }
+            }
 
             auto seek(uint64_t frame) -> bool override { return drmp3_seek_to_pcm_frame(&mp3, frame); }
             auto read(int64_t frames) -> tensor_t override {
@@ -230,7 +242,8 @@ namespace torchmedia::audio::io {
                                             : stb_vorbis_open_memory(static_cast<const unsigned char *>(src.data),
                                                                      static_cast<int>(src.size), nullptr, nullptr)) {
                 if (vorbis == nullptr) {
-                    throw std::runtime_error("Could not decode Ogg Vorbis: " + src.name());
+                    error = "Could not decode Ogg Vorbis: " + src.name();
+                    return;
                 }
                 const auto vi = stb_vorbis_get_info(vorbis);
                 info = {static_cast<int>(vi.sample_rate),
@@ -272,11 +285,16 @@ namespace torchmedia::audio::io {
             }
         };
 
-        // Opens the decoder for the container named by the leading bytes (never by the file extension).
+        // Opens the decoder for the container named by the leading bytes (never by the file extension). Throws
+        // std::runtime_error, or (LIB_TORCH_MEDIA_NO_EXCEPTIONS) returns nullptr.
         inline auto open(const source &src) -> std::unique_ptr<decoder> {
+            using R = std::unique_ptr<decoder>;
             if (!src.path.empty() && !std::filesystem::exists(src.path)) {
-                throw std::runtime_error("File does not exist: " + src.path);
+                return handle_exceptions<R, std::runtime_error>("File does not exist: " + src.path);
             }
+            const auto checked = [](R dec) -> R {
+                return dec->error.empty() ? std::move(dec) : handle_exceptions<R, std::runtime_error>(dec->error);
+            };
             const auto peek = [&](size_t offset, size_t len) -> std::string { // up to len bytes from offset
                 if (src.path.empty()) {
                     return offset < src.size ? std::string(static_cast<const char *>(src.data) + offset,
@@ -296,41 +314,44 @@ namespace torchmedia::audio::io {
             };
             const auto byte = [&](size_t pos) { return pos < h.size() ? static_cast<unsigned char>(h[pos]) : 0u; };
             if (((at(0, "RIFF") || at(0, "RF64")) && at(8, "WAVE")) || (at(0, "riff") && at(24, "wave"))) { // W64
-                return std::make_unique<wav_decoder>(src);
+                return checked(std::make_unique<wav_decoder>(src));
             }
             if (at(0, "fLaC")) {
-                return std::make_unique<flac_decoder>(src, 0);
+                return checked(std::make_unique<flac_decoder>(src, 0));
             }
             if (at(0, "OggS") && h.size() > 26 && at(27 + byte(26), "\x01vorbis")) {
-                return std::make_unique<vorbis_decoder>(src);
+                return checked(std::make_unique<vorbis_decoder>(src));
             }
             if (at(0, "ID3") && h.size() >= 10) { // ID3v2: 10-byte header + syncsafe size (+ 10-byte footer)
                 const size_t tag =
                         10 + (byte(6) << 21 | byte(7) << 14 | byte(8) << 7 | byte(9)) + (byte(5) & 0x10 ? 10 : 0);
                 if (peek(tag, 4) == "fLaC") { // tagged FLAC (sox reads it too); anything else goes to dr_mp3
-                    return std::make_unique<flac_decoder>(src, tag);
+                    return checked(std::make_unique<flac_decoder>(src, tag));
                 }
-                return std::make_unique<mp3_decoder>(src);
+                return checked(std::make_unique<mp3_decoder>(src));
             }
             // An MPEG audio frame sync whose layer bits are not the reserved 00 (that is AAC ADTS), after any zero
             // padding within the first 512 bytes (dr_mp3 resyncs past it).
             const size_t z = std::min(h.find_first_not_of('\0'), h.size());
             if (byte(z) == 0xFF && (byte(z + 1) & 0xE0) == 0xE0 && (byte(z + 1) & 0x06)) {
-                return std::make_unique<mp3_decoder>(src);
+                return checked(std::make_unique<mp3_decoder>(src));
             }
-            throw std::runtime_error("Unsupported or unrecognized audio format: " + src.name());
+            return handle_exceptions<R, std::runtime_error>("Unsupported or unrecognized audio format: " + src.name());
         }
 
         inline auto load(const source &src, const load_option &opt) -> load_audio_t {
             if (opt._frame_offset < 0) {
-                throw std::invalid_argument("load_audio: frame_offset must be non-negative, got " +
-                                            std::to_string(opt._frame_offset));
+                return handle_exceptions<load_audio_t, std::invalid_argument>(
+                        "load_audio: frame_offset must be non-negative, got " + std::to_string(opt._frame_offset));
             }
             if (opt._num_frames == 0 || opt._num_frames < -1) {
-                throw std::invalid_argument("load_audio: num_frames must be -1 or positive, got " +
-                                            std::to_string(opt._num_frames));
+                return handle_exceptions<load_audio_t, std::invalid_argument>(
+                        "load_audio: num_frames must be -1 or positive, got " + std::to_string(opt._num_frames));
             }
             const auto dec = open(src);
+            if (!dec) {
+                return {}; // LIB_TORCH_MEDIA_NO_EXCEPTIONS: open() failed
+            }
             const int64_t total = dec->info.num_frames, channels = dec->info.num_channels;
             const int64_t start = std::min(opt._frame_offset, total);
             const int64_t count = opt._num_frames < 0 ? total - start : std::min(opt._num_frames, total - start);
@@ -401,7 +422,7 @@ namespace torchmedia::audio::io {
     // W64), FLAC (16 / 24-bit; also behind an ID3v2 tag), Ogg Vorbis, MP3. Integer PCM decodes to x / 2^(bits-1) and
     // 8-bit to (x - 128) / 128 like torchaudio; float WAV, MP3 and Vorbis come back as decoded, including any overshoot
     // beyond [-1, 1] (torchaudio's sox backend clips them). Throws std::runtime_error naming the path for a missing,
-    // unsupported (e.g. 32-bit FLAC) or undecodable file.
+    // unsupported (e.g. 32-bit FLAC) or undecodable file (LIB_TORCH_MEDIA_NO_EXCEPTIONS: returns {undefined, 0}).
     inline auto load_audio(const std::string &path, const load_option &opt = {}) -> load_audio_t {
         return detail::load({path}, opt);
     }
@@ -414,10 +435,14 @@ namespace torchmedia::audio::io {
     // torchaudio.info: the stream's metadata without decoding it (MP3 without a Xing / LAME tag scans frame headers;
     // Vorbis whose last page stb_vorbis cannot find, and FLAC of unknown length, are decoded once to count). The frame
     // count is the header's: for a corrupt or truncated file load_audio returns what actually decodes.
-    inline auto info(const path_t &path) -> audio_info { return detail::open({path.string()})->info; }
+    inline auto info(const path_t &path) -> audio_info {
+        const auto dec = detail::open({path.string()});
+        return dec ? dec->info : audio_info{}; // LIB_TORCH_MEDIA_NO_EXCEPTIONS: {} when open() failed
+    }
 
     inline auto info_from_memory(const void *data, size_t size) -> audio_info {
-        return detail::open({"", data, size})->info;
+        const auto dec = detail::open({"", data, size});
+        return dec ? dec->info : audio_info{};
     }
 
     // Save a [channels, frames] tensor (float32, int32, int16 or uint8, as torchaudio.save accepts) as a WAV file.

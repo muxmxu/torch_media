@@ -30,7 +30,7 @@ namespace torchmedia::audio::functional {
         }
         if (mode != convolve_mode::full) {
             return handle_exceptions<tensor_t, std::invalid_argument>(
-                    torch::empty({1}), "Unrecognized convolve mode. Use full, valid, or same.");
+                    "Unrecognized convolve mode. Use full, valid, or same.");
         }
         return conv_result;
     }
@@ -62,7 +62,7 @@ namespace torchmedia::audio::functional {
 
     inline auto convolve(tensor_t x, tensor_t y, const convolve_mode mode = convolve_mode::full) -> tensor_t {
         if (const auto err = _align_convolve_operands(x, y); !err.empty()) {
-            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}), err);
+            return handle_exceptions<tensor_t, std::invalid_argument>(err);
         }
         const auto n_dims_x = x.dim();
 
@@ -148,7 +148,7 @@ namespace torchmedia::audio::functional {
         if (option.apply_top_db) {
             if (db.dim() < 2) {
                 return handle_exceptions<tensor_t, std::invalid_argument>(
-                        torch::empty({1}), "amplitude_to_DB: top_db needs at least (freq, time) dimensions.");
+                        "amplitude_to_DB: top_db needs at least (freq, time) dimensions.");
             }
             const auto shape = db.sizes().vec();
             const int64_t channels = db.dim() > 2 ? shape[shape.size() - 3] : 1;
@@ -166,15 +166,14 @@ namespace torchmedia::audio::functional {
     // normalized is false (torchaudio has one `normalized` argument, so it never holds an unused invalid method).
     inline auto spectrogram(tensor_t signal, const spectrogram_option &option) -> tensor_t {
         if (option._normalize_method != "frame_length" && option._normalize_method != "window") {
-            return handle_exceptions<tensor_t, std::invalid_argument>(
-                    torch::empty({1}), "Invalid normalize_method: \"" + option._normalize_method +
-                                               "\" (use \"window\" or \"frame_length\").");
+            return handle_exceptions<tensor_t, std::invalid_argument>("Invalid normalize_method: \"" +
+                                                                      option._normalize_method +
+                                                                      "\" (use \"window\" or \"frame_length\").");
         }
         const bool frame_length_norm = option._normalized && option._normalize_method == "frame_length";
         const bool window_norm = option._normalized && option._normalize_method == "window";
         if (signal.dim() < 1) {
-            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                                      "spectrogram: expected a (..., time) waveform.");
+            return handle_exceptions<tensor_t, std::invalid_argument>("spectrogram: expected a (..., time) waveform.");
         }
         if (option._pad > 0) {
             signal = torch::constant_pad_nd(signal, {option._pad, option._pad}, 0);
@@ -247,7 +246,7 @@ namespace torchmedia::audio::functional {
                                 ) -> tensor_t {
         using namespace torch::indexing;
         if (const auto err = _check_mel_strings(norm, mel_scale); !err.empty()) {
-            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}), err);
+            return handle_exceptions<tensor_t, std::invalid_argument>(err);
         }
         f_max = detail::effective_f_max(f_max, sample_rate);
         const bool htk = mel_scale == "htk";
@@ -293,7 +292,7 @@ namespace torchmedia::audio::functional {
     // The filterbank is moved to the spectrogram's device and dtype.
     inline auto melspectrogram(const_tensor_lref_t waveform, const mel_spectrogram_option &opt) -> tensor_t {
         if (const auto err = _check_melspectrogram_args(opt); !err.empty()) {
-            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}), err);
+            return handle_exceptions<tensor_t, std::invalid_argument>(err);
         }
         spectrogram_option sp_opt;
         sp_opt._pad = opt.pad;
@@ -308,6 +307,9 @@ namespace torchmedia::audio::functional {
         sp_opt._return_complex = false; // 我们要实数谱，后面才能和 fb 做乘法
 
         const auto spec = spectrogram(waveform, sp_opt); // [..., freq, time]
+        if (!spec.defined()) {
+            return spec; // LIB_TORCH_MEDIA_NO_EXCEPTIONS: spectrogram rejected the waveform
+        }
         const auto fb = mel_filter_bank(opt.n_mels, opt.f_min, opt.f_max, opt.sample_rate, opt.n_fft / 2 + 1, opt.norm,
                                         opt.mel_scale)
                                 .to(spec.device(), spec.scalar_type()); // [n_mels, n_stft_bins]
@@ -319,7 +321,7 @@ namespace torchmedia::audio::functional {
     // *sqrt(2/n_mels); returned transposed (a view, like torchaudio).
     inline auto create_dct(int n_mfcc, int n_mels, const std::string &norm = "ortho") -> tensor_t {
         if (const auto err = _check_dct_norm(norm); !err.empty()) {
-            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}), err);
+            return handle_exceptions<tensor_t, std::invalid_argument>(err);
         }
         const double pi = std::acos(-1.0);
         const auto n = torch::arange(n_mels, torch::kFloat); // [n_mels]
@@ -339,7 +341,7 @@ namespace torchmedia::audio::functional {
     inline auto mfcc(const_tensor_lref_t waveform, const mfcc_option &opt) -> tensor_t {
         if (opt.n_mfcc > opt.mel.n_mels) {
             return handle_exceptions<tensor_t, std::invalid_argument>(
-                    torch::empty({1}), "Cannot select more MFCC coefficients than mel bins.");
+                    "Cannot select more MFCC coefficients than mel bins.");
         }
         auto mel_opt = opt.mel;
         mel_opt.sample_rate = opt.sample_rate;
@@ -348,10 +350,13 @@ namespace torchmedia::audio::functional {
             err = _check_melspectrogram_args(mel_opt);
         }
         if (!err.empty()) {
-            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}), err);
+            return handle_exceptions<tensor_t, std::invalid_argument>(err);
         }
         const auto dct_mat = create_dct(opt.n_mfcc, opt.mel.n_mels, opt.norm); // [n_mels, n_mfcc]
         const auto mel_spec = melspectrogram(waveform, mel_opt); // [..., n_mels, time]
+        if (!mel_spec.defined()) {
+            return mel_spec; // LIB_TORCH_MEDIA_NO_EXCEPTIONS: the waveform was rejected
+        }
         tensor_t feat;
         if (opt.log_mels) {
             feat = torch::log(mel_spec + 1e-6);
@@ -366,12 +371,11 @@ namespace torchmedia::audio::functional {
     // istft and rand_init draws torch.rand(complex)). The default window follows the spectrogram's dtype and device.
     inline auto griffinlim(const_tensor_lref_t specgram, const griffinlim_option &opt) -> tensor_t {
         if (!(opt.momentum >= 0.0 && opt.momentum < 1.0)) {
-            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                                      "momentum must be in range [0, 1).");
+            return handle_exceptions<tensor_t, std::invalid_argument>("momentum must be in range [0, 1).");
         }
         if (specgram.dim() < 2) {
             return handle_exceptions<tensor_t, std::invalid_argument>(
-                    torch::empty({1}), "griffinlim: expected a (..., freq, time) spectrogram.");
+                    "griffinlim: expected a (..., freq, time) spectrogram.");
         }
         const int win_length = detail::derive_win_length(opt.win_length, opt.n_fft);
         const int hop_length = detail::derive_hop_length(opt.hop_length, win_length);
@@ -464,11 +468,10 @@ namespace torchmedia::audio::functional {
                                             const_tensor_lref_t kernels, int width) -> tensor_t {
         if (!waveform.is_floating_point()) {
             return handle_exceptions<tensor_t, std::invalid_argument>(
-                    torch::empty({1}), "Expected floating point type for waveform tensor.");
+                    "Expected floating point type for waveform tensor.");
         }
         if (waveform.dim() < 1) {
-            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                                      "resample: expected a (..., time) waveform.");
+            return handle_exceptions<tensor_t, std::invalid_argument>("resample: expected a (..., time) waveform.");
         }
         const int of = orig_freq / gcd;
         const int nf = new_freq / gcd;
@@ -495,7 +498,7 @@ namespace torchmedia::audio::functional {
     inline auto resample(const_tensor_lref_t waveform, int orig_freq, int new_freq, const resample_option &opt = {})
             -> tensor_t {
         if (const auto err = _check_resample_args(orig_freq, new_freq, opt); !err.empty()) {
-            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}), err);
+            return handle_exceptions<tensor_t, std::invalid_argument>(err);
         }
         if (orig_freq == new_freq) {
             return waveform;
@@ -547,11 +550,10 @@ namespace torchmedia::audio::functional {
             -> tensor_t {
         namespace F = torch::nn::functional;
         if (win_length < 3) {
-            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}), "win_length must be >= 3.");
+            return handle_exceptions<tensor_t, std::invalid_argument>("win_length must be >= 3.");
         }
         if (mode != "replicate" && mode != "constant" && mode != "reflect" && mode != "circular") {
-            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                                      "Unrecognised padding mode " + mode);
+            return handle_exceptions<tensor_t, std::invalid_argument>("Unrecognised padding mode " + mode);
         }
         const auto shape = specgram.sizes().vec();
         const int64_t time = shape.back();
@@ -594,6 +596,9 @@ namespace torchmedia::audio::functional {
                            .normalized(false)
                            .return_complex(false);
         const auto specgram = spectrogram(waveform, opt);
+        if (!specgram.defined()) {
+            return specgram; // LIB_TORCH_MEDIA_NO_EXCEPTIONS: spectrogram rejected the waveform
+        }
         // float32 like torchaudio's linspace(device=...), whatever the spectrogram's dtype.
         const auto freqs =
                 torch::linspace(0, sample_rate / 2, 1 + n_fft / 2, tensor_options_t().device(specgram.device()))
@@ -605,7 +610,7 @@ namespace torchmedia::audio::functional {
     // operand check and crop helper, so it agrees with the time-domain convolve() to FP tolerance.
     inline auto fftconvolve(tensor_t x, tensor_t y, const convolve_mode mode = convolve_mode::full) -> tensor_t {
         if (const auto err = _align_convolve_operands(x, y); !err.empty()) {
-            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}), err);
+            return handle_exceptions<tensor_t, std::invalid_argument>(err);
         }
         const int64_t n = x.size(-1) + y.size(-1) - 1;
         const auto fresult = torch::fft::rfft(x, n, -1) * torch::fft::rfft(y, n, -1);
@@ -618,12 +623,11 @@ namespace torchmedia::audio::functional {
                           const c10::optional<tensor_t> &lengths = c10::nullopt) -> tensor_t {
         if (!(waveform.dim() >= 1 && waveform.dim() == noise.dim() && waveform.dim() - 1 == snr.dim() &&
               (!lengths.has_value() || lengths->dim() == snr.dim()))) {
-            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                                      "Input leading dimensions don't match.");
+            return handle_exceptions<tensor_t, std::invalid_argument>("Input leading dimensions don't match.");
         }
         if (waveform.size(-1) != noise.size(-1)) {
             return handle_exceptions<tensor_t, std::invalid_argument>(
-                    torch::empty({1}), "Length dimensions of waveform and noise don't match.");
+                    "Length dimensions of waveform and noise don't match.");
         }
         tensor_t ws = waveform, ns = noise;
         if (lengths.has_value()) {
@@ -649,12 +653,12 @@ namespace torchmedia::audio::functional {
         const int g = std::gcd(source_sample_rate, target_sample_rate);
         source_sample_rate /= g;
         target_sample_rate /= g;
-        c10::optional<tensor_t> out_lengths = c10::nullopt;
-        if (lengths.has_value()) {
-            out_lengths = torch::ceil(lengths.value() * target_sample_rate / static_cast<double>(source_sample_rate))
-                                  .to(lengths.value().dtype());
+        const auto out = resample(waveform, source_sample_rate, target_sample_rate);
+        if (!lengths.has_value() || (!out.defined() && waveform.defined())) { // resample rejected it (no-exceptions)
+            return {out, c10::nullopt};
         }
-        return {resample(waveform, source_sample_rate, target_sample_rate), out_lengths};
+        return {out, torch::ceil(lengths.value() * target_sample_rate / static_cast<double>(source_sample_rate))
+                             .to(lengths.value().dtype())};
     }
 
     // Levenshtein edit distance over two sequences (mirrors torchaudio.functional.edit_distance).
@@ -692,11 +696,10 @@ namespace torchmedia::audio::functional {
         if (mu_x.dim() != 1 || sigma_x.dim() != 2 || sigma_x.size(0) != sigma_x.size(1) ||
             sigma_x.size(0) != mu_x.size(0)) {
             return handle_exceptions<tensor_t, std::invalid_argument>(
-                    torch::empty({1}), "mu_x must be 1-D and sigma_x a matching square matrix.");
+                    "mu_x must be 1-D and sigma_x a matching square matrix.");
         }
         if (mu_x.sizes() != mu_y.sizes() || sigma_x.sizes() != sigma_y.sizes()) {
-            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                                      "x and y means/covariances must share shapes.");
+            return handle_exceptions<tensor_t, std::invalid_argument>("x and y means/covariances must share shapes.");
         }
         const auto a = (mu_x - mu_y).square().sum();
         const auto b = sigma_x.trace() + sigma_y.trace();
@@ -717,16 +720,13 @@ namespace torchmedia::audio::functional {
                                 double p = 1.0) -> tensor_t {
         const int64_t dim = specgram.dim();
         if (dim < 2) {
-            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                                      "Spectrogram must have at least two dimensions.");
+            return handle_exceptions<tensor_t, std::invalid_argument>("Spectrogram must have at least two dimensions.");
         }
         if (axis != dim - 2 && axis != dim - 1) {
-            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                                      "Only Frequency and Time masking are supported.");
+            return handle_exceptions<tensor_t, std::invalid_argument>("Only Frequency and Time masking are supported.");
         }
         if (!(p >= 0.0 && p <= 1.0)) {
-            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                                      "p must be between 0.0 and 1.0.");
+            return handle_exceptions<tensor_t, std::invalid_argument>("p must be between 0.0 and 1.0.");
         }
         const int64_t mp = _get_mask_param(mask_param, p, specgram.size(axis));
         if (mp < 1) {
@@ -756,15 +756,13 @@ namespace torchmedia::audio::functional {
         const int64_t dim = specgrams.dim();
         if (dim < 3) {
             return handle_exceptions<tensor_t, std::invalid_argument>(
-                    torch::empty({1}), "Spectrogram must have at least three dimensions.");
+                    "Spectrogram must have at least three dimensions.");
         }
         if (axis != dim - 2 && axis != dim - 1) {
-            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                                      "Only Frequency and Time masking are supported.");
+            return handle_exceptions<tensor_t, std::invalid_argument>("Only Frequency and Time masking are supported.");
         }
         if (!(p >= 0.0 && p <= 1.0)) {
-            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                                      "p must be between 0.0 and 1.0.");
+            return handle_exceptions<tensor_t, std::invalid_argument>("p must be between 0.0 and 1.0.");
         }
         const int64_t mp = _get_mask_param(mask_param, p, specgrams.size(axis));
         if (mp < 1) {
@@ -792,7 +790,7 @@ namespace torchmedia::audio::functional {
         }
         if (complex_specgrams_in.dim() < 2) { // torchaudio raises (RuntimeError) on 0-D / 1-D input
             return handle_exceptions<tensor_t, std::invalid_argument>(
-                    torch::empty({1}), "phase_vocoder: expected a (..., freq, time) complex spectrogram.");
+                    "phase_vocoder: expected a (..., freq, time) complex spectrogram.");
         }
         const double pi = std::acos(-1.0);
         const auto shape = complex_specgrams_in.sizes().vec();
@@ -831,16 +829,14 @@ namespace torchmedia::audio::functional {
         const bool frame_length_norm = normalized == "frame_length";
         const bool window_norm = normalized == "window" || normalized == "true";
         if (!frame_length_norm && !window_norm && normalized != "none" && normalized != "false") {
-            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                                      "Invalid normalized parameter: " + normalized);
+            return handle_exceptions<tensor_t, std::invalid_argument>("Invalid normalized parameter: " + normalized);
         }
         if (spectrogram_in.dim() < 2) {
             return handle_exceptions<tensor_t, std::invalid_argument>(
-                    torch::empty({1}), "inverse_spectrogram: expected a (..., freq, time) spectrogram.");
+                    "inverse_spectrogram: expected a (..., freq, time) spectrogram.");
         }
         if (!spectrogram_in.is_complex()) {
-            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                                      "Expected spectrogram to be complex dtype.");
+            return handle_exceptions<tensor_t, std::invalid_argument>("Expected spectrogram to be complex dtype.");
         }
         auto spec = spectrogram_in;
         if (window_norm) {
@@ -867,8 +863,7 @@ namespace torchmedia::audio::functional {
                                   const c10::optional<tensor_t> &window_opt = c10::nullopt) -> tensor_t {
         using namespace torch::indexing;
         if (waveform_in.dim() < 1) {
-            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                                      "pitch_shift: expected a (..., time) waveform.");
+            return handle_exceptions<tensor_t, std::invalid_argument>("pitch_shift: expected a (..., time) waveform.");
         }
         const int hop_length = hop_length_opt.has_value() ? hop_length_opt.value() : n_fft / 4;
         const int win_length = win_length_opt.has_value() ? win_length_opt.value() : n_fft;
@@ -927,11 +922,10 @@ namespace torchmedia::audio::functional {
                             const c10::optional<tensor_t> &window = c10::nullopt) -> tensor_t {
         int orig_freq = 0;
         if (const auto err = _pitch_shift_orig_freq(sample_rate, n_steps, bins_per_octave, orig_freq); !err.empty()) {
-            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}), err);
+            return handle_exceptions<tensor_t, std::invalid_argument>(err);
         }
         if (waveform.dim() < 1) { // torchaudio: IndexError
-            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                                      "pitch_shift: expected a (..., time) waveform.");
+            return handle_exceptions<tensor_t, std::invalid_argument>("pitch_shift: expected a (..., time) waveform.");
         }
         const auto waveform_stretch =
                 _stretch_waveform(waveform, n_steps, bins_per_octave, n_fft, win_length, hop_length, window);
@@ -943,8 +937,7 @@ namespace torchmedia::audio::functional {
     inline auto loudness(const_tensor_lref_t waveform_in, int sample_rate) -> tensor_t {
         using namespace torch::indexing;
         if (waveform_in.size(-2) > 5) {
-            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                                      "Only up to 5 channels are supported.");
+            return handle_exceptions<tensor_t, std::invalid_argument>("Only up to 5 channels are supported.");
         }
         const double gate_duration = 0.4, overlap = 0.75, gamma_abs = -70.0, kweight_bias = -0.691;
         // Python round(): halves go to even (11025 Hz: round(1102.5) = 1102).
@@ -1132,8 +1125,8 @@ namespace torchmedia::audio::functional {
         if (waveform_in.dim() < 1 || sample_rate <= 0 || freq_low <= 0 || freq_high <= 0 || win_length < 1 ||
             !(frame_time > 0.0 && sample_rate * frame_time < 1e15)) { // torchaudio: ZeroDivisionError / IndexError
             return handle_exceptions<tensor_t, std::invalid_argument>(
-                    torch::empty({1}), "detect_pitch_frequency: need a (..., time) waveform, positive sample_rate, "
-                                       "frame_time, freq_low, freq_high and win_length >= 1.");
+                    "detect_pitch_frequency: need a (..., time) waveform, positive sample_rate, "
+                    "frame_time, freq_low, freq_high and win_length >= 1.");
         }
         const auto shape = waveform_in.sizes().vec();
         const auto waveform = waveform_in.reshape({-1, shape.back()});

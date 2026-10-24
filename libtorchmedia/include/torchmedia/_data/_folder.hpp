@@ -44,6 +44,11 @@ namespace torchmedia::data {
                 const auto &[path, target] = _list->samples[index];
                 auto data = _loader(path);
                 auto label = torch::scalar_tensor(target, torch::kInt64);
+#ifdef LIB_TORCH_MEDIA_NO_EXCEPTIONS
+                if (!data.defined()) { // the loader failed (last_error() names the file): no transform on its fallback
+                    return {data, _target_transform ? _target_transform(label) : label};
+                }
+#endif
                 return {_transform ? _transform(data) : data, _target_transform ? _target_transform(label) : label};
             }
             auto size() const -> std::optional<size_t> override { return _list->samples.size(); }
@@ -219,6 +224,9 @@ namespace torchmedia::data {
             }
             sample_list list;
             std::tie(list.classes, list.class_to_idx) = find_classes(root);
+            if (list.classes.empty()) {
+                return list; // LIB_TORCH_MEDIA_NO_EXCEPTIONS: find_classes failed
+            }
             list.samples = make_dataset(root, list.class_to_idx, opt._extensions, opt._is_valid_file, opt._allow_empty);
             for (const auto &s: list.samples) {
                 list.targets.push_back(s.second);
@@ -268,13 +276,22 @@ namespace torchmedia::data {
         if (opt._load_image) {
             return [](const path_t &p) {
                 const auto x = vision::io::load_image(p);
+                if (!x.defined()) {
+                    return x; // LIB_TORCH_MEDIA_NO_EXCEPTIONS: load_image failed (its message names the file)
+                }
                 return (x.size(0) < 3 ? x.narrow(0, 0, 1).expand({3, -1, -1}) : x.narrow(0, 0, 3)).contiguous();
             };
         }
-        return [mode = opt._mode](const path_t &p) {
+        return [mode = opt._mode](const path_t &p) -> tensor_t {
             const auto bytes = vision::io::read_file(p); // its error names the file
+            if (!bytes.defined()) {
+                return bytes; // LIB_TORCH_MEDIA_NO_EXCEPTIONS: read_file failed
+            }
             try {
                 const auto x = vision::io::decode_image(bytes, mode);
+                if (!x.defined()) { // LIB_TORCH_MEDIA_NO_EXCEPTIONS: name the file, as the throwing build does
+                    return detail::invalid<tensor_t, std::runtime_error>(p.string() + ": " + last_error());
+                }
                 return mode == vision::io::image_read_mode::unchanged
                                ? x
                                : vision::functional::to_dtype(x, torch::kUInt8, true);
@@ -345,6 +362,9 @@ namespace torchmedia::data {
                 read.num_frames(opt._num_frames);
             }
             auto [x, sr] = audio::io::load_audio(p, read);
+            if (!x.defined()) {
+                return x; // LIB_TORCH_MEDIA_NO_EXCEPTIONS: load_audio failed (its message names the file)
+            }
             if (opt._mono) {
                 x = x.mean(0, true);
             }

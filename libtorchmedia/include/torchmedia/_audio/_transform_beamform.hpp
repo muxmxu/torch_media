@@ -61,7 +61,7 @@ namespace torchmedia::audio::transform {
                         double eps = 1e-8) const -> tensor_t {
             const auto w =
                     functional::mvdr_weights_souden(psd_s, psd_n, reference_channel, diagonal_loading, diag_eps, eps);
-            return functional::apply_beamforming(w, specgram);
+            return w.defined() ? functional::apply_beamforming(w, specgram) : w; // undefined: rejected (no-exceptions)
         }
         template<class Ref>
         auto forward(const_tensor_lref_t specgram, const_tensor_lref_t psd_s, const_tensor_lref_t psd_n,
@@ -81,7 +81,7 @@ namespace torchmedia::audio::transform {
                         const Ref &reference_channel, bool diagonal_loading = true, double diag_eps = 1e-7,
                         double eps = 1e-8) const -> tensor_t {
             const auto w = functional::mvdr_weights_rtf(rtf, psd_n, reference_channel, diagonal_loading, diag_eps, eps);
-            return functional::apply_beamforming(w, specgram);
+            return w.defined() ? functional::apply_beamforming(w, specgram) : w; // undefined: rejected (no-exceptions)
         }
         template<class Ref>
         auto forward(const_tensor_lref_t specgram, const_tensor_lref_t rtf, const_tensor_lref_t psd_n,
@@ -138,11 +138,10 @@ namespace torchmedia::audio::transform {
             const auto dtype = specgram.scalar_type();
             if (specgram.dim() < 3) {
                 return handle_exceptions<tensor_t, std::invalid_argument>(
-                        torch::empty({1}), "MVDR: expected at least a 3D tensor (..., channel, freq, time).");
+                        "MVDR: expected at least a 3D tensor (..., channel, freq, time).");
             }
             if (!specgram.is_complex()) {
-                return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                                          "MVDR: specgram must be a complex tensor.");
+                return handle_exceptions<tensor_t, std::invalid_argument>("MVDR: specgram must be a complex tensor.");
             }
             // Promote cfloat -> cdouble for internal numerical stability (G7).
             const tensor_t spec = dtype == torch::kComplexFloat ? specgram.to(torch::kComplexDouble) : specgram;
@@ -150,6 +149,9 @@ namespace torchmedia::audio::transform {
 
             const auto psd_s = _psd(spec, mask_s);
             const auto psd_n = _psd(spec, mask_n);
+            if (!psd_s.defined() || !psd_n.defined()) {
+                return {}; // LIB_TORCH_MEDIA_NO_EXCEPTIONS: PSD rejected a mask
+            }
 
             // One-hot reference vector u over the leading (..., channel) dims.
             auto lead = spec.sizes().vec();

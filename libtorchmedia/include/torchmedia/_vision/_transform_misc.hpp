@@ -18,16 +18,19 @@ namespace torchmedia::vision::transform {
             (void) handle_exceptions<int, std::invalid_argument>(std::move(msg));
         }
 
+        inline auto size_ok(const std::vector<int64_t> &size) -> bool { return !size.empty() && size.size() <= 2; }
+
         inline auto check_size(const char *cls, const std::vector<int64_t> &size) -> void {
-            if (size.empty() || size.size() > 2) {
+            if (!size_ok(size)) {
                 fail(std::format("{}: please provide only two dimensions (h, w) for size.", cls));
             }
         }
 
-        // torchvision _setup_size: {s} or {h, w} -> {h, w} ({0, 0} after a failed check in a no-exceptions build).
+        // torchvision _setup_size: {s} or {h, w} -> {h, w} ({0, 0} after a failed check in a no-exceptions build: the
+        // class's calls then return the fallback, see RandomCrop).
         inline auto setup_size(const char *cls, const std::vector<int64_t> &size) -> std::array<int64_t, 2> {
             check_size(cls, size);
-            return size.empty() || size.size() > 2 ? std::array<int64_t, 2>{} : std::array{size[0], size.back()};
+            return size_ok(size) ? std::array{size[0], size.back()} : std::array<int64_t, 2>{};
         }
 
         inline auto check_p(const char *cls, double p) -> void {
@@ -59,11 +62,14 @@ namespace torchmedia::vision::transform {
             return {l[0].item<double>(), l[1].item<double>()};
         }
 
-        // torchvision query_chw on one image [..., H, W] (a 2-D image has one channel).
+        // torchvision query_chw on one image [..., H, W] (a 2-D image has one channel). {-1, -1, -1} after a failed
+        // check in a no-exceptions build: the caller returns the fallback (`if (c < 0) return {};`).
         inline auto query_chw(const char *cls, const tensor_t &img) -> std::array<int64_t, 3> {
             if (img.dim() < 2) {
-                return handle_exceptions<std::array<int64_t, 3>, std::invalid_argument>(std::format(
-                        "{}: expected a tensor with at least 2 dims (..., H, W), got {} dims.", cls, img.dim()));
+                return handle_exceptions<std::array<int64_t, 3>, std::invalid_argument>(
+                        {-1, -1, -1},
+                        std::format("{}: expected a tensor with at least 2 dims (..., H, W), got {} dims.", cls,
+                                    img.dim()));
             }
             return {img.dim() < 3 ? 1 : img.size(-3), img.size(-2), img.size(-1)};
         }
@@ -98,6 +104,11 @@ namespace torchmedia::vision::transform {
             auto out = img;
             for (const auto &t: _transforms) {
                 out = t(out);
+#ifdef LIB_TORCH_MEDIA_NO_EXCEPTIONS
+                if (!out.defined()) {
+                    return out; // a part's fallback: later parts do not run on it
+                }
+#endif
             }
             return out;
         }
@@ -123,6 +134,11 @@ namespace torchmedia::vision::transform {
             auto out = img;
             for (const auto &t: _transforms) {
                 out = t(out);
+#ifdef LIB_TORCH_MEDIA_NO_EXCEPTIONS
+                if (!out.defined()) {
+                    return out; // a part's fallback: later parts do not run on it
+                }
+#endif
             }
             return out;
         }
@@ -147,8 +163,10 @@ namespace torchmedia::vision::transform {
                 _p.assign(_transforms.size(), 1.0);
                 detail::fail(msg);
             }
-            const double total = std::accumulate(_p.begin(), _p.end(), 0.0);
+            double total = std::accumulate(_p.begin(), _p.end(), 0.0);
             if (total == 0.0 && !_p.empty()) {
+                _p.assign(_p.size(), 1.0); // a no-exceptions build then picks with equal weights
+                total = static_cast<double>(_p.size());
                 detail::fail("RandomChoice: p sums to zero."); // torchvision: ZeroDivisionError
             }
             for (auto &v: _p) {
@@ -177,6 +195,11 @@ namespace torchmedia::vision::transform {
             auto out = img;
             for (int64_t i = 0; i < perm.numel(); ++i) {
                 out = _transforms[perm[i].item<int64_t>()](out);
+#ifdef LIB_TORCH_MEDIA_NO_EXCEPTIONS
+                if (!out.defined()) {
+                    return out; // a part's fallback: later parts do not run on it
+                }
+#endif
             }
             return out;
         }
@@ -293,26 +316,35 @@ namespace torchmedia::vision::transform {
     // (img.reshape(-1, D) - mean_vector) @ transformation_matrix, reshaped back (e.g. ZCA whitening).
     class LinearTransformation {
     public:
+        // LIB_TORCH_MEDIA_NO_EXCEPTIONS: rejected tensors are dropped and every call returns the fallback.
         explicit LinearTransformation(linear_transformation_option opt) : _opt(std::move(opt)) {
             const auto &m = _opt._transformation_matrix;
             const auto &v = _opt._mean_vector;
+            std::string err;
             if (m.size(0) != m.size(1)) {
-                detail::fail(std::format("LinearTransformation: transformation_matrix should be square, got [{}, {}] "
-                                         "rectangular matrix.",
-                                         m.size(0), m.size(1)));
+                err = std::format("LinearTransformation: transformation_matrix should be square, got [{}, {}] "
+                                  "rectangular matrix.",
+                                  m.size(0), m.size(1));
             } else if (v.size(0) != m.size(0)) {
-                detail::fail(std::format("LinearTransformation: mean_vector should have the same length {} as any one "
-                                         "of the dimensions of the transformation_matrix [{}, {}].",
-                                         v.size(0), m.size(0), m.size(1)));
+                err = std::format("LinearTransformation: mean_vector should have the same length {} as any one of the "
+                                  "dimensions of the transformation_matrix [{}, {}].",
+                                  v.size(0), m.size(0), m.size(1));
             } else if (m.device() != v.device()) {
-                detail::fail("LinearTransformation: input tensors should be on the same device.");
+                err = "LinearTransformation: input tensors should be on the same device.";
             } else if (m.scalar_type() != v.scalar_type()) {
-                detail::fail("LinearTransformation: input tensors should have the same dtype.");
+                err = "LinearTransformation: input tensors should have the same dtype.";
+            }
+            if (!err.empty()) {
+                _opt = {};
+                detail::fail(err);
             }
         }
 
         auto operator()(const_tensor_lref_t img) const -> tensor_t {
             const auto &m = _opt._transformation_matrix;
+            if (!m.defined()) {
+                return functional::detail::invalid("LinearTransformation: invalid arguments.");
+            }
             const auto n = img.size(-3) * img.size(-2) * img.size(-1);
             if (n != m.size(0)) {
                 return functional::detail::invalid(std::format(
@@ -450,6 +482,7 @@ namespace torchmedia::vision::transform {
             _opt(std::move(opt)), _log_ratio(detail::log_ratio(_opt._ratio)) {
             detail::check_p("RandomErasing", _opt._p);
             if (_opt._scale[0] < 0 || _opt._scale[1] > 1) {
+                _opt._scale = random_erasing_option()._scale; // a no-exceptions build then uses the default
                 detail::fail("RandomErasing: scale should be between 0 and 1.");
             }
         }
@@ -459,6 +492,9 @@ namespace torchmedia::vision::transform {
                 return img;
             }
             const auto [c, h, w] = detail::query_chw("RandomErasing", img);
+            if (c < 0) {
+                return {}; // LIB_TORCH_MEDIA_NO_EXCEPTIONS: query_chw rejected img
+            }
             const auto &value = _opt._value;
             if (!value.empty() && value.size() != 1 && static_cast<int64_t>(value.size()) != c) {
                 return functional::detail::invalid(

@@ -15,6 +15,7 @@ namespace torchmedia::metric::detection {
     namespace detail {
         using metric::detail::fail;
         using metric::detail::invalid;
+        using metric::detail::silently_failed;
         using torch::indexing::None;
         using torch::indexing::Slice;
 
@@ -965,9 +966,15 @@ namespace torchmedia::metric::detection {
     inline auto mean_average_precision(const std::vector<detection_prediction> &preds,
                                        const std::vector<detection_target> &target,
                                        const mean_average_precision_option &opt = {}) -> mean_average_precision_result {
-        MeanAveragePrecision m(opt);
-        m.update(preds, target);
-        return m.compute();
+        mean_average_precision_result res;
+        if (detail::silently_failed([&] {
+                MeanAveragePrecision m(opt);
+                m.update(preds, target);
+                res = m.compute();
+            })) {
+            return {}; // LIB_TORCH_MEDIA_NO_EXCEPTIONS: a rejected option or input
+        }
+        return res;
     }
 
     // ---------------- VOC average precision (VOC devkit / py-faster-rcnn voc_eval) ----------------

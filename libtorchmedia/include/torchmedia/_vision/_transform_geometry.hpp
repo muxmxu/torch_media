@@ -199,7 +199,8 @@ namespace torchmedia::vision::transform {
                 -> std::vector<double> {
             if (v.size() == 1) {
                 if (v[0] < 0) {
-                    fail(std::format("{}: if {} is a single number, it must be positive.", cls, name));
+                    return handle_exceptions<std::vector<double>, std::invalid_argument>(
+                            {0.0, 0.0}, std::format("{}: if {} is a single number, it must be positive.", cls, name));
                 }
                 return {-v[0], v[0]};
             }
@@ -278,7 +279,13 @@ namespace torchmedia::vision::transform {
         }
 
         auto operator()(const_tensor_lref_t img) const -> tensor_t {
+            if (!detail::size_ok(_opt._size)) { // LIB_TORCH_MEDIA_NO_EXCEPTIONS: the constructor rejected the size
+                return functional::detail::invalid("RandomCrop: invalid arguments.");
+            }
             auto [c, h, w] = detail::query_chw("RandomCrop", img);
+            if (c < 0) {
+                return {}; // LIB_TORCH_MEDIA_NO_EXCEPTIONS: query_chw rejected img
+            }
             const auto &p = _opt._padding;
             std::array<int64_t, 4> pad{}; // left, top, right, bottom
             if (!p.empty()) {
@@ -362,7 +369,13 @@ namespace torchmedia::vision::transform {
             _log_ratio(detail::log_ratio(_opt._ratio)) {}
 
         auto operator()(const_tensor_lref_t img) const -> tensor_t {
+            if (!detail::size_ok(_opt._size)) { // LIB_TORCH_MEDIA_NO_EXCEPTIONS: the constructor rejected the size
+                return functional::detail::invalid("RandomResizedCrop: invalid arguments.");
+            }
             const auto [c, height, width] = detail::query_chw("RandomResizedCrop", img);
+            if (c < 0) {
+                return {}; // LIB_TORCH_MEDIA_NO_EXCEPTIONS: query_chw rejected img
+            }
             const auto area = static_cast<double>(height * width);
             int64_t top = 0;
             int64_t left = 0;
@@ -477,6 +490,9 @@ namespace torchmedia::vision::transform {
 
         auto operator()(const_tensor_lref_t img) const -> tensor_t {
             const auto [c, h, w] = detail::query_chw("RandomShortestSize", img);
+            if (c < 0) {
+                return {}; // LIB_TORCH_MEDIA_NO_EXCEPTIONS: query_chw rejected img
+            }
             const auto pick = detail::randint(0, static_cast<int64_t>(_opt._min_size.size()));
             double r = static_cast<double>(_opt._min_size[pick]) / static_cast<double>(std::min(h, w));
             if (_opt._max_size) {
@@ -523,6 +539,9 @@ namespace torchmedia::vision::transform {
 
         auto operator()(const_tensor_lref_t img) const -> tensor_t {
             const auto [c, h, w] = detail::query_chw("ScaleJitter", img);
+            if (c < 0) {
+                return {}; // LIB_TORCH_MEDIA_NO_EXCEPTIONS: query_chw rejected img
+            }
             const auto &s = _opt._scale_range;
             const auto scale = torch::rand({1}).mul(s[1] - s[0]).add(s[0]);
             const auto r = scale.mul(std::min(static_cast<double>(_opt._target_size[1]) / static_cast<double>(h),
@@ -564,7 +583,9 @@ namespace torchmedia::vision::transform {
             detail::check_p("RandomZoomOut", _opt._p);
             const auto &s = _opt._side_range;
             if (s[0] < 1.0 || s[0] > s[1]) {
-                detail::fail(std::format("RandomZoomOut: invalid side range provided ({}, {}).", s[0], s[1]));
+                const auto msg = std::format("RandomZoomOut: invalid side range provided ({}, {}).", s[0], s[1]);
+                _opt._side_range = random_zoom_out_option()._side_range; // a no-exceptions build then uses the default
+                detail::fail(msg);
             }
         }
 
@@ -573,6 +594,9 @@ namespace torchmedia::vision::transform {
                 return img;
             }
             const auto [c, h, w] = detail::query_chw("RandomZoomOut", img);
+            if (c < 0) {
+                return {}; // LIB_TORCH_MEDIA_NO_EXCEPTIONS: query_chw rejected img
+            }
             const auto &s = _opt._side_range;
             const auto r = torch::rand({1}).mul(s[1] - s[0]).add(s[0]);
             const auto canvas_w = static_cast<int64_t>(r.mul(w).item<double>());
@@ -689,10 +713,9 @@ namespace torchmedia::vision::transform {
                     _opt._translate.clear();
                     detail::fail("RandomAffine: translate should be a sequence of length 2.");
                 }
-                for (const auto t: _opt._translate) {
-                    if (!(0.0 <= t && t <= 1.0)) {
-                        detail::fail("RandomAffine: translation values should be between 0 and 1.");
-                    }
+                if (std::ranges::any_of(_opt._translate, [](double t) { return !(0.0 <= t && t <= 1.0); })) {
+                    _opt._translate.clear(); // a no-exceptions build then does not translate
+                    detail::fail("RandomAffine: translation values should be between 0 and 1.");
                 }
             }
             if (!_opt._scale.empty()) {
@@ -700,10 +723,9 @@ namespace torchmedia::vision::transform {
                     _opt._scale.clear();
                     detail::fail("RandomAffine: scale should be a sequence of length 2.");
                 }
-                for (const auto s: _opt._scale) {
-                    if (s <= 0) {
-                        detail::fail("RandomAffine: scale values should be positive.");
-                    }
+                if (std::ranges::any_of(_opt._scale, [](double s) { return s <= 0; })) {
+                    _opt._scale.clear(); // a no-exceptions build then does not scale
+                    detail::fail("RandomAffine: scale values should be positive.");
                 }
             }
             if (!_opt._shear.empty()) {
@@ -714,6 +736,9 @@ namespace torchmedia::vision::transform {
 
         auto operator()(const_tensor_lref_t img) const -> tensor_t {
             const auto [c, h, w] = detail::query_chw("RandomAffine", img);
+            if (c < 0) {
+                return {}; // LIB_TORCH_MEDIA_NO_EXCEPTIONS: query_chw rejected img
+            }
             const auto angle = detail::uniform(_opt._degrees[0], _opt._degrees[1]);
             std::vector<double> translate{0.0, 0.0};
             if (!_opt._translate.empty()) {
@@ -770,6 +795,7 @@ namespace torchmedia::vision::transform {
         explicit RandomPerspective(random_perspective_option opt = {}) : _opt(std::move(opt)) {
             detail::check_p("RandomPerspective", _opt._p);
             if (!(0.0 <= _opt._distortion_scale && _opt._distortion_scale <= 1.0)) {
+                _opt._distortion_scale = random_perspective_option()._distortion_scale; // no-exceptions: the default
                 detail::fail("RandomPerspective: distortion_scale value should be between 0 and 1.");
             }
         }
@@ -779,6 +805,9 @@ namespace torchmedia::vision::transform {
                 return img;
             }
             const auto [c, h, w] = detail::query_chw("RandomPerspective", img);
+            if (c < 0) {
+                return {}; // LIB_TORCH_MEDIA_NO_EXCEPTIONS: query_chw rejected img
+            }
             const auto bound_h = static_cast<int64_t>(_opt._distortion_scale * static_cast<double>(h / 2)) + 1;
             const auto bound_w = static_cast<int64_t>(_opt._distortion_scale * static_cast<double>(w / 2)) + 1;
             const auto point = [](int64_t x, int64_t y) {
@@ -838,6 +867,9 @@ namespace torchmedia::vision::transform {
 
         auto operator()(const_tensor_lref_t img) const -> tensor_t {
             const auto [c, h, w] = detail::query_chw("ElasticTransform", img);
+            if (c < 0) {
+                return {}; // LIB_TORCH_MEDIA_NO_EXCEPTIONS: query_chw rejected img
+            }
             const auto field = [&](int axis, int64_t size) {
                 auto d = torch::rand({1, 1, h, w}).mul(2).sub(1);
                 if (_opt._sigma[axis] > 0.0) {

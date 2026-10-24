@@ -70,8 +70,7 @@ namespace torchmedia::audio::transform {
                 return waveform; // identity short-circuit
             }
             if (!_kernel.defined()) { // LIB_TORCH_MEDIA_NO_EXCEPTIONS: the constructor rejected the arguments
-                return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}),
-                                                                          "Resample: invalid arguments.");
+                return handle_exceptions<tensor_t, std::invalid_argument>("Resample: invalid arguments.");
             }
             return functional::_apply_sinc_resample_kernel(waveform, _opt._orig_freq, _opt._new_freq, _gcd, _kernel,
                                                            _width);
@@ -116,12 +115,12 @@ namespace torchmedia::audio::transform {
 
         auto operator()(const_tensor_lref_t waveform, const c10::optional<tensor_t> &lengths = c10::nullopt) const
                 -> std::pair<tensor_t, c10::optional<tensor_t>> {
-            c10::optional<tensor_t> out_lengths = c10::nullopt;
-            if (lengths.has_value()) {
-                out_lengths = torch::ceil(lengths.value() * _target / static_cast<double>(_source))
-                                      .to(lengths.value().dtype());
+            const auto out = _resampler(waveform);
+            if (!lengths.has_value() || (!out.defined() && waveform.defined())) { // the ctor rejected the factor
+                return {out, c10::nullopt};
             }
-            return {_resampler(waveform), out_lengths};
+            return {out,
+                    torch::ceil(lengths.value() * _target / static_cast<double>(_source)).to(lengths.value().dtype())};
         }
 
         auto forward(const_tensor_lref_t waveform, const c10::optional<tensor_t> &lengths = c10::nullopt) const
@@ -243,7 +242,7 @@ namespace torchmedia::audio::transform {
         auto operator()(const_tensor_lref_t waveform) const -> tensor_t {
             if (_orig_freq <= 0 || waveform.dim() < 1) {
                 return handle_exceptions<tensor_t, std::invalid_argument>(
-                        torch::empty({1}), "PitchShift: invalid arguments or a 0-D waveform.");
+                        "PitchShift: invalid arguments or a 0-D waveform.");
             }
             const auto stretched = functional::_stretch_waveform(
                     waveform, _opt._n_steps, _opt._bins_per_octave, _opt._n_fft, c10::optional<int>(_win_length),
@@ -327,9 +326,8 @@ namespace torchmedia::audio::transform {
             const double rate = overriding_rate.has_value() ? overriding_rate.value() : _opt._fixed_rate;
             if (!(rate > 0.0)) {
                 return handle_exceptions<tensor_t, std::invalid_argument>(
-                        torch::empty({1}), overriding_rate.has_value()
-                                                   ? "TimeStretch: overriding_rate must be positive."
-                                                   : "TimeStretch: no fixed_rate set; pass a valid rate to the call.");
+                        overriding_rate.has_value() ? "TimeStretch: overriding_rate must be positive."
+                                                    : "TimeStretch: no fixed_rate set; pass a valid rate to the call.");
             }
             return functional::phase_vocoder(complex_specgrams, rate, _phase_advance.to(complex_specgrams.device()));
         }

@@ -32,7 +32,7 @@ namespace torchmedia::audio::functional {
                              const c10::optional<tensor_t> &target_lengths = c10::nullopt, int64_t blank = 0)
             -> std::pair<tensor_t, tensor_t> {
         const auto fail = [](const str_t &msg) -> std::pair<tensor_t, tensor_t> {
-            return {handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}), msg), torch::empty({1})};
+            return {handle_exceptions<tensor_t, std::invalid_argument>(msg), tensor_t{}};
         };
         const auto lp_type = log_probs.scalar_type();
         const auto tg_type = targets.scalar_type();

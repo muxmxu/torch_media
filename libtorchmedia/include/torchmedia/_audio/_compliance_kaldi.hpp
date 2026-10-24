@@ -429,7 +429,7 @@ namespace torchmedia::audio::compliance::kaldi {
         if (const auto err =
                     detail::check_vtln_warp(vtln_low_cutoff, vtln_high_cutoff, low_freq, high_freq, vtln_warp_factor);
             !err.empty()) {
-            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}), err);
+            return handle_exceptions<tensor_t, std::invalid_argument>(err);
         }
         const double l = vtln_low_cutoff * std::max(1.0, vtln_warp_factor);
         const double h = vtln_high_cutoff * std::min(1.0, vtln_warp_factor);
@@ -449,8 +449,9 @@ namespace torchmedia::audio::compliance::kaldi {
     inline auto vtln_warp_mel_freq(const double vtln_low_cutoff, const double vtln_high_cutoff, const double low_freq,
                                    const double high_freq, const double vtln_warp_factor, const_tensor_lref_t mel_freq)
             -> tensor_t {
-        return mel_scale(vtln_warp_freq(vtln_low_cutoff, vtln_high_cutoff, low_freq, high_freq, vtln_warp_factor,
-                                        inverse_mel_scale(mel_freq)));
+        const auto warped = vtln_warp_freq(vtln_low_cutoff, vtln_high_cutoff, low_freq, high_freq, vtln_warp_factor,
+                                           inverse_mel_scale(mel_freq));
+        return warped.defined() ? mel_scale(warped) : warped; // undefined: rejected (no-exceptions build)
     }
 
     // (bins [num_bins, window_length_padded / 2], center_freqs [num_bins, 1]), float32 on the CPU as in torchaudio.
@@ -501,7 +502,7 @@ namespace torchmedia::audio::compliance::kaldi {
     inline auto spectrogram(const_tensor_lref_t waveform, const spectrogram_option &opt = {}) -> tensor_t {
         const auto props = detail::get_waveform_and_window_properties(waveform, opt);
         if (!props) {
-            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}), props.error());
+            return handle_exceptions<tensor_t, std::invalid_argument>(props.error());
         }
         const auto &[wave, window_shift, window_size, padded_window_size] = *props;
         if (static_cast<double>(wave.size(0)) < opt._min_duration * opt._sample_frequency) {
@@ -520,7 +521,7 @@ namespace torchmedia::audio::compliance::kaldi {
     inline auto fbank(const_tensor_lref_t waveform, const fbank_option &opt = {}) -> tensor_t {
         const auto props = detail::get_waveform_and_window_properties(waveform, opt);
         if (!props) {
-            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}), props.error());
+            return handle_exceptions<tensor_t, std::invalid_argument>(props.error());
         }
         const auto &[wave, window_shift, window_size, padded_window_size] = *props;
         if (static_cast<double>(wave.size(0)) < opt._min_duration * opt._sample_frequency) {
@@ -531,7 +532,7 @@ namespace torchmedia::audio::compliance::kaldi {
                     detail::check_mel_banks(opt._num_mel_bins, padded_window_size, opt._sample_frequency, opt._low_freq,
                                             opt._high_freq, opt._vtln_low, opt._vtln_high, opt._vtln_warp);
             !err.empty()) {
-            return handle_exceptions<tensor_t, std::invalid_argument>(torch::empty({1}), err);
+            return handle_exceptions<tensor_t, std::invalid_argument>(err);
         }
         const auto [strided_input, signal_log_energy] =
                 detail::get_window(wave, padded_window_size, window_size, window_shift, opt);
@@ -560,21 +561,19 @@ namespace torchmedia::audio::compliance::kaldi {
     // (or the energy) to the last column.
     inline auto mfcc(const_tensor_lref_t waveform, const mfcc_option &opt = {}) -> tensor_t {
         if (opt._num_ceps > opt._num_mel_bins) {
-            return handle_exceptions<tensor_t, std::invalid_argument>(
-                    torch::empty({1}), std::format("num_ceps cannot be larger than num_mel_bins: {} vs {}",
-                                                   opt._num_ceps, opt._num_mel_bins));
+            return handle_exceptions<tensor_t, std::invalid_argument>(std::format(
+                    "num_ceps cannot be larger than num_mel_bins: {} vs {}", opt._num_ceps, opt._num_mel_bins));
         }
         // torchaudio fails on these later (arange(num_ceps) for the lifter, feature[:, 0] with no cepstra); otherwise a
         // negative num_ceps is its Python slice of the DCT columns: all but the last -num_ceps
         if (opt._num_ceps < 0 && opt._cepstral_lifter != 0.0) {
             return handle_exceptions<tensor_t, std::invalid_argument>(
-                    torch::empty({1}), std::format("a negative num_ceps ({}) needs cepstral_lifter 0", opt._num_ceps));
+                    std::format("a negative num_ceps ({}) needs cepstral_lifter 0", opt._num_ceps));
         }
         const auto num_cepstra = opt._num_ceps < 0 ? std::max<int64_t>(int64_t{opt._num_mel_bins} + opt._num_ceps, 0)
                                                    : int64_t{opt._num_ceps};
         if (num_cepstra == 0 && (opt._use_energy || opt._htk_compat)) {
             return handle_exceptions<tensor_t, std::invalid_argument>(
-                    torch::empty({1}),
                     std::format("num_ceps {} leaves no C0 column for use_energy / htk_compat", opt._num_ceps));
         }
         fbank_option fbank_opt; // log power mel energies (use_log_fbank, use_power), mean subtracted at the end

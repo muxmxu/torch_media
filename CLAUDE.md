@@ -62,6 +62,14 @@ See `develop_log/README.md` for file conventions, templates, and naming.
   `make_data_loader` / samplers / Stack; read-only after construction, so safe for loader workers;
   develop_log/2026-10-24/progress03).
 - **No heavy runtime deps**: prefer header-only / vendored single-header over system libraries.
+- **Error policy** (the user's choice; `global_include.hpp`, develop_log/2026-10-24/progress05): every library error
+  goes through `return handle_exceptions<T, E>(msg)` (no raw `throw` except the two progress05 D4 keeps): it throws by
+  default and, with `LIB_TORCH_MEDIA_NO_EXCEPTIONS`, returns the documented fallback (tensor: undefined; struct /
+  tuple: value-initialised; container: empty; void update: no-op; metric forward: value-initialised) and records
+  `torchmedia::last_error()`. Composites and containers stop at a part's fallback (`if (!x.defined()) return x;`); a
+  rejected constructor leaves the object callable (audio transforms: every call returns the fallback; metric /
+  vision: documented defaults). c10::Error stays a throw. Each new error site needs a check in `unit_test/error_policy`
+  or a no-exceptions binary.
 - **Seeded parity**: a random vision transform class replicates its torchvision class's parameter draws (same torch
   calls, order and dtypes, on the global generator), so `torch::manual_seed(s)` reproduces `torch.manual_seed(s)`
   (develop_log/2026-10-23/progress10 D3) — for serialized calls: concurrent calls interleave the draws (progress10 D1).

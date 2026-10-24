@@ -117,9 +117,28 @@ namespace torchmedia::metric {
             return res;
         }
 
+        // Runs f; true when it failed in the LIB_TORCH_MEDIA_NO_EXCEPTIONS build (last_error() then holds its
+        // message, else the earlier message is kept). The throwing build just runs f (a failure throws).
+        template<class F>
+        inline auto silently_failed(F &&f) -> bool {
+#ifdef LIB_TORCH_MEDIA_NO_EXCEPTIONS
+            auto &slot = torchmedia::detail::last_error_slot();
+            auto earlier = std::exchange(slot, std::string{});
+            f();
+            if (!slot.empty()) {
+                return true;
+            }
+            slot = std::move(earlier);
+#else
+            f();
+#endif
+            return false;
+        }
+
         // Stateful-class base (torchmetrics Metric): forward(args) / operator()(args) update the accumulated state and
-        // return the metric of this batch alone. Derived provides update, compute and options() (its option struct,
-        // from which a fresh instance is built; a class without options is default-constructed).
+        // return the metric of this batch alone; a rejected batch (LIB_TORCH_MEDIA_NO_EXCEPTIONS) returns the
+        // value-initialised result. Derived provides update, compute and options() (its option struct, from which a
+        // fresh instance is built; a class without options is default-constructed).
         template<class Derived>
         class metric_base {
         public:
@@ -127,8 +146,9 @@ namespace torchmedia::metric {
             auto forward(const Args &...args) {
                 auto &self = static_cast<Derived &>(*this);
                 Derived batch = fresh(self);
-                batch.update(args...);
-                self.update(args...);
+                if (silently_failed([&] { batch.update(args...); }) || silently_failed([&] { self.update(args...); })) {
+                    return decltype(batch.compute()){};
+                }
                 return batch.compute();
             }
             template<class... Args>

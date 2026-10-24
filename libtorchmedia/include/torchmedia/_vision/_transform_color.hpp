@@ -229,7 +229,7 @@ namespace torchmedia::vision::transform {
             }
             auto out = img;
             for (const auto k: order) {
-                if (factor[k]) {
+                if (factor[k] && (out.defined() || !img.defined())) { // undefined out: an op rejected img (silent)
                     out = detail::adjust_color(k, out, *factor[k]);
                 }
             }
@@ -311,6 +311,9 @@ namespace torchmedia::vision::transform {
 
         auto operator()(const_tensor_lref_t img) const -> tensor_t {
             const auto c = detail::query_chw("RandomPhotometricDistort", img)[0];
+            if (c < 0) {
+                return {}; // LIB_TORCH_MEDIA_NO_EXCEPTIONS: query_chw rejected img
+            }
             const std::array ranges{_opt._brightness, _opt._contrast, _opt._saturation, _opt._hue};
             std::array<std::optional<double>, 4> factor;
             for (size_t k = 0; k < 4; ++k) {
@@ -322,7 +325,7 @@ namespace torchmedia::vision::transform {
             const auto permutation = detail::rand_lt(_opt._p) ? detail::randperm(c) : std::vector<int64_t>{};
             auto out = img;
             const auto apply = [&](int64_t k) {
-                if (factor[k]) {
+                if (factor[k] && (out.defined() || !img.defined())) { // undefined out: an op rejected img (silent)
                     out = detail::adjust_color(k, out, *factor[k]);
                 }
             };
@@ -335,7 +338,7 @@ namespace torchmedia::vision::transform {
             if (!contrast_before) {
                 apply(1);
             }
-            return permutation.empty() ? out : functional::permute_channels(out, permutation);
+            return permutation.empty() || !out.defined() ? out : functional::permute_channels(out, permutation);
         }
         auto forward(const_tensor_lref_t img) const -> tensor_t { return (*this)(img); }
 
@@ -348,7 +351,7 @@ namespace torchmedia::vision::transform {
     public:
         auto operator()(const_tensor_lref_t img) const -> tensor_t {
             const auto c = detail::query_chw("RandomChannelPermutation", img)[0];
-            return functional::permute_channels(img, detail::randperm(c));
+            return c < 0 ? tensor_t{} : functional::permute_channels(img, detail::randperm(c)); // c < 0: rejected
         }
         auto forward(const_tensor_lref_t img) const -> tensor_t { return (*this)(img); }
     };

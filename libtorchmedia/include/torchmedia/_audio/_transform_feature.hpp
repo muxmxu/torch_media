@@ -37,6 +37,9 @@ namespace torchmedia::audio::transform {
         }
 
         auto operator()(const_tensor_lref_t signal) const -> tensor_t {
+            if (_opt._has_top_db && _opt._top_db < 0.0) { // LIB_TORCH_MEDIA_NO_EXCEPTIONS: the constructor rejected it
+                return handle_exceptions<tensor_t, std::invalid_argument>("AmplitudeToDB: invalid arguments.");
+            }
             const auto o = functional::amplitude_to_db_option()
                                    .set_multiplier(_opt._stype == db_stype::power ? 10.0 : 20.0)
                                    .set_amin(1e-10)
@@ -93,18 +96,22 @@ namespace torchmedia::audio::transform {
     } mel_scale_option_t;
 
     namespace detail {
-        // torchaudio raises when f_min > f_max (f_max defaulting to float(sample_rate // 2)).
-        inline void check_f_min_max(double f_min, double f_max, int sample_rate) {
+        // torchaudio raises when f_min > f_max (f_max defaulting to float(sample_rate // 2)). false: rejected.
+        inline auto check_f_min_max(double f_min, double f_max, int sample_rate) -> bool {
             if (f_min > functional::detail::effective_f_max(f_max, sample_rate)) {
-                (void) handle_exceptions<int, std::invalid_argument>("MelScale: require f_min <= f_max.");
+                return handle_exceptions<bool, std::invalid_argument>("MelScale: require f_min <= f_max.");
             }
+            return true;
         }
     } // namespace detail
 
     class MelScale {
     public:
+        // LIB_TORCH_MEDIA_NO_EXCEPTIONS: rejected options leave fb() undefined and every call returns the fallback.
         explicit MelScale(mel_scale_option opt = {}) : _opt(opt) {
-            detail::check_f_min_max(_opt._f_min, _opt._f_max, _opt._sample_rate);
+            if (!detail::check_f_min_max(_opt._f_min, _opt._f_max, _opt._sample_rate)) {
+                return;
+            }
             _fb = functional::mel_filter_bank(_opt._n_mels, _opt._f_min, _opt._f_max, _opt._sample_rate, _opt._n_stft,
                                               _opt._norm, _opt._mel_scale);
         }
@@ -112,6 +119,9 @@ namespace torchmedia::audio::transform {
         // _fb is (n_mels, n_stft); functional::mel_scale projects it (rank-preserving matmul:
         // (..., freq, time) -> (..., n_mels, time)) after moving it to the input's device and dtype.
         auto operator()(const_tensor_lref_t specgram) const -> tensor_t {
+            if (!_fb.defined()) {
+                return handle_exceptions<tensor_t, std::invalid_argument>("MelScale: invalid arguments.");
+            }
             return functional::mel_scale(specgram, _fb.to(specgram.device(), specgram.scalar_type()));
         }
 
@@ -189,21 +199,26 @@ namespace torchmedia::audio::transform {
     class InverseMelScale {
     public:
         explicit InverseMelScale(inverse_mel_scale_option opt = {}) : _opt(opt) {
-            detail::check_f_min_max(_opt._f_min, _opt._f_max, _opt._sample_rate);
+            if (!detail::check_f_min_max(_opt._f_min, _opt._f_max, _opt._sample_rate)) {
+                return; // LIB_TORCH_MEDIA_NO_EXCEPTIONS: fb() stays undefined, every call returns the fallback
+            }
             // _fb is (n_mels, n_stft) == torchaudio's fb.transpose(-1, -2): the lstsq coefficient matrix A.
             _fb = functional::mel_filter_bank(_opt._n_mels, _opt._f_min, _opt._f_max, _opt._sample_rate, _opt._n_stft,
                                               _opt._norm, _opt._mel_scale);
         }
 
         auto operator()(const_tensor_lref_t melspec) const -> tensor_t {
+            if (!_fb.defined()) {
+                return handle_exceptions<tensor_t, std::invalid_argument>("InverseMelScale: invalid arguments.");
+            }
             const auto shape = melspec.sizes().vec();
             if (shape.size() < 2) { // torchaudio: IndexError
                 return handle_exceptions<tensor_t, std::invalid_argument>(
-                        torch::empty({1}), "InverseMelScale: expected a (..., n_mels, time) spectrogram.");
+                        "InverseMelScale: expected a (..., n_mels, time) spectrogram.");
             }
             if (shape[shape.size() - 2] != _opt._n_mels) {
                 return handle_exceptions<tensor_t, std::invalid_argument>(
-                        torch::empty({1}), "InverseMelScale: input n_mels does not match the configured n_mels.");
+                        "InverseMelScale: input n_mels does not match the configured n_mels.");
             }
             const int64_t time = shape.back();
             const auto packed = melspec.reshape({-1, static_cast<int64_t>(_opt._n_mels), time}); // (B, n_mels, time)
@@ -332,7 +347,10 @@ namespace torchmedia::audio::transform {
                                .norm(_opt._norm)
                                .mel_scale(_opt._mel_scale)) {}
 
-        auto operator()(const_tensor_lref_t waveform) const -> tensor_t { return _mel_scale(_spectrogram(waveform)); }
+        auto operator()(const_tensor_lref_t waveform) const -> tensor_t {
+            const auto spec = _spectrogram(waveform);
+            return spec.defined() ? _mel_scale(spec) : spec; // undefined: rejected (no-exceptions build)
+        }
 
         auto forward(const_tensor_lref_t waveform) const -> tensor_t { return (*this)(waveform); }
 
@@ -382,18 +400,25 @@ namespace torchmedia::audio::transform {
         explicit MFCC(mfcc_option opt = {}) :
             _opt(std::move(opt)), _melspec(with_sample_rate(_opt._mel, _opt._sample_rate)),
             _amplitude_to_db(amplitude_to_db_option().stype(db_stype::power).top_db(80.0)) {
+            // LIB_TORCH_MEDIA_NO_EXCEPTIONS: rejected options leave the DCT undefined; every call returns the fallback.
             if (_opt._dct_type != 2) {
                 (void) handle_exceptions<int, std::invalid_argument>("MFCC: only dct_type == 2 is supported.");
-            }
-            if (_opt._n_mfcc > _opt._mel._n_mels) {
+            } else if (_opt._n_mfcc > _opt._mel._n_mels) {
                 (void) handle_exceptions<int, std::invalid_argument>(
                         "MFCC: cannot select more MFCC coefficients than mel bins.");
+            } else {
+                _dct = functional::create_dct(_opt._n_mfcc, _opt._mel._n_mels, _opt._norm); // (n_mels, n_mfcc)
             }
-            _dct = functional::create_dct(_opt._n_mfcc, _opt._mel._n_mels, _opt._norm); // (n_mels, n_mfcc)
         }
 
         auto operator()(const_tensor_lref_t waveform) const -> tensor_t {
+            if (!_dct.defined()) {
+                return handle_exceptions<tensor_t, std::invalid_argument>("MFCC: invalid arguments.");
+            }
             const auto mel = _melspec(waveform);
+            if (!mel.defined()) {
+                return mel; // LIB_TORCH_MEDIA_NO_EXCEPTIONS: MelSpectrogram rejected the waveform or its options
+            }
             const auto feat = _opt._log_mels ? torch::log(mel + 1e-6) : _amplitude_to_db(mel);
             return torch::matmul(feat.transpose(-2, -1), _dct.to(feat.device(), feat.scalar_type())).transpose(-2, -1);
         }
@@ -466,12 +491,13 @@ namespace torchmedia::audio::transform {
     class LFCC {
     public:
         explicit LFCC(lfcc_option opt = {}) : _opt(opt) {
-            if (_opt._dct_type != 2) {
-                (void) handle_exceptions<int, std::invalid_argument>("LFCC: only dct_type == 2 is supported.");
-            }
-            if (_opt._n_lfcc > _opt._spec._n_fft) {
-                (void) handle_exceptions<int, std::invalid_argument>(
-                        "LFCC: cannot select more LFCC coefficients than fft bins.");
+            const char *err = _opt._dct_type != 2 ? "LFCC: only dct_type == 2 is supported."
+                              : _opt._n_lfcc > _opt._spec._n_fft
+                                      ? "LFCC: cannot select more LFCC coefficients than fft bins."
+                                      : nullptr;
+            if (err != nullptr) {
+                (void) handle_exceptions<int, std::invalid_argument>(err);
+                return; // LIB_TORCH_MEDIA_NO_EXCEPTIONS: the DCT stays undefined, every call returns the fallback
             }
             _spectrogram = Spectrogram(_opt._spec);
             _amplitude_to_db = AmplitudeToDB(amplitude_to_db_option().stype(db_stype::power).top_db(80.0));
@@ -483,7 +509,13 @@ namespace torchmedia::audio::transform {
         }
 
         auto operator()(const_tensor_lref_t waveform) const -> tensor_t {
+            if (!_dct.defined()) {
+                return handle_exceptions<tensor_t, std::invalid_argument>("LFCC: invalid arguments.");
+            }
             auto spec = _spectrogram(waveform); // (..., n_freqs, time)
+            if (!spec.defined()) {
+                return spec; // LIB_TORCH_MEDIA_NO_EXCEPTIONS: Spectrogram rejected the waveform
+            }
             const auto like_spec = [&spec](const tensor_t &t) { return t.to(spec.device(), spec.scalar_type()); };
             spec = torch::matmul(spec.transpose(-2, -1), like_spec(_filter)).transpose(-2, -1); // (..., n_filter, time)
             spec = _opt._log_lf ? torch::log(spec + 1e-6) : _amplitude_to_db(spec);

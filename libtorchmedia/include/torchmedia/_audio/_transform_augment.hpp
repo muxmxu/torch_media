@@ -156,17 +156,17 @@ namespace torchmedia::audio::transform {
             const int freq_dim = time_dim - 1;
             tensor_t out = specgram;
             if (specgram.dim() > 2 && _opt._iid_masks) {
-                for (int i = 0; i < _opt._n_time_masks; ++i) {
+                for (int i = 0; i < _opt._n_time_masks && (out.defined() || !specgram.defined()); ++i) {
                     out = functional::mask_along_axis_iid(out, _opt._time_mask_param, mask_value, time_dim, _opt._p);
                 }
-                for (int i = 0; i < _opt._n_freq_masks; ++i) {
+                for (int i = 0; i < _opt._n_freq_masks && (out.defined() || !specgram.defined()); ++i) {
                     out = functional::mask_along_axis_iid(out, _opt._freq_mask_param, mask_value, freq_dim, _opt._p);
                 }
             } else {
-                for (int i = 0; i < _opt._n_time_masks; ++i) {
+                for (int i = 0; i < _opt._n_time_masks && (out.defined() || !specgram.defined()); ++i) {
                     out = functional::mask_along_axis(out, _opt._time_mask_param, mask_value, time_dim, _opt._p);
                 }
-                for (int i = 0; i < _opt._n_freq_masks; ++i) {
+                for (int i = 0; i < _opt._n_freq_masks && (out.defined() || !specgram.defined()); ++i) {
                     out = functional::mask_along_axis(out, _opt._freq_mask_param, mask_value, freq_dim, _opt._p);
                 }
             }

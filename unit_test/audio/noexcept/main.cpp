@@ -1,6 +1,7 @@
-// LIB_TORCH_MEDIA_NO_EXCEPTIONS build: invalid input returns handle_exceptions' default value (torch::empty({1}))
-// instead of throwing -- and instead of silently computing a result from the invalid input. One check per
-// tensor-returning error site, so dropping any `return` in front of handle_exceptions fails here.
+// LIB_TORCH_MEDIA_NO_EXCEPTIONS build: invalid input returns the silent fallback, an undefined tensor, and records the
+// message for torchmedia::last_error() (develop_log/2026-10-24/progress05) instead of throwing -- and instead of
+// silently computing a result from the invalid input. One check per tensor-returning error site, so dropping any
+// `return` in front of handle_exceptions, or a defined fallback, fails here.
 #include <torch/torch.h>
 #include <torchmedia.hpp>
 #include "test_util.hpp"
@@ -8,7 +9,12 @@
 namespace fn = torchmedia::audio::functional;
 namespace tf = torchmedia::audio::transform;
 
-static auto is_default(const torch::Tensor &t) -> bool { return t.sizes() == torch::IntArrayRef({1}); }
+// The fallback plus a recorded message (consumed, so the next check needs its own).
+static auto is_default(const torch::Tensor &t) -> bool {
+    const bool recorded = !torchmedia::last_error().empty();
+    torchmedia::clear_last_error();
+    return !t.defined() && recorded;
+}
 // For composites: an exception escaping from an inner op (torch's c10::Error) counts as a failure, not an abort.
 template<class Fn>
 static auto returns_default(Fn &&f) -> bool {
@@ -194,7 +200,8 @@ static void test_kaldi_sites() {
     TM_CHECK(returns_default([&] { return kd::mfcc(w, kd::mfcc_option().num_ceps(-1)); }));
     TM_CHECK(returns_default([&] { return kd::mfcc(w, kd::mfcc_option().num_ceps(0).htk_compat(true)); }));
     TM_CHECK(returns_default([&] { return kd::mfcc(w, kd::mfcc_option().num_mel_bins(3).num_ceps(2)); }));
-    TM_CHECK(!std::get<0>(kd::get_mel_banks(23, 511, 16000, 20, 0, 100, -500, 1)).defined());
+    const auto [banks, centers] = kd::get_mel_banks(23, 511, 16000, 20, 0, 100, -500, 1);
+    TM_CHECK(is_default(banks) && !centers.defined());
     const auto f = torch::linspace(0, 8000, 9);
     TM_CHECK(returns_default([&] { return kd::vtln_warp_freq(100, 7500, 20, 8000, 0.0, f); }));
     TM_CHECK(returns_default([&] { return kd::vtln_warp_mel_freq(10, 7500, 20, 8000, 0.9, f); }));
@@ -224,9 +231,23 @@ static void test_metric_sites() {
     TM_CHECK(!ma::permutation_invariant_training(x, x, m.options()).first.defined());
     TM_CHECK(returns_default([&] {
         m.update(x, x);
-        return torch::empty({1});
+        return torch::Tensor();
     }));
     TM_CHECK(std::isnan(m.compute().item<float>())); // 0 / 0: nothing accumulated
+}
+
+// audio::separation (progress05 D4): every auxiva_ip check.
+static void test_separation_sites() {
+    namespace sep = torchmedia::audio::separation;
+    const auto X = torch::complex(torch::randn({2, 3, 4}), torch::randn({2, 3, 4})); // 2 channels
+    TM_CHECK(is_default(sep::auxiva_ip(X[0])));
+    TM_CHECK(is_default(sep::auxiva_ip(torch::randn({2, 3, 4}))));
+    TM_CHECK(is_default(sep::auxiva_ip(X, sep::auxiva_option().n_src(3))));
+    TM_CHECK(is_default(sep::auxiva_ip(X, sep::auxiva_option().n_iter(-1))));
+    TM_CHECK(is_default(sep::auxiva_ip(X, sep::auxiva_option().proj_back_mic(2))));
+    TM_CHECK(is_default(sep::auxiva_ip(X, sep::auxiva_option().n_basis(0))));
+    TM_CHECK(is_default(sep::auxiva_ip(X, sep::auxiva_option().eps(0.0))));
+    TM_CHECK(is_default(sep::auxiva_ip(X, sep::auxiva_option().load(NAN))));
 }
 
 int main() {
@@ -238,5 +259,6 @@ int main() {
     TM_RUN(test_kaldi_sites);
     TM_RUN(test_p8_sites);
     TM_RUN(test_metric_sites);
+    TM_RUN(test_separation_sites);
     return tm_test::summary("audio_test_noexcept");
 }

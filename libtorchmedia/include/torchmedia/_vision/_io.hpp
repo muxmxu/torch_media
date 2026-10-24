@@ -129,19 +129,24 @@ namespace torchmedia::vision::io {
 
     // Load an image into a [C, H, W] float32 tensor in [0, 1]: stb_image (8 bits per channel; a 16-bit PNG keeps its
     // high byte), except PNM P1-P6, read by detail::pnm_decode as sample / maxval at full precision.
+    // Throws std::runtime_error (LIB_TORCH_MEDIA_NO_EXCEPTIONS: returns an undefined tensor).
     inline auto load_image(const std::string &path) -> tensor_t {
         if (!std::filesystem::exists(path)) {
-            throw std::runtime_error("File does not exist: " + path);
+            return handle_exceptions<tensor_t, std::runtime_error>("File does not exist: " + path);
         }
         std::ifstream f(path, std::ios::binary);
         char magic[2] = {};
         if (f.read(magic, 2) && magic[0] == 'P' && magic[1] >= '1' && magic[1] <= '6') {
-            return detail::pnm_decode(magic[1] - '0', std::string(std::istreambuf_iterator<char>(f), {}), path);
+            try { // pnm_decode's parser fails from nested helpers: its std::runtime_error is reported here
+                return detail::pnm_decode(magic[1] - '0', std::string(std::istreambuf_iterator<char>(f), {}), path);
+            } catch (const std::runtime_error &e) {
+                return handle_exceptions<tensor_t, std::runtime_error>(e.what());
+            }
         }
         int w = 0, h = 0, c = 0;
         unsigned char *data = stbi_load(path.c_str(), &w, &h, &c, 0);
         if (data == nullptr) {
-            throw std::runtime_error("Could not load image: " + path);
+            return handle_exceptions<tensor_t, std::runtime_error>("Could not load image: " + path);
         }
         // stb gives [H, W, C] uint8 row-major; -> float [0,1] -> [C, H, W]. permute+contiguous copies out
         // of the stb buffer, so it is safe to free immediately afterwards.
@@ -292,8 +297,8 @@ namespace torchmedia::vision::io {
             void *data = sixteen ? static_cast<void *>(stbi_load_16_from_memory(p, len, &w, &h, &c, req))
                                  : static_cast<void *>(stbi_load_from_memory(p, len, &w, &h, &c, req));
             if (data == nullptr) {
-                throw std::runtime_error(std::string("decode_image: could not decode the image: ") +
-                                         stbi_failure_reason());
+                return handle_exceptions<tensor_t, std::runtime_error>(
+                        std::string("decode_image: could not decode the image: ") + stbi_failure_reason());
             }
             const auto out =
                     torch::from_blob(data, {h, w, req != 0 ? req : c}, sixteen ? torch::kUInt16 : torch::kUInt8)
@@ -322,7 +327,8 @@ namespace torchmedia::vision::io {
                         "decode_image: the provided mode is not supported for JPEG files.");
             }
             if (!detail::jpeg_has_eoi(p, n)) {
-                throw std::runtime_error("decode_image: image is incomplete or truncated.");
+                return handle_exceptions<tensor_t, std::runtime_error>(
+                        "decode_image: image is incomplete or truncated.");
             }
             // stb decodes only the Y plane of a YCbCr JPEG for gray, like libjpeg's JCS_GRAYSCALE output
             return detail::stb_decode(p, n,
@@ -332,11 +338,15 @@ namespace torchmedia::vision::io {
                                       false);
         }
         if (n < 8 || std::memcmp(p, "\x89PNG", 4) != 0) {
-            throw std::runtime_error("decode_image: unsupported image file, only JPEG and PNG are supported.");
+            return handle_exceptions<tensor_t, std::runtime_error>(
+                    "decode_image: unsupported image file, only JPEG and PNG are supported.");
         }
         const auto hdr = detail::read_png_header(p, n);
         const bool sixteen = hdr.bit_depth == 16;
         auto x = detail::stb_decode(p, n, 0, sixteen);
+        if (!x.defined()) {
+            return x; // LIB_TORCH_MEDIA_NO_EXCEPTIONS: stb_image could not decode it
+        }
         // stb turns the tRNS chunk of a gray / RGB image into an alpha channel; libpng (torchvision) ignores it
         const int64_t native = hdr.color_type == 0 ? 1 : hdr.color_type == 2 ? 3 : hdr.color_type == 4 ? 2 : 4;
         if (hdr.color_type != 3 && x.size(0) > native) {
@@ -371,7 +381,8 @@ namespace torchmedia::vision::io {
         auto out = torch::empty({std::max<int64_t>(size, 0)}, torch::kUInt8);
         // a directory opens and reports a size on some platforms, then fails to read; torchvision also rejects empty
         if (size <= 0 || !f.seekg(0) || !f.read(reinterpret_cast<char *>(out.data_ptr<uint8_t>()), size)) {
-            throw std::runtime_error("read_file: could not read " + path.string() + " (missing, unreadable or empty)");
+            return handle_exceptions<tensor_t, std::runtime_error>("read_file: could not read " + path.string() +
+                                                                   " (missing, unreadable or empty)");
         }
         return out;
     }
@@ -379,7 +390,8 @@ namespace torchmedia::vision::io {
     // torchvision.io.read_image / decode_image(path): read_file + decode_image.
     inline auto read_image(const std::filesystem::path &path, image_read_mode mode = image_read_mode::unchanged)
             -> tensor_t {
-        return decode_image(read_file(path), mode);
+        const auto bytes = read_file(path);
+        return bytes.defined() ? decode_image(bytes, mode) : bytes; // undefined: read_file failed (no-exceptions)
     }
 } // namespace torchmedia::vision::io
 

@@ -895,7 +895,8 @@ namespace torchmedia::vision::functional {
                     "solarize: threshold should be less or equal the maximum value of the dtype, but got {}.",
                     threshold));
         }
-        return torch::where(img >= threshold, invert(img), img);
+        const auto inverted = invert(img);
+        return inverted.defined() ? torch::where(img >= threshold, inverted, img) : inverted; // undefined: rejected
     }
 
     // Stretch each channel to the full range (a constant channel is left as is).
@@ -925,6 +926,9 @@ namespace torchmedia::vision::functional {
             return img;
         }
         const auto u8 = to_dtype(img, torch::kUInt8, true);
+        if (!u8.defined()) {
+            return u8; // LIB_TORCH_MEDIA_NO_EXCEPTIONS: to_dtype rejected the dtype
+        }
         if (u8.dim() < 2) {
             return detail::invalid(detail::rank_error("equalize", img, 2));
         }
