@@ -123,6 +123,18 @@ See `develop_log/README.md` for file conventions, templates, and naming.
 - Coverage run: `cmake -S . -B build -DTORCHMEDIA_COVERAGE=ON`, then `llvm-profdata merge` +
   `xcrun llvm-cov` (with `--ignore-filename-regex='_vendor/.*'`).
 
+## Documentation (decided 2026-10-24 — see develop_log/2026-10-24/progress07)
+
+- API documentation lives in the header comments: each public function / class names its Python counterpart and any
+  difference from it. No markdown API reference.
+- `doc/` holds only what no single function documents: `porting-from-python.md` (how Python calls map), `deviations.md`
+  (every intentional or measured difference from the Python libraries, each linked to its progress note) and
+  `reproducibility.md` (bit-exactness conditions, FP contraction, seeded randomness).
+- A change that adds, removes or changes a difference from the Python library updates `doc/deviations.md` in the same
+  commit; a new seeded-parity random op goes into `doc/reproducibility.md`; a new mapping rule into
+  `porting-from-python.md`. Code in `doc/` and `readme.md` is compiled and run before it lands, and any output it
+  states is that program's output.
+
 ## Audio I/O direction (decided 2026-05-30 — see develop_log/2026-05-30/progress01)
 
 - Drop the FFmpeg-from-source dependency. Use **vendored single-header** decoders:

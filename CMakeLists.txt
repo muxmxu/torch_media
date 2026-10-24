@@ -12,6 +12,9 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 # Bundled dependencies live under dependence/ (fetched by script/download_dep).
+if(POLICY CMP0126)
+    cmake_policy(SET CMP0126 NEW) # a parent project's plain set(TORCHMEDIA_DEPENDENCE_DIR ...) beats the cache default
+endif()
 set(TORCHMEDIA_DEPENDENCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependence"
     CACHE PATH "Directory holding bundled dependencies (libtorch, matplotplusplus)")
 

@@ -4,7 +4,8 @@ TorchMedia (libtorchmedia) is a header-only C++23 library that reimplements torc
 torchvision 0.20.1 (transforms v2) on native libtorch (`torch::Tensor`) operators. It is meant for C++ inference
 preprocessing that has to compute what torchaudio / torchvision computed at training time: each ported op is compared
 point-wise against the Python library, and on the CPU most are bit-exact in float32 and float64. `develop_log/`
-records the measurements and every intentional difference.
+records the measurements; [doc/](doc/) summarises how to port Python code, every intentional difference and what
+reproducibility depends on.
 
 > **Status: personal hobby project.** It is provided "as is", without warranty of any kind, and without any
 > obligation to support, maintain, or fix it. APIs and behaviour may change without notice. Verify its outputs for
@@ -21,7 +22,7 @@ records the measurements and every intentional difference.
 | `torchmedia::audio::compliance::kaldi` | `torchaudio.compliance.kaldi` | fbank, mfcc, spectrogram |
 | `torchmedia::audio::separation` | torchiva 0.1.1 | AuxIVA-IP, OverIVA and ILRMA-IP blind source separation |
 | `torchmedia::vision::io` | `torchvision.io.read_file` / `decode_image` / `read_image` | decode_image / read_image: JPEG and PNG to uint8 (uint16 for 16-bit PNG) in torchvision's read modes, PNG bit-exact except palette PNGs in unchanged mode (colours, not indices) and the 16-bit sBIT shift, JPEG within a few levels (stb_image instead of libjpeg-turbo); load_image: float32 [0, 1] from PNG, JPEG, BMP, ... (stb_image) and PNM P1-P6 (sample / maxval); save_image (PNG) |
-| `torchmedia::vision::functional`, `torchmedia::vision::transform` | `torchvision.transforms.v2` | resize, crop, center / five / ten crop, pad, normalize, to_dtype, grayscale, flips, brightness, invert; the Resize, CenterCrop, Pad, Normalize, ToDtype, Grayscale, RandomHorizontalFlip, RandomVerticalFlip, FiveCrop and TenCrop classes |
+| `torchmedia::vision::functional`, `torchmedia::vision::transform` | `torchvision.transforms.v2` | geometry (resize, crop, resized / center / five / ten crop, pad, flips, rotate, affine, perspective, elastic), colour (brightness, contrast, saturation, hue, gamma, sharpness, grayscale, invert, posterize, solarize, autocontrast, equalize), normalize, to_dtype, gaussian blur / noise, erase; their classes, the random augmentations (RandomResizedCrop, ColorJitter, RandomAffine, RandomErasing, ScaleJitter, ...) with torchvision's seeded draws, and Compose / RandomApply / RandomChoice / RandomOrder |
 | `torchmedia::metric::detection` | `torchmetrics.detection`, `torchvision.ops`, pycocotools | box ops (box_iou, generalized / distance / complete IoU, box_convert), the IoU metrics, MeanAveragePrecision (= pycocotools COCOeval, bbox and segm), VOC average precision |
 | `torchmedia::metric::image`, `torchmedia::metric::segmentation` | `torchmetrics.image`, `torchmetrics.segmentation` | PSNR, SSIM, MS-SSIM, UQI, TotalVariation, SAM, ERGAS, RASE, RMSE-SW, SCC, VIF; MeanIoU, DiceScore, GeneralizedDiceScore |
 | `torchmedia::metric::audio` | `torchmetrics.audio`, pystoi, mir_eval | SNR, SI-SDR, SI-SNR, C-SI-SNR, SDR, SA-SDR, PIT, STOI (= pystoi), bss_eval_sources (= mir_eval), speaker-verification EER / minDCF |
@@ -68,6 +69,10 @@ target_link_libraries(audio_example PRIVATE torch_media)
 add_executable(vision_example vision.cpp)
 target_link_libraries(vision_example PRIVATE torch_media)
 ```
+
+For a libtorch outside `torch_media/dependence/`, set `TORCHMEDIA_DEPENDENCE_DIR` to the directory containing
+`libtorch/` before `add_subdirectory` (or pass it with `-D`). If no libtorch is there, `find_package(Torch)` uses any
+other libtorch it finds on the system; TorchMedia is written against libtorch 2.5.1.
 
 The audio and image codecs are vendored single-header C libraries (dr_wav, dr_flac, dr_mp3, stb_vorbis, stb_image).
 Their implementation is compiled only in the translation unit that defines `TORCHMEDIA_IO_IMPLEMENTATION` before
@@ -239,6 +244,17 @@ also BMP and PNM). `random_split(dataset, {0.8, 0.2}, seed)` gives the indices o
   libtorch itself (`c10::Error`) still throw.
 - libtorch 2.5.1's MPS backend lacks some ops (`istft`, `angle`), so GriffinLim, InverseSpectrogram, PitchShift and
   TimeStretch do not run on MPS.
+
+## Documentation
+
+Each function's comment in its header names its Python counterpart and any difference from it. Three pages cover
+what no single function documents:
+
+- [doc/porting-from-python.md](doc/porting-from-python.md): how a Python call maps to TorchMedia (namespaces, names,
+  option structs, classes, errors, building).
+- [doc/deviations.md](doc/deviations.md): every intentional or measured difference from the Python libraries.
+- [doc/reproducibility.md](doc/reproducibility.md): when results are bit-identical to Python, what changes them, and
+  seeded randomness.
 
 ## License
 
