@@ -135,9 +135,10 @@ int main() {
     // positional; keyword arguments go into an option struct (this one is a plain aggregate).
     const auto down = AF::resample(wave, 16000, 8000, {.lowpass_filter_width = 16});
 
-    // torchaudio.functional.spectrogram(..., n_fft=512, hop_length=None, ...): fluent setters named after the
-    // keyword; an unset field keeps torchaudio's default (here hop_length 0 = None = win_length // 2).
-    const auto spec = AF::spectrogram(down, AF::spectrogram_option().n_fft(512));
+    // torchaudio.functional.spectrogram(..., n_fft=512, hop_length=None, power=2.0, ...): fluent setters named after
+    // the keyword (hop_length 0 = None = win_length // 2). This option returns the complex STFT unless
+    // return_complex(false), whatever power is (see doc/deviations.md).
+    const auto spec = AF::spectrogram(down, AF::spectrogram_option().n_fft(512).return_complex(false));
 
     // torchvision.transforms.v2.functional.rotate(img, 30.0, expand=True): vision functionals mirror torchvision's
     // positional order with C++ default arguments; strings and enums become enum classes.

@@ -68,3 +68,8 @@ commit; doc / readme code is compiled and run, stated output is that program's o
 ## Agent log
 - 2026-10-24: pages written, example compiled and cross-checked, CMake fix verified; main-checkout build + ctest
   before push (task60).
+- 2026-10-24: correction. The porting example called `functional::spectrogram` with `spectrogram_option().n_fft(512)` under
+  the comment "an unset field keeps torchaudio's default"; that option defaults to `return_complex = true`, so it returned
+  the complex STFT (found by the readiness review, finding F2: `amplitude_to_DB` of it is exactly half the dB of the power
+  path). The example now calls `.return_complex(false)` and says why, and deviations.md lists the trap (open items
+  G1-3 / G3-13, Mux's call). The example was re-extracted from the page, compiled and run: real-valued, same output.

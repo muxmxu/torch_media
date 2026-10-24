@@ -36,6 +36,12 @@ Notes: [progress04](../develop_log/2026-10-23/progress04-audio-surface-audit.md)
 [progress08](../develop_log/2026-10-23/progress08-audio-parity-followups.md) D3, D7,
 [progress06 (2026-10-24)](../develop_log/2026-10-24/progress06-sanitizer-sweep.md) D2.
 
+- **`functional::spectrogram` returns the complex STFT by default.** `spectrogram_option` defaults to
+  `return_complex = true`, which ignores `power`. Call `.return_complex(false)` to get torchaudio's power spectrogram
+  (`power=2.0`). `transform::Spectrogram` defaults to the power spectrogram, like torchaudio. `amplitude_to_DB` and
+  `MelScale` accept a complex input, and `amplitude_to_DB` takes its magnitude; torchaudio raises for both. So a
+  forgotten `.return_complex(false)` silently gives half the dB. This is an open item (G1-3, G3-13).
+  Notes: [progress02](../develop_log/2026-10-23/progress02-audio-audit-followup.md) Open.
 - **Mutating ops.** `dcshift` and `dither` never modify their input.
 - **GPDF dither.** It sums seven samples of the unmodified input. torchaudio sums into a view of its input, so it
   mutates the caller's tensor and re-reads the grown sample; seeded outputs therefore differ at a few elements. Mono
